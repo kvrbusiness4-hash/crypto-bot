@@ -30,7 +30,39 @@ MIN_AMOUNT_USDT  = float(os.getenv("MIN_AMOUNT_USDT", "25"))      # прийма
 USDT_TRON_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 # --- TRON check helpers ---
 TRON_API_BASE = "https://api.trongrid.io"
+# --- Heartbeat (пінг адміна) ---
+import time
+from datetime import datetime, timedelta
+from telegram.ext import ContextTypes
 
+START_TS = time.time()
+
+def _fmt_uptime():
+    secs = int(time.time() - START_TS)
+    d, r = divmod(secs, 86400)
+    h, r = divmod(r, 3600)
+    m, s = divmod(r, 60)
+    parts = []
+    if d: parts.append(f"{d}d")
+    if h: parts.append(f"{h}h")
+    if m: parts.append(f"{m}m")
+    parts.append(f"{s}s")
+    return " ".join(parts)
+
+async def heartbeat(_: ContextTypes.DEFAULT_TYPE):
+    admin_id = int(os.environ.get("ADMIN_ID", "0") or "0")
+    if not admin_id:
+        return
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
+    text = (
+        "✅ Heartbeat: бот працює\n"
+        f"⏱ Uptime: {_fmt_uptime()}\n"
+        f"🕒 UTC: {now}"
+    )
+    try:
+        await _.bot.send_message(chat_id=admin_id, text=text)
+    except Exception as e:
+        print(f"[heartbeat] send failed: {e}")
 async def check_tron_usdt_tx(tx_hash: str, session: aiohttp.ClientSession) -> tuple[bool, float, str]:
     """
     Перевіряє, що tx_hash:
@@ -522,6 +554,15 @@ async def auto_push_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Автопуш помилка: {e}")
 
+async def heartbeat(context):
+    """Пінг адміну, щоб бачити, що бот живий."""
+    admin_id = os.environ.get("ADMIN_ID")
+    if not admin_id:
+        return
+    try:
+        await context.bot.send_message(chat_id=int(admin_id), text="✅ Bot is alive")
+    except Exception as e:
+        print("Heartbeat error:", e)
 # =====================================================================
 #                   MAIN
 # =====================================================================
@@ -539,12 +580,21 @@ def main():
     app.add_handler(CallbackQueryHandler(on_cb_pay))
     app.add_handler(CommandHandler("claim", claim_cmd))
     app.add_handler(CommandHandler("mysub", mysub_cmd))
-
     # Закриті командою підписки
     app.add_handler(CommandHandler("signals", require_sub(signals_cmd)))
     app.add_handler(CommandHandler("auto_on", require_sub(auto_on_cmd)))
     app.add_handler(CommandHandler("auto_off", require_sub(auto_off_cmd)))
     app.add_handler(CommandHandler("status", status_cmd))   # статус автопушу можна лишити відкритим
+# Закриті командою підписки
+    app.add_handler(CommandHandler("stop", stop))
+
+    # запускаємо heartbeat кожні N хвилин
+    hb_minutes = int(os.environ.get("HEARTBEAT_MIN", "60"))
+    app.job_queue.run_repeating(
+        heartbeat,
+        interval=timedelta(minutes=hb_minutes),
+        first=10
+    )
 
     app.run_polling()
 
