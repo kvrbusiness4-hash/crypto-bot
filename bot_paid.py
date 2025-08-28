@@ -599,3 +599,13 @@ def main():
 
     # запуск бота
     app.run_polling()
+if __name__ == "__main__":
+    import sys, traceback
+    try:
+        print("[BOOT] entering main()")
+        main()
+        print("[BOOT] main() returned normally")
+    except Exception:
+        print("[BOOT] Unhandled exception:")
+        traceback.print_exc()
+        sys.exit(1)
