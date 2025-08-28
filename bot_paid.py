@@ -568,26 +568,28 @@ async def heartbeat(context):
 # =====================================================================
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        print("Set TELEGRAM_BOT_TOKEN or TELEGRAM_TOKEN env var"); return
+        print("Set TELEGRAM_BOT_TOKEN or TELEGRAM_TOKEN env var")
+        return
+
     print("Bot running | BASE=CoinGecko | Paid access via TRON")
 
+    # ініціалізація локального сховища підписок
     subs_init()
 
+    # створюємо застосунок бота
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
     # Команди
     app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("signals", signals_cmd))
+    app.add_handler(CallbackQueryHandler(plan_cb, pattern=r"^plan:"))
     app.add_handler(CommandHandler("pay", pay_cmd))
-    app.add_handler(CallbackQueryHandler(on_cb_pay))
-    app.add_handler(CommandHandler("claim", claim_cmd))
     app.add_handler(CommandHandler("mysub", mysub_cmd))
-    
-    app.add_handler(CommandHandler("signals", require_sub(signals_cmd)))
-    app.add_handler(CommandHandler("auto_on", require_sub(auto_on_cmd)))
-    app.add_handler(CommandHandler("auto_off", require_sub(auto_off_cmd)))
-    app.add_handler(CommandHandler("status", status_cmd))   # статус автопушу можна лишити відкритим
-    # Закриті командою підписки
-    app.add_handler(CommandHandler("stop", auto_off_cmd))
-    # запускаємо heartbeat кожні N хвилин
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("auto_on", auto_on_cmd))
+    app.add_handler(CommandHandler("auto_off", auto_off_cmd))
+
+    # --- Heartbeat: пінг адміна кожні N хвилин
     hb_minutes = int(os.environ.get("HEARTBEAT_MIN", "60"))
     app.job_queue.run_repeating(
         heartbeat,
@@ -595,7 +597,5 @@ def main():
         first=10
     )
 
+    # запуск бота
     app.run_polling()
-
-if __name__ == "__main__":
-    main()
