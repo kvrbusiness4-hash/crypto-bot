@@ -28,7 +28,28 @@ MIN_AMOUNT_USDT  = float(os.getenv("MIN_AMOUNT_USDT", "25"))      # прийма
 
 # USDT-TRC20 контракт (офіційний)
 USDT_TRON_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+# --- TRON check helpers ---
+TRON_API_BASE = "https://api.trongrid.io"
 
+async def check_tron_usdt_tx(tx_hash: str, session: aiohttp.ClientSession) -> tuple[bool, float, str]:
+    """
+    Перевіряє, що tx_hash:
+      - підтверджений у TRON
+      - це TRC20 Transfer токена USDT
+      - одержувач WALLET_ADDRESS
+    Повертає: (ok, amount_usdt, reason)
+    """
+    headers = {}
+    if TRON_API_KEY:
+        headers["TRON-PRO-API-KEY"] = TRON_API_KEY
+
+    # 1) загальна інфа по транзакції
+    url_tx = f"{TRON_API_BASE}/v1/transactions/{tx_hash}"
+    async with session.get(url_tx, headers=headers, timeout=25) as r:
+        if r.status != 200:
+            return False, 0.0, f"http {r.status}"
+        tx_data = await r.json()
+        # тут далі додаєш перевірку: сума, контракт, адреса одержувача
 # Автопуш стан (in-memory)
 STATE: Dict[int, Dict[str, int | bool]] = {}
 
