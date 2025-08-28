@@ -580,14 +580,13 @@ def main():
     app.add_handler(CallbackQueryHandler(on_cb_pay))
     app.add_handler(CommandHandler("claim", claim_cmd))
     app.add_handler(CommandHandler("mysub", mysub_cmd))
-    # Закриті командою підписки
+    
     app.add_handler(CommandHandler("signals", require_sub(signals_cmd)))
     app.add_handler(CommandHandler("auto_on", require_sub(auto_on_cmd)))
     app.add_handler(CommandHandler("auto_off", require_sub(auto_off_cmd)))
     app.add_handler(CommandHandler("status", status_cmd))   # статус автопушу можна лишити відкритим
-# Закриті командою підписки
-    app.add_handler(CommandHandler("stop", stop))
-
+    # Закриті командою підписки
+    app.add_handler(CommandHandler("stop", auto_off_cmd))
     # запускаємо heartbeat кожні N хвилин
     hb_minutes = int(os.environ.get("HEARTBEAT_MIN", "60"))
     app.job_queue.run_repeating(
