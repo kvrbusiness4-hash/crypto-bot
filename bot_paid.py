@@ -563,12 +563,21 @@ async def heartbeat(context):
         await context.bot.send_message(chat_id=int(admin_id), text="✅ Bot is alive")
     except Exception as e:
         print("Heartbeat error:", e)
+        # Callback для вибору плану підписки
+async def plan_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()  # відповідаємо, щоб кнопка не "крутилась"
+
+    # тут можна налаштувати логіку для вибору тарифів
+    await query.edit_message_text(
+        text="Виберіть план підписки:\n\n1) 7 днів – 5 USDT\n2) 30 днів – 15 USDT"
+    )
 # =====================================================================
 #                   MAIN
 # =====================================================================
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        print("Set TELEGRAM_BOT_TOKEN or TELEGRAM_TOKEN env var")
+        print("Set TELEGRAM_BOT_TOKEN env var")
         return
 
     print("Bot running | BASE=CoinGecko | Paid access via TRON")
@@ -582,12 +591,13 @@ def main():
     # Команди
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("signals", signals_cmd))
-    app.add_handler(CallbackQueryHandler(plan_cb, pattern=r"^plan:"))
+    app.add_handler(CallbackQueryHandler(plan_cb, pattern=r"^plan"))
     app.add_handler(CommandHandler("pay", pay_cmd))
     app.add_handler(CommandHandler("mysub", mysub_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("auto_on", auto_on_cmd))
     app.add_handler(CommandHandler("auto_off", auto_off_cmd))
+    app.add_handler(CallbackQueryHandler(plan_cb, pattern="plan"))
 
     # --- Heartbeat: пінг адміна кожні N хвилин
     hb_minutes = int(os.environ.get("HEARTBEAT_MIN", "60"))
@@ -599,13 +609,12 @@ def main():
 
     # запуск бота
     app.run_polling()
+
+
 if __name__ == "__main__":
-    import sys, traceback
     try:
         print("[BOOT] entering main()")
         main()
-        print("[BOOT] main() returned normally")
     except Exception:
-        print("[BOOT] Unhandled exception:")
-        traceback.print_exc()
-        sys.exit(1)
+        import traceback
+        print("[BOOT] crashed:\n", traceback.format_exc())
