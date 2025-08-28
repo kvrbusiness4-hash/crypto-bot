@@ -428,7 +428,36 @@ async def claim_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(ADMIN_ID, f"✅ Оплата: @{u.username or u.id} · TX {tx} · до {until.isoformat()}")
         except:  # noqa
             pass
+# --- ADMIN helper & subscription gate ---
+def is_admin(update: Update) -> bool:
+    """Повертає True якщо користувач — адмін (за ADMIN_ID)."""
+    return bool(update.effective_user) and update.effective_user.id == ADMIN_ID
 
+
+def require_sub(handler):
+    """
+    Декоратор-гейт: пропускає адміна без перевірки підписки.
+    Для інших — пропускає лише за наявності активної підписки.
+    """
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        if not user:
+            return  # на всяк випадок
+
+        # 1) Адмін завжди проходить
+        if is_admin(update):
+            return await handler(update, context)
+
+        # 2) Звичайні користувачі — тільки з активною підпискою
+        if sub_active(user.id):
+            return await handler(update, context)
+
+        # 3) Немає підписки — відмовляємо
+        await update.message.reply_text(
+            "🔒 Немає активної підписки. Спершу оплатити: /pay"
+        )
+    return wrapper
+    
 async def mysub_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if sub_active(update.effective_user.id):
         exp = sub_get(update.effective_user.id)
