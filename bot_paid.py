@@ -434,29 +434,7 @@ def is_admin(update: Update) -> bool:
     return bool(update.effective_user) and update.effective_user.id == ADMIN_ID
 
 
-def require_sub(handler):
-    """
-    Декоратор-гейт: пропускає адміна без перевірки підписки.
-    Для інших — пропускає лише за наявності активної підписки.
-    """
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        if not user:
-            return  # на всяк випадок
 
-        # 1) Адмін завжди проходить
-        if is_admin(update):
-            return await handler(update, context)
-
-        # 2) Звичайні користувачі — тільки з активною підпискою
-        if sub_active(user.id):
-            return await handler(update, context)
-
-        # 3) Немає підписки — відмовляємо
-        await update.message.reply_text(
-            "🔒 Немає активної підписки. Спершу оплатити: /pay"
-        )
-    return wrapper
     
 async def mysub_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if sub_active(update.effective_user.id):
@@ -470,8 +448,14 @@ async def mysub_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def require_sub(handler):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = update.effective_user.id
+
+        # Якщо це адмін — пропускаємо без перевірок
+        if ADMIN_ID and uid == ADMIN_ID:
+            return await handler(update, context)
+
+        # Якщо юзер не адмін — перевірка підписки
         if not sub_active(uid):
-            await update.message.reply_text("🔒 Немає активної підписки. Спершу оплати: /pay")
+            await update.message.reply_text("🔒 Немає активної підписки. Спершу оплатити: /pay")
             return
         return await handler(update, context)
     return wrapper
