@@ -571,7 +571,7 @@ async def plan_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )    
     # ================================ MAIN ================================
 async def setup_jobs(app: Application):
-    """Планувальник задач (heartbeat)."""
+    """Heartbeat job"""
     from datetime import timedelta
     hb_minutes = int(os.environ.get("HEARTBEAT_MIN", "60"))
     app.job_queue.run_repeating(
@@ -594,7 +594,7 @@ def main():
     app = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
-        .post_init(setup_jobs)
+        .post_init(setup_jobs)   # 🔹 тільки тут запускаємо jobs
         .build()
     )
 
