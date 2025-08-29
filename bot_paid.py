@@ -572,6 +572,15 @@ async def plan_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         text="Виберіть план підписки:\n\n1) 7 днів – 5 USDT\n2) 30 днів – 15 USDT"
     )
+from datetime import timedelta
+from telegram.ext import Application    
+    async def setup_jobs(app: Application) -> None:
+    hb_minutes = int(os.environ.get("HEARTBEAT_MIN", "60"))
+    app.job_queue.run_repeating(
+        heartbeat,
+        interval=timedelta(minutes=hb_minutes),
+        first=10,
+    )
 # =====================================================================
 #                   MAIN
 # =====================================================================
@@ -587,7 +596,13 @@ def main():
     subs_init()
 
     # 2) створюємо застосунок бота
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = (
+    Application
+    .builder()
+    .token(TELEGRAM_BOT_TOKEN)
+    .post_init(setup_jobs)
+    .build()
+    )
 
     # 3) Команди
     app.add_handler(CommandHandler("start", start_cmd))
@@ -601,12 +616,7 @@ def main():
     app.add_handler(CallbackQueryHandler(plan_cb, pattern="plan"))
 
     # 4) Heartbeat: пінг адміна кожні N хвилин
-    hb_minutes = int(os.environ.get("HEARTBEAT_MIN", "60"))
-    app.job_queue.run_repeating(
-        heartbeat,
-        interval=timedelta(minutes=hb_minutes),
-        first=10
-    )
+
     # 5) запуск бота
     app.run_polling()
 
