@@ -1,330 +1,109 @@
-# bot_paid.py
+# bot_clean.py  (з підпискою USDT-TRC20)
 # -*- coding: utf-8 -*-
 
-import os
-import math
-import time
-import sqlite3
+import os, math, sqlite3, asyncio, aiohttp
 from typing import List, Tuple, Dict, Optional
-
-import aiohttp
 from datetime import datetime, timedelta
 
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    CallbackQueryHandler,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# =====================================================================
-#                   ENV & GLOBALS
-# =====================================================================
+# ===== ENV / Налаштування =====
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+# Адмін має повні права (обхід підписки)
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 
-# Платежі / підписка
-WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "").strip()  # TRON адреса (USDT-TRC20)
-TRON_API_KEY = os.getenv("TRON_API_KEY", "").strip()
-SUB_PRICE = float(os.getenv("SUBSCRIPTION_PRICE", "25"))  # $25
-SUB_DAYS = int(os.getenv("SUBSCRIPTION_DAYS", "30"))      # 30 днів
+# Підписка
+SUB_PRICE       = float(os.getenv("SUBSCRIPTION_PRICE", "25"))
+SUB_DAYS        = int(os.getenv("SUBSCRIPTION_DAYS", "30"))
 MIN_AMOUNT_USDT = float(os.getenv("MIN_AMOUNT_USDT", "25"))
 
-# USDT-TRC20 офіційний контракт
+# Гаманець TRON (USDT-TRC20)
+WALLET_ADDRESS  = os.getenv("WALLET_ADDRESS", "").strip()
+
+# TronGrid API key (безкоштовно на trongrid.io)
+TRON_API_KEY    = os.getenv("TRON_API_KEY", "").strip()
+TRON_API_BASE   = "https://api.trongrid.io"
 USDT_TRON_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 
-# TronGrid
-TRON_API_BASE = "https://api.trongrid.io"
-
-# CoinGecko
+# CoinGecko: топ-120 монет з ціною, sparkline та % за 24h
 MARKET_URL = (
     "https://api.coingecko.com/api/v3/coins/markets"
     "?vs_currency=usd&order=market_cap_desc&per_page=120&page=1"
     "&sparkline=true&price_change_percentage=24h"
 )
-STABLES = {"USDT", "USDC", "DAI", "TUSD", "FDUSD", "USDD", "PYUSD", "EURS", "EURT", "BUSD"}
 
-# Автопуш стан (in-memory)
+# стейбли — виключаємо
+STABLES = {"USDT","USDC","DAI","TUSD","FDUSD","USDD","PYUSD","EURS","EURT","BUSD"}
+
+# простий in-memory стейт: chat_id -> {"auto_on": bool, "every": int}
 STATE: Dict[int, Dict[str, int | bool]] = {}
 
-# SQLite
-DB_FILE = "subs.db"
 
-
-# =====================================================================
-#                   HELPERS: TIME / UPTIME / HEARTBEAT
-# =====================================================================
-
-START_TS = time.time()
-
-
-def _fmt_uptime():
-    secs = int(time.time() - START_TS)
-    d, r = divmod(secs, 86400)
-    h, r = divmod(r, 3600)
-    m, s = divmod(r, 60)
-    parts = []
-    if d:
-        parts.append(f"{d}d")
-    if h:
-        parts.append(f"{h}h")
-    if m:
-        parts.append(f"{m}m")
-    parts.append(f"{s}s")
-    return " ".join(parts)
-
-
-async def heartbeat(context: ContextTypes.DEFAULT_TYPE):
-    """Пінг адміна, щоб бачити, що бот живий."""
-    admin_id = int(os.environ.get("ADMIN_ID", "0") or "0")
-    if not admin_id:
-        return
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
-    text = (
-        "✅ Heartbeat: бот працює\n"
-        f"⏱ Uptime: {_fmt_uptime()}\n"
-        f"🕒 UTC: {now}"
-    )
-    try:
-        await context.bot.send_message(chat_id=admin_id, text=text)
-    except Exception as e:
-        print(f"[heartbeat] send failed: {e}")
-
-
-# =====================================================================
-#                   HELPERS: TECH (EMA/RSI/MACD)
-# =====================================================================
-
-def ema(series: List[float], period: int) -> List[float]:
-    if not series or period <= 1:
-        return series[:]
-    k = 2 / (period + 1)
-    out = [series[0]]
-    for x in series[1:]:
-        out.append(out[-1] + k * (x - out[-1]))
-    return out
-
-
-def rsi(series: List[float], period: int = 14) -> List[float]:
-    if len(series) < period + 1:
-        return []
-    gains, losses = [], []
-    for i in range(1, len(series)):
-        ch = series[i] - series[i - 1]
-        gains.append(max(0.0, ch))
-        losses.append(max(0.0, -ch))
-
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-
-    rsis = [0.0] * period
-    if avg_loss == 0:
-        rsis.append(100.0)
-    else:
-        rsis.append(100.0 - (100.0 / (1.0 + (avg_gain / (avg_loss + 1e-9)))))
-
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        if avg_loss == 0:
-            rsis.append(100.0)
-        else:
-            rs = avg_gain / (avg_loss + 1e-9)
-            rsis.append(100.0 - (100.0 / (1.0 + rs)))
-    return rsis
-
-
-def macd(series: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[List[float], List[float]]:
-    if len(series) < slow + signal:
-        return [], []
-    ema_fast = ema(series, fast)
-    ema_slow = ema(series, slow)
-    macd_line = [a - b for a, b in zip(ema_fast[-len(ema_slow):], ema_slow)]
-    sig = ema(macd_line, signal)
-    L = min(len(macd_line), len(sig))
-    return macd_line[-L:], sig[-L:]
-
-
-def decide_signal(prices: List[float], p24: Optional[float]) -> Tuple[str, float, float, str]:
-    """
-    -> (direction LONG/SHORT/NONE, sl_price, tp_price, note)
-    """
-    if not prices or len(prices) < 40:
-        return "NONE", 0.0, 0.0, "недостатньо даних"
-
-    series = prices[-120:]
-    px = series[-1]
-
-    # тренд
-    ema50 = ema(series, 50)
-    ema200 = ema(series, min(200, len(series)))
-    trend = 0
-    if ema50 and ema200:
-        if ema50[-1] > ema200[-1]:
-            trend = 1
-        elif ema50[-1] < ema200[-1]:
-            trend = -1
-
-    # RSI
-    rsi15 = rsi(series, 7)
-    rsi30 = rsi(series, 14)
-    rsi60 = rsi(series, 28)
-    macd_line, macd_sig = macd(series)
-
-    votes = 0
-
-    def rsi_vote(last: float) -> int:
-        if last <= 30:
-            return +1
-        if last >= 70:
-            return -1
-        return 0
-
-    note_parts: List[str] = []
-
-    if rsi15:
-        votes += rsi_vote(rsi15[-1])
-        note_parts.append(f"RSI7={rsi15[-1]:.1f}")
-    if rsi30:
-        votes += rsi_vote(rsi30[-1])
-        note_parts.append(f"RSI14={rsi30[-1]:.1f}")
-    if rsi60:
-        votes += rsi_vote(rsi60[-1])
-        note_parts.append(f"RSI28={rsi60[-1]:.1f}")
-
-    if macd_line and macd_sig:
-        if macd_line[-1] > macd_sig[-1]:
-            votes += 1
-            note_parts.append("MACD↑")
-        elif macd_line[-1] < macd_sig[-1]:
-            votes -= 1
-            note_parts.append("MACD↓")
-
-    if trend > 0:
-        votes += 1
-        note_parts.append("Trend↑")
-    elif trend < 0:
-        votes -= 1
-        note_parts.append("Trend↓")
-
-    direction = "NONE"
-    if votes >= 2:
-        direction = "LONG"
-    elif votes <= -2:
-        direction = "SHORT"
-
-    # SL/TP прості
-    tail = series[-48:] if len(series) >= 48 else series
-    if len(tail) >= 2:
-        mean = sum(tail) / len(tail)
-        var = sum((x - mean) ** 2 for x in tail) / len(tail)
-        stdev = math.sqrt(var)
-        vol_pct = (stdev / px) * 100.0
-    else:
-        vol_pct = 1.0
-
-    ctx = abs(p24 or 0.0)
-    base_sl_pct = max(0.6, min(3.0, 0.7 * vol_pct + ctx / 2.5))
-    base_tp_pct = max(0.8, min(5.0, 1.2 * vol_pct + ctx / 2.0))
-
-    if direction == "LONG":
-        sl = px * (1 - base_sl_pct / 100)
-        tp = px * (1 + base_tp_pct / 100)
-    elif direction == "SHORT":
-        sl = px * (1 + base_sl_pct / 100)
-        tp = px * (1 - base_tp_pct / 100)
-    else:
-        sl = tp = 0.0
-
-    return direction, sl, tp, " · ".join(note_parts)
-
-
-# =====================================================================
-#                   SUBSCRIPTIONS (SQLite)
-# =====================================================================
+# ======================= SQLite: підписки =======================
+DB_PATH = "subs.db"
 
 def _db():
-    con = sqlite3.connect(DB_FILE)
+    con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     return con
 
-
 def subs_init():
-    con = _db()
-    cur = con.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS subs (
-            user_id INTEGER PRIMARY KEY,
-            expires_at TEXT
-        )
-        """
-    )
-    con.commit()
-    con.close()
+    con = _db(); cur = con.cursor()
+    cur.execute("""
+      CREATE TABLE IF NOT EXISTS subs (
+        user_id INTEGER PRIMARY KEY,
+        expires_at TEXT
+      )
+    """)
+    con.commit(); con.close()
 
-
-def sub_set(user_id: int, days: int = SUB_DAYS) -> datetime:
+def sub_set(user_id: int, days: int = SUB_DAYS):
     until = datetime.utcnow() + timedelta(days=days)
-    con = _db()
-    cur = con.cursor()
-    cur.execute(
-        """INSERT INTO subs(user_id, expires_at)
-           VALUES(?,?)
-           ON CONFLICT(user_id) DO UPDATE SET expires_at=?""",
-        (user_id, until.isoformat(), until.isoformat()),
-    )
-    con.commit()
-    con.close()
+    con = _db(); cur = con.cursor()
+    cur.execute("""INSERT INTO subs(user_id, expires_at)
+                   VALUES(?,?)
+                   ON CONFLICT(user_id) DO UPDATE SET expires_at=?""",
+                (user_id, until.isoformat(), until.isoformat()))
+    con.commit(); con.close()
     return until
 
-
-def sub_get(user_id: int) -> Optional[datetime]:
-    con = _db()
-    cur = con.cursor()
+def sub_get(user_id: int):
+    con = _db(); cur = con.cursor()
     cur.execute("SELECT * FROM subs WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    con.close()
-    if not row:
-        return None
+    row = cur.fetchone(); con.close()
+    if not row: return None
     try:
         return datetime.fromisoformat(row["expires_at"])
     except Exception:
         return None
 
-
 def sub_active(user_id: int) -> bool:
     exp = sub_get(user_id)
     return bool(exp and exp > datetime.utcnow())
 
-
 def sub_days_left(user_id: int) -> int:
     exp = sub_get(user_id)
-    if not exp:
-        return 0
+    if not exp: return 0
+    # округляємо догори до повних днів
     left = (exp - datetime.utcnow()).total_seconds()
-    return max(0, int((left + 86399) // 86400))
+    return max(0, int((left + 86399)//86400))
 
 
-# =====================================================================
-#                   TRON: Verify USDT-TRC20 TX
-# =====================================================================
-
-async def verify_tron_usdt_tx(tx_hash: str) -> Tuple[bool, str]:
+# ======================= Tron перевірка TX =======================
+async def verify_tron_usdt_tx(tx_hash: str) -> tuple[bool, str]:
+    """
+    Перевіряє, що:
+      - tx існує та SUCCESS
+      - є подія Transfer для USDT-TRC20 на WALLET_ADDRESS
+      - сума >= MIN_AMOUNT_USDT
+    """
     if not TRON_API_KEY:
-        return False, "TRON_API_KEY не задано."
+        return False, "TRON_API_KEY не налаштовано."
     if not WALLET_ADDRESS:
-        return False, "WALLET_ADDRESS не задано."
+        return False, "WALLET_ADDRESS не налаштовано."
 
     headers = {"TRON-PRO-API-KEY": TRON_API_KEY}
 
@@ -343,8 +122,7 @@ async def verify_tron_usdt_tx(tx_hash: str) -> Tuple[bool, str]:
     if not events:
         return False, "Події не знайдено (невалідний TX?)."
 
-    ok = False
-    found_amt = 0.0
+    ok = False; found_amt = 0.0
     for ev in events:
         if ev.get("event_name") != "Transfer":
             continue
@@ -355,10 +133,9 @@ async def verify_tron_usdt_tx(tx_hash: str) -> Tuple[bool, str]:
         to_addr = res.get("to")
         raw_val = res.get("value")
         try:
-            amt = float(raw_val) / 1_000_000.0
+            amt = float(raw_val) / 1_000_000.0  # 6 decimals
         except Exception:
             amt = 0.0
-
         if to_addr == WALLET_ADDRESS and amt >= max(MIN_AMOUNT_USDT, SUB_PRICE):
             ok = True
             found_amt = amt
@@ -388,85 +165,210 @@ async def verify_tron_usdt_tx(tx_hash: str) -> Tuple[bool, str]:
     return True, f"Оплату підтверджено: {found_amt:.2f} USDT"
 
 
-# =====================================================================
-#                   MARKET: build_signals_text
-# =====================================================================
-
-async def build_signals_text() -> str:
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    header = f"📊 Сигнали ({now})\n"
-    lines: List[str] = []
-
-    async with aiohttp.ClientSession() as s:
-        try:
-            async with s.get(MARKET_URL, timeout=25) as r:
-                data = await r.json()
-        except Exception as e:
-            return header + f"❌ Помилка завантаження ринку: {e}"
-
-    picked = 0
-    for c in data:
-        sym = (c.get("symbol") or "").upper()
-        name = (c.get("name") or "").upper()
-        if sym in STABLES or name in STABLES:
-            continue
-        spark = (c.get("sparkline_in_7d") or {}).get("price") or []
-        if len(spark) < 40:
-            continue
-
-        change_24h = c.get("price_change_percentage_24h") or 0.0
-        direction, sl, tp, note = decide_signal(spark, change_24h)
-        if direction == "NONE":
-            continue
-
-        px = c.get("current_price") or 0.0
-        line = (
-            f"*{c.get('symbol','?').upper()}* ${px:.4f} · {direction}\n"
-            f"SL: {sl:.4f} · TP: {tp:.4f} · Δ24h: {change_24h:.2f}% · {note}"
-        )
-        lines.append(line)
-        picked += 1
-        if picked >= 12:
-            break
-
-    if not lines:
-        return header + "Наразі немає чітких сетапів. Спробуйте пізніше."
-    return header + "\n\n".join(lines)
-
-
-# =====================================================================
-#                   UI / COMMANDS
-# =====================================================================
-
-KB = ReplyKeyboardMarkup(
-    [
-        ["/signals", "/status"],
-        ["/auto_on 15", "/auto_off"],
-        ["/pay", "/mysub"],
-    ],
-    resize_keyboard=True,
-)
-
-
-def split_long(text: str, chunk_len: int = 3500) -> List[str]:
-    if not text:
-        return [""]
-    out = []
-    while len(text) > chunk_len:
-        out.append(text[:chunk_len])
-        text = text[chunk_len:]
-    out.append(text)
+# ======================= Технічні індикатори =======================
+def ema(series: List[float], period: int) -> List[float]:
+    if not series or period <= 1:
+        return series[:]
+    k = 2 / (period + 1)
+    out = [series[0]]
+    for x in series[1:]:
+        out.append(out[-1] + k * (x - out[-1]))
     return out
 
+def rsi(series: List[float], period: int = 14) -> List[float]:
+    if len(series) < period + 1:
+        return []
+    gains, losses = [], []
+    for i in range(1, len(series)):
+        ch = series[i] - series[i-1]
+        gains.append(max(0.0, ch))
+        losses.append(max(0.0, -ch))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    rsis = [0.0] * (period)
+    if avg_loss == 0:
+        rsis.append(100.0)
+    else:
+        rs = avg_gain/(avg_loss+1e-9)
+        rsis.append(100.0 - (100.0 / (1.0 + rs)))
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain*(period-1) + gains[i]) / period
+        avg_loss = (avg_loss*(period-1) + losses[i]) / period
+        if avg_loss == 0:
+            rsis.append(100.0)
+        else:
+            rs = avg_gain/(avg_loss+1e-9)
+            rsis.append(100.0 - (100.0/(1.0+rs)))
+    return rsis
 
+def macd(series: List[float], fast:int=12, slow:int=26, signal:int=9) -> Tuple[List[float], List[float]]:
+    if len(series) < slow + signal:
+        return [], []
+    ema_fast = ema(series, fast)
+    ema_slow = ema(series, slow)
+    macd_line = [a-b for a,b in zip(ema_fast[-len(ema_slow):], ema_slow)]
+    sig = ema(macd_line, signal)
+    L = min(len(macd_line), len(sig))
+    return macd_line[-L:], sig[-L:]
+
+
+# ======================= Логіка оцінки монети =======================
+def decide_signal(prices: List[float], p24: Optional[float]) -> Tuple[str, float, float, str]:
+    """
+    Повертає: (direction 'LONG/SHORT/NONE', sl_price, tp_price, пояснення)
+    """
+    explain: List[str] = []
+    if not prices or len(prices) < 40:
+        return "NONE", 0.0, 0.0, "недостатньо даних"
+
+    # нормалізуємо на ~120 останніх точок (sparkline ~7d, ~1год/такт)
+    series = prices[-120:]
+    px = series[-1]
+
+    # тренд: EMA50 vs EMA200 по тій самій серії
+    ema50 = ema(series, 50)
+    ema200 = ema(series, min(200, len(series)//2 if len(series) >= 200 else 100))
+    trend = 0
+    if len(ema50) and len(ema200):
+        if ema50[-1] > ema200[-1]:
+            trend = 1
+        elif ema50[-1] < ema200[-1]:
+            trend = -1
+
+    # RSI (короткий/середній/довгий)
+    rsi15 = rsi(series, 7)    # ~як 15м
+    rsi30 = rsi(series, 14)   # ~як 30м
+    rsi60 = rsi(series, 28)   # ~як 60м
+    macd_line, macd_sig = macd(series)
+
+    votes = 0
+    def rsi_vote(last: float) -> int:
+        if last is None: return 0
+        if last <= 30: return +1
+        if last >= 70: return -1
+        return 0
+
+    if rsi15: votes += rsi_vote(rsi15[-1]); explain.append(f"RSI15={rsi15[-1]:.1f}{'→L' if rsi15[-1]<=30 else '→S' if rsi15[-1]>=70 else ' '}")
+    if rsi30: votes += rsi_vote(rsi30[-1]); explain.append(f"RSI30={rsi30[-1]:.1f}{'→L' if rsi30[-1]<=30 else '→S' if rsi30[-1]>=70 else ' '}")
+    if rsi60: votes += rsi_vote(rsi60[-1]); explain.append(f"RSI60={rsi60[-1]:.1f}{'→L' if rsi60[-1]<=30 else '→S' if rsi60[-1]>=70 else ' '}")
+
+    # MACD перетин
+    if macd_line and macd_sig:
+        if macd_line[-1] > macd_sig[-1]:
+            votes += 1; explain.append("MACD↑")
+        elif macd_line[-1] < macd_sig[-1]:
+            votes -= 1; explain.append("MACD↓")
+        else:
+            explain.append("MACD·")
+
+    # тренд як вага
+    if trend > 0:
+        votes += 1; explain.append("Trend=UP")
+    elif trend < 0:
+        votes -= 1; explain.append("Trend=DOWN")
+    else:
+        explain.append("Trend=FLAT")
+
+    direction = "NONE"
+    if votes >= 2: direction = "LONG"
+    elif votes <= -2: direction = "SHORT"
+
+    # ---- Авто SL/TP у цінах (динамічні) ----
+    # локальна волатильність: std останніх 48 кроків (~2д) / ціна
+    tail = series[-48:] if len(series) >= 48 else series
+    if len(tail) >= 2:
+        mean = sum(tail)/len(tail)
+        var = sum((x-mean)**2 for x in tail)/len(tail)
+        stdev = math.sqrt(var)
+        vol_pct = (stdev/px) * 100.0  # у %
+    else:
+        vol_pct = 1.0
+
+    # врахуємо 24h зміну як контекст
+    ctx = abs(p24 or 0.0)
+    base_sl_pct = max(0.6, min(3.0, 0.7*vol_pct + ctx/2.5))
+    base_tp_pct = max(0.8, min(5.0, 1.2*vol_pct + ctx/2.0))
+
+    # ціни SL/TP
+    if direction == "LONG":
+        sl_price = px * (1 - base_sl_pct/100.0)
+        tp_price = px * (1 + base_tp_pct/100.0)
+    elif direction == "SHORT":
+        sl_price = px * (1 + base_sl_pct/100.0)
+        tp_price = px * (1 - base_tp_pct/100.0)
+    else:
+        sl_price = 0.0; tp_price = 0.0
+
+    return direction, round(sl_price, 6), round(tp_price, 6), " | ".join(explain)
+
+
+# ======================= Ринок =======================
+async def fetch_market(session: aiohttp.ClientSession) -> List[dict]:
+    async with session.get(MARKET_URL, timeout=25) as r:
+        r.raise_for_status()
+        return await r.json()
+
+def is_good_symbol(item: dict) -> bool:
+    sym = (item.get("symbol") or "").upper()
+    name = (item.get("name") or "").upper()
+    if sym in STABLES or any(s in name for s in STABLES):
+        return False
+    return True
+
+
+# ======================= Формування сигналів =======================
+async def build_signals_text(top_n: int = 3) -> str:
+    text_lines: List[str] = []
+    async with aiohttp.ClientSession() as s:
+        try:
+            market = await fetch_market(s)
+        except Exception as e:
+            return f"⚠️ Помилка ринку: {e}"
+
+    candidates = [m for m in market if is_good_symbol(m)]
+    if not candidates:
+        return "⚠️ Ринок недоступний або немає кандидатів."
+
+    scored = []
+    for it in candidates:
+        prices = (((it.get("sparkline_in_7d") or {}).get("price")) or [])
+        p24 = it.get("price_change_percentage_24h")
+        direction, sl, tp, note = decide_signal(prices, p24)
+
+        score = 0
+        if direction == "LONG":  score = 2
+        if direction == "SHORT": score = 2
+        if p24 is not None:
+            score += min(2, abs(p24)/10.0)
+
+        scored.append((score, direction, sl, tp, note, it))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = [z for z in scored if z[1] != "NONE"][:top_n]
+    if not top:
+        return "⚠️ Зараз сильних підтверджених сигналів немає."
+
+    for _, direction, sl, tp, note, it in top:
+        sym = (it.get("symbol") or "").upper()
+        px = it.get("current_price")
+        p24 = it.get("price_change_percentage_24h") or 0.0
+        text_lines.append(
+            f"• {sym}: *{direction}* @ {px}\n"
+            f"  SL: `{sl}` · TP: `{tp}` · 24h: {p24:.2f}%\n"
+            f"  {note}\n"
+        )
+
+    return "📈 *Сильні сигнали:*\n\n" + "\n".join(text_lines)
+
+
+# ======================= Gate (підписка/адмін) =======================
 def is_admin(update: Update) -> bool:
-    return bool(update.effective_user) and update.effective_user.id == ADMIN_ID
-
+    return bool(update.effective_user) and ADMIN_ID and update.effective_user.id == ADMIN_ID
 
 def require_sub(handler):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = update.effective_user.id
-        if ADMIN_ID and uid == ADMIN_ID:
+        if is_admin(update):
             return await handler(update, context)
         if not sub_active(uid):
             await update.message.reply_text("🔒 Немає активної підписки. Спершу оплатити: /pay")
@@ -475,47 +377,86 @@ def require_sub(handler):
     return wrapper
 
 
+# ======================= Команди =======================
+KB = ReplyKeyboardMarkup(
+    [["/signals", "/auto_on 15"], ["/auto_off", "/status"], ["/pay", "/mysub"]],
+    resize_keyboard=True
+)
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    STATE.setdefault(update.effective_chat.id, {"auto_on": False, "every": 15})
+    chat_id = update.effective_chat.id
+    STATE.setdefault(chat_id, {"auto_on": False, "every": 15})
     await update.message.reply_text(
         "👋 Готовий!\n\nКоманди:\n"
-        "• /signals — сканувати зараз (лише з активною підпискою)\n"
-        "• /auto_on 15 — автопуш кожні N хв (5–120)\n"
+        "• /signals — сканувати зараз (потрібна активна підписка)\n"
+        "• /auto_on 15 — автопуш кожні 15 хв (5–120)\n"
         "• /auto_off — вимкнути автопуш\n"
+        "• /status — стан автопушу\n"
         "• /pay — оплатити підписку\n"
-        "• /mysub — статус підписки\n"
-        "• /status — стан автопушу",
-        reply_markup=KB,
+        "• /mysub — статус підписки",
+        reply_markup=KB
     )
 
+@require_sub
+async def signals_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = await build_signals_text()
+    for chunk in split_long(txt):
+        await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
 
-# ------- Платежі / підписка -------
+@require_sub
+async def auto_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    st = STATE.setdefault(chat_id, {"auto_on": False, "every": 15})
+    minutes = 15
+    if context.args:
+        try:
+            minutes = max(5, min(120, int(context.args[0])))
+        except:
+            pass
+    st["auto_on"] = True
+    st["every"] = minutes
 
+    name = f"auto_{chat_id}"
+    for j in context.application.job_queue.get_jobs_by_name(name):
+        j.schedule_removal()
+    context.application.job_queue.run_repeating(
+        auto_push_job,
+        interval=minutes*60,
+        first=5,
+        name=name,
+        data={"chat_id": chat_id}
+    )
+    await update.message.reply_text(f"Автопуш увімкнено: кожні {minutes} хв.", reply_markup=KB)
+
+@require_sub
+async def auto_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    st = STATE.setdefault(chat_id, {"auto_on": False, "every": 15})
+    st["auto_on"] = False
+    name = f"auto_{chat_id}"
+    for j in context.application.job_queue.get_jobs_by_name(name):
+        j.schedule_removal()
+    await update.message.reply_text("Автопуш вимкнено.", reply_markup=KB)
+
+@require_sub
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    st = STATE.setdefault(chat_id, {"auto_on": False, "every": 15})
+    await update.message.reply_text(f"Статус: {'ON' if st['auto_on'] else 'OFF'} · кожні {st['every']} хв.")
+
+# ---- Платежі
 async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not WALLET_ADDRESS:
         await update.message.reply_text("Адреса гаманця не налаштована (WALLET_ADDRESS).")
         return
-    kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("✅ Я оплатив — надішлю TX hash", callback_data="paid")]]
-    )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Я оплатив — надішлю TX hash", callback_data="paid")]])
     txt = (
         f"💳 Підписка *{SUB_DAYS} днів* — *${SUB_PRICE:.2f}*\n\n"
         f"Надішліть *{max(MIN_AMOUNT_USDT, SUB_PRICE):.2f} USDT (TRC20)* на адресу:\n"
         f"`{WALLET_ADDRESS}`\n\n"
-        f"Після оплати скористайтесь командою `/claim <tx_hash>` або натисніть кнопку нижче."
+        f"Після оплати використайте `/claim <tx_hash>`.",
     )
-    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
-
-
-async def on_cb_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if q.data == "paid":
-        await q.edit_message_text(
-            "Відправте TX hash цією відповіддю або командою: `/claim <tx_hash>`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-
+    await update.message.reply_text("\n".join(txt), parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
 
 async def claim_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -529,85 +470,41 @@ async def claim_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     until = sub_set(update.effective_user.id, SUB_DAYS)
     await update.message.reply_text(
         f"✅ {msg}\nДоступ відкрито до *{until.strftime('%Y-%m-%d %H:%M UTC')}*.",
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.MARKDOWN
     )
     if ADMIN_ID:
         u = update.effective_user
         try:
             await context.bot.send_message(
-                ADMIN_ID, f"✅ Оплата: @{u.username or u.id} · TX {tx} · до {until.isoformat()}"
+                ADMIN_ID,
+                f"✅ Оплата: @{u.username or u.id} · TX {tx} · до {until.isoformat()}"
             )
-        except Exception:
+        except:
             pass
 
-
 async def mysub_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_admin(update):
+        await update.message.reply_text("🛡 Ти адмін — доступ без обмежень.")
+        return
     if sub_active(update.effective_user.id):
         exp = sub_get(update.effective_user.id)
         left = sub_days_left(update.effective_user.id)
-        await update.message.reply_text(
-            f"🔐 Підписка активна: {left} дн. (до {exp.strftime('%Y-%m-%d %H:%M UTC')})"
-        )
+        await update.message.reply_text(f"🔐 Підписка активна: {left} дн. (до {exp.strftime('%Y-%m-%d %H:%M UTC')})")
     else:
         await update.message.reply_text("🔒 Підписки немає або закінчилась. Оплатити: /pay")
 
 
-# ------- Сигнали / автопуш -------
-
-@require_sub
-async def signals_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = await build_signals_text()
-    for chunk in split_long(txt):
-        await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
-
-
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    st = STATE.setdefault(chat_id, {"auto_on": False, "every": 15})
-    await update.message.reply_text(f"Статус: {'ON' if st['auto_on'] else 'OFF'} · кожні {st['every']} хв.")
-
-
-async def auto_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    st = STATE.setdefault(chat_id, {"auto_on": False, "every": 15})
-    minutes = 15
-    if context.args:
-        try:
-            minutes = max(5, min(120, int(context.args[0])))
-        except Exception:
-            pass
-    st["auto_on"] = True
-    st["every"] = minutes
-
-    name = f"auto_{chat_id}"
-    for j in context.application.job_queue.get_jobs_by_name(name):
-        j.schedule_removal()
-    context.application.job_queue.run_repeating(
-        auto_push_job, interval=minutes * 60, first=5, name=name, data={"chat_id": chat_id}
-    )
-    await update.message.reply_text(f"Автопуш увімкнено: кожні {minutes} хв.", reply_markup=KB)
-
-
-async def auto_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    st = STATE.setdefault(chat_id, {"auto_on": False, "every": 15})
-    st["auto_on"] = False
-    name = f"auto_{chat_id}"
-    for j in context.application.job_queue.get_jobs_by_name(name):
-        j.schedule_removal()
-    await update.message.reply_text("Автопуш вимкнено.", reply_markup=KB)
-
-
+# ======================= Автопуш =======================
 async def auto_push_job(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.data["chat_id"]
     st = STATE.get(chat_id, {})
     if not st or not st.get("auto_on"):
         return
-    # перевірка підписки (у приваті chat_id == user_id)
-    if not sub_active(chat_id):
+    # підписка (для адміна не перевіряємо)
+    if chat_id != ADMIN_ID and not sub_active(chat_id):
         try:
             await context.bot.send_message(chat_id, "🔒 Підписка неактивна. Автопуш призупинено. Оплатити: /pay")
-        except Exception:
+        except:
             pass
         name = f"auto_{chat_id}"
         for j in context.application.job_queue.get_jobs_by_name(name):
@@ -618,59 +515,43 @@ async def auto_push_job(context: ContextTypes.DEFAULT_TYPE):
         for chunk in split_long(txt):
             await context.bot.send_message(chat_id=chat_id, text=chunk, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        try:
-            await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Автопуш помилка: {e}")
-        except Exception:
-            pass
+        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Автопуш помилка: {e}")
 
 
-# =====================================================================
-#                   APP BOOTSTRAP
-# =====================================================================
-
-async def setup_jobs(app: Application):
-    """Запускаємо періодичні jobs після старту застосунку."""
-    hb_minutes = int(os.environ.get("HEARTBEAT_MIN", "60"))
-    app.job_queue.run_repeating(
-        heartbeat,
-        interval=timedelta(minutes=hb_minutes),
-        first=10,
-        name="heartbeat",
-    )
+# ======================= Утиліти =======================
+def split_long(text: str, chunk_len: int = 3500) -> List[str]:
+    if not text: return [""]
+    chunks = []
+    while len(text) > chunk_len:
+        chunks.append(text[:chunk_len])
+        text = text[chunk_len:]
+    chunks.append(text)
+    return chunks
 
 
+# ======================= Main =======================
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        print("Set TELEGRAM_BOT_TOKEN or check .env")
-        return
+        print("Set TELEGRAM_BOT_TOKEN env var"); return
 
-    print("Bot running | BASE=CoinGecko")
-
-    # 1) Ініціалізація локального сховища
+    # ініціалізуємо БД підписок
     subs_init()
 
-    # 2) Створюємо застосунок бота
-    app = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .post_init(setup_jobs)  # запуск heartbeat
-        .build()
-    )
+    print("Bot running | BASE=CoinGecko | Paid access via USDT-TRC20")
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # 3) Команди/хендлери
+    # Команди
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("signals", signals_cmd))
+    app.add_handler(CommandHandler("auto_on", auto_on_cmd))
+    app.add_handler(CommandHandler("auto_off", auto_off_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
+
     app.add_handler(CommandHandler("pay", pay_cmd))
     app.add_handler(CommandHandler("claim", claim_cmd))
     app.add_handler(CommandHandler("mysub", mysub_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("auto_on", auto_on_cmd))
-    app.add_handler(CommandHandler("auto_off", auto_off_cmd))
-    app.add_handler(CallbackQueryHandler(on_cb_pay, pattern="^paid$"))
 
-    # 4) Запуск бота
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
