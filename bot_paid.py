@@ -575,23 +575,24 @@ async def plan_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =====================================================================
 #                   MAIN
 # =====================================================================
+# ================================ MAIN ================================
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        print("Set TELEGRAM_BOT_TOKEN env var")
+        print("Set TELEGRAM_BOT_TOKEN or check env")
         return
 
-    print("Bot running | BASE=CoinGecko | Paid access via TRON")
+    print("Bot running | BASE=CoinGecko | paid access via TRON")
 
-    # ініціалізація локального сховища підписок
+    # 1) ініціалізація локального сховища підписок
     subs_init()
 
-    # створюємо застосунок бота
+    # 2) створюємо застосунок бота
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Команди
+    # 3) Команди
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("signals", signals_cmd))
-    app.add_handler(CallbackQueryHandler(plan_cb, pattern=r"^plan"))
+    app.add_handler(CallbackQueryHandler(plan_cb, pattern=r"^plan:"))
     app.add_handler(CommandHandler("pay", pay_cmd))
     app.add_handler(CommandHandler("mysub", mysub_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
@@ -599,7 +600,7 @@ def main():
     app.add_handler(CommandHandler("auto_off", auto_off_cmd))
     app.add_handler(CallbackQueryHandler(plan_cb, pattern="plan"))
 
-    # --- Heartbeat: пінг адміна кожні N хвилин
+    # 4) Heartbeat: пінг адміна кожні N хвилин
     hb_minutes = int(os.environ.get("HEARTBEAT_MIN", "60"))
     app.job_queue.run_repeating(
         heartbeat,
@@ -607,14 +608,9 @@ def main():
         first=10
     )
 
-    # запуск бота
+    # 5) запуск бота
     app.run_polling()
 
 
 if __name__ == "__main__":
-    try:
-        print("[BOOT] entering main()")
-        main()
-    except Exception:
-        import traceback
-        print("[BOOT] crashed:\n", traceback.format_exc())
+    main()
