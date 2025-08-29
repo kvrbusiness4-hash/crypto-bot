@@ -7,10 +7,7 @@ from datetime import datetime, timedelta
 
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.ext import Application
-    Application, CommandHandler, ContextTypes,
-    MessageHandler, CallbackQueryHandler, filters
-)
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
 
 # =====================================================================
 #                   ENV & GLOBALS
@@ -572,12 +569,10 @@ async def plan_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         text="Виберіть план підписки:\n\n1) 7 днів – 5 USDT\n2) 30 днів – 15 USDT"
     )    
-    # ============================== MAIN ==============================
-
-# ЦЯ ФУНКЦІЯ МАЄ БУТИ ВИЩЕ ЗА main().
-# Якщо вже додав — дубль НЕ потрібен.
+    # ================================ MAIN ================================
 async def setup_jobs(app: Application):
-    """Реєструємо періодичний heartbeat після старту бота."""
+    """Планувальник задач (heartbeat)."""
+    from datetime import timedelta
     hb_minutes = int(os.environ.get("HEARTBEAT_MIN", "60"))
     app.job_queue.run_repeating(
         heartbeat,
@@ -587,37 +582,35 @@ async def setup_jobs(app: Application):
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        print("Set TELEGRAM_BOT_TOKEN or ENV variable")
+        print("Set TELEGRAM_BOT_TOKEN or check .env")
         return
 
     print("Bot running | BASE=CoinGecko")
 
-    # 1) ініціалізація локального сховища/підписок (залиши як у тебе)
+    # 1) Ініціалізація локального сховища
     subs_init()
 
-    # 2) створюємо застосунок бота і підв’язуємо post_init для джоб
+    # 2) Створюємо застосунок бота
     app = (
-        Application
-        .builder()
+        Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
-        .post_init(setup_jobs)   # тут реєструється heartbeat після старту
+        .post_init(setup_jobs)
         .build()
     )
 
-    # 3) твої хендлери (залиши свій перелік — нижче приклад)
+    # 3) Команди
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("signals", signals_cmd))
-    app.add_handler(CallbackQueryHandler(plan_cb, pattern=r"^plan:"))
+    app.add_handler(CallbackQueryHandler(plan_cb, pattern="^plan:"))
     app.add_handler(CommandHandler("pay", pay_cmd))
     app.add_handler(CommandHandler("mysub", mysub_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("auto_on", auto_on_cmd))
     app.add_handler(CommandHandler("auto_off", auto_off_cmd))
-    # ... інші твої хендлери за потреби ...
+    app.add_handler(CallbackQueryHandler(plan_cb, pattern="plan"))
 
-    # 4) запуск бота
+    # 4) Запуск бота
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
