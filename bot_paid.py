@@ -607,7 +607,9 @@ def main():
         interval=timedelta(minutes=hb_minutes),
         first=10
     )
-
+from datetime import timedelta
+hb_minutes = int(os.environ.get("HEARTBEAT_MIN", "60"))
+pp.job_queue.run_repeating(heartbeat, interval=timedelta(minutes=hb_minutes), first=10, name="hb")
     # 5) запуск бота
     app.run_polling()
 
