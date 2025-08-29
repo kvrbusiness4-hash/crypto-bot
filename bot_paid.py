@@ -5,56 +5,32 @@ import os, math, sqlite3, aiohttp, time
 from typing import List, Tuple, Dict, Optional
 from datetime import datetime, timedelta
 
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
-# ===================== ENV & GLOBALS =====================
+# =========================
+# ENV / ГЛОБАЛЬНІ
+# =========================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
-ADMIN_ID   = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 
-# Платежі / підписка (TRON USDT-TRC20)
-WALLET_ADDRESS   = os.getenv("WALLET_ADDRESS", "").strip()   # твій TRON адрес (наприклад TEzU1D...)
-TRON_API_KEY     = os.getenv("TRON_API_KEY", "").strip()
-SUB_PRICE        = float(os.getenv("SUBSCRIPTION_PRICE", "25"))   # $25
-SUB_DAYS         = int(os.getenv("SUBSCRIPTION_DAYS", "30"))      # 30 днів
-MIN_AMOUNT_USDT  = float(os.getenv("MIN_AMOUNT_USDT", "25"))      # приймати від 25 USDT
-USDT_TRON_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"          # офіційний
+# Підписка / оплата
+WALLET_ADDRESS  = (os.getenv("WALLET_ADDRESS") or "").strip()     # твоя TRON адреса (USDT-TRC20)
+TRON_API_KEY    = (os.getenv("TRON_API_KEY") or "").strip()
+SUB_PRICE       = float(os.getenv("SUBSCRIPTION_PRICE", "25"))    # $25
+SUB_DAYS        = int(os.getenv("SUBSCRIPTION_DAYS", "30"))       # 30 днів
+MIN_AMOUNT_USDT = float(os.getenv("MIN_AMOUNT_USDT", "25"))       # мінімум 25 USDT, щоб зарахувати
 
+USDT_TRON_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"         # офіційний контракт USDT на TRON
 TRON_API_BASE = "https://api.trongrid.io"
 
-# In-memory автопуш
+# Автопуш стан (in-memory)
 STATE: Dict[int, Dict[str, int | bool]] = {}
 
-# Heartbeat (пінг адміну)
-START_TS = time.time()
-def _fmt_uptime():
-    secs = int(time.time() - START_TS)
-    d, r = divmod(secs, 86400); h, r = divmod(r, 3600); m, s = divmod(r, 60)
-    parts = []
-    if d: parts.append(f"{d}d")
-    if h: parts.append(f"{h}h")
-    if m: parts.append(f"{m}m")
-    parts.append(f"{s}s")
-    return " ".join(parts)
-
-async def heartbeat(context: ContextTypes.DEFAULT_TYPE):
-    if not ADMIN_ID: return
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
-    text = f"✅ Heartbeat | Uptime {_fmt_uptime()} | UTC {now}"
-    try:
-        await context.bot.send_message(chat_id=ADMIN_ID, text=text)
-    except Exception as e:
-        print(f"[heartbeat] send failed: {e}")
-
-# ===== Адмін-хелпер (мінімальна утиліта) =====
-def is_admin(chat_id: int) -> bool:
-    try:
-        return ADMIN_ID and int(chat_id) == int(ADMIN_ID)
-    except Exception:
-        return False
-
-# ===================== MARKET / INDICATORS =====================
+# =========================
+# ІНДИКАТОРИ / РИНОК (як у твоєму bot_clean)
+# =========================
 MARKET_URL = (
     "https://api.coingecko.com/api/v3/coins/markets"
     "?vs_currency=usd&order=market_cap_desc&per_page=120&page=1"
@@ -63,7 +39,8 @@ MARKET_URL = (
 STABLES = {"USDT","USDC","DAI","TUSD","FDUSD","USDD","PYUSD","EURS","EURT","BUSD"}
 
 def ema(series: List[float], period: int) -> List[float]:
-    if not series or period <= 1: return series[:]
+    if not series or period <= 1:
+        return series[:]
     k = 2 / (period + 1)
     out = [series[0]]
     for x in series[1:]:
@@ -71,7 +48,8 @@ def ema(series: List[float], period: int) -> List[float]:
     return out
 
 def rsi(series: List[float], period: int = 14) -> List[float]:
-    if len(series) < period + 1: return []
+    if len(series) < period + 1:
+        return []
     gains, losses = [], []
     for i in range(1, len(series)):
         ch = series[i] - series[i-1]
@@ -79,7 +57,7 @@ def rsi(series: List[float], period: int = 14) -> List[float]:
         losses.append(max(0.0, -ch))
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
-    rsis = [0.0] * period
+    rsis = [0.0] * (period)
     if avg_loss == 0:
         rsis.append(100.0)
     else:
@@ -95,7 +73,8 @@ def rsi(series: List[float], period: int = 14) -> List[float]:
     return rsis
 
 def macd(series: List[float], fast:int=12, slow:int=26, signal:int=9) -> Tuple[List[float], List[float]]:
-    if len(series) < slow + signal: return [], []
+    if len(series) < slow + signal:
+        return [], []
     ema_fast = ema(series, fast)
     ema_slow = ema(series, slow)
     macd_line = [a-b for a,b in zip(ema_fast[-len(ema_slow):], ema_slow)]
@@ -104,9 +83,6 @@ def macd(series: List[float], fast:int=12, slow:int=26, signal:int=9) -> Tuple[L
     return macd_line[-L:], sig[-L:]
 
 def decide_signal(prices: List[float], p24: Optional[float]) -> Tuple[str, float, float, str]:
-    """
-    -> (direction LONG/SHORT/NONE, sl_price, tp_price, note)
-    """
     explain: List[str] = []
     if not prices or len(prices) < 40:
         return "NONE", 0.0, 0.0, "недостатньо даних"
@@ -114,12 +90,15 @@ def decide_signal(prices: List[float], p24: Optional[float]) -> Tuple[str, float
     series = prices[-120:]
     px = series[-1]
 
+    # тренд
     ema50 = ema(series, 50)
     ema200 = ema(series, min(200, len(series)//2 if len(series) >= 200 else 100))
     trend = 0
     if ema50 and ema200:
         if ema50[-1] > ema200[-1]: trend = 1
         elif ema50[-1] < ema200[-1]: trend = -1
+
+    # RSI псевдо-tf
     rsi15 = rsi(series, 7)
     rsi30 = rsi(series, 14)
     rsi60 = rsi(series, 28)
@@ -137,15 +116,11 @@ def decide_signal(prices: List[float], p24: Optional[float]) -> Tuple[str, float
     if rsi60: votes += rsi_vote(rsi60[-1]); explain.append(f"RSI60={rsi60[-1]:.1f}")
 
     if macd_line and macd_sig:
-        if macd_line[-1] > macd_sig[-1]:
-            votes += 1; explain.append("MACD↑")
-        elif macd_line[-1] < macd_sig[-1]:
-            votes -= 1; explain.append("MACD↓")
+        if macd_line[-1] > macd_sig[-1]: votes += 1; explain.append("MACD↑")
+        elif macd_line[-1] < macd_sig[-1]: votes -= 1; explain.append("MACD↓")
 
-    if trend > 0:
-        votes += 1; explain.append("Trend=UP")
-    elif trend < 0:
-        votes -= 1; explain.append("Trend=DOWN")
+    if trend > 0: votes += 1; explain.append("Trend=UP")
+    elif trend < 0: votes -= 1; explain.append("Trend=DOWN")
 
     direction = "NONE"
     if votes >= 2: direction = "LONG"
@@ -160,6 +135,7 @@ def decide_signal(prices: List[float], p24: Optional[float]) -> Tuple[str, float
         vol_pct = (stdev/px) * 100.0
     else:
         vol_pct = 1.0
+
     ctx = abs(p24 or 0.0)
     base_sl_pct = max(0.6, min(3.0, 0.7*vol_pct + ctx/2.5))
     base_tp_pct = max(0.8, min(5.0, 1.2*vol_pct + ctx/2.0))
@@ -188,6 +164,7 @@ def is_good_symbol(item: dict) -> bool:
     return True
 
 async def build_signals_text(top_n: int = 3) -> str:
+    text_lines: List[str] = []
     async with aiohttp.ClientSession() as s:
         try:
             market = await fetch_market(s)
@@ -203,13 +180,11 @@ async def build_signals_text(top_n: int = 3) -> str:
         prices = (((it.get("sparkline_in_7d") or {}).get("price")) or [])
         p24 = it.get("price_change_percentage_24h")
         direction, sl, tp, note = decide_signal(prices, p24)
-
         score = 0
         if direction == "LONG":  score = 2
         if direction == "SHORT": score = 2
         if p24 is not None:
             score += min(2, abs(p24)/10.0)
-
         scored.append((score, direction, sl, tp, note, it))
 
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -217,20 +192,23 @@ async def build_signals_text(top_n: int = 3) -> str:
     if not top:
         return "⚠️ Зараз сильних підтверджених сигналів немає."
 
-    lines = []
     for _, direction, sl, tp, note, it in top:
         sym = (it.get("symbol") or "").upper()
         px = it.get("current_price")
         p24 = it.get("price_change_percentage_24h") or 0.0
-        lines.append(
+        text_lines.append(
             f"• {sym}: *{direction}* @ {px}\n"
             f"  SL: `{sl}` · TP: `{tp}` · 24h: {p24:.2f}%\n"
             f"  {note}\n"
         )
-    return "📈 *Сильні сигнали:*\n\n" + "\n".join(lines)
 
-# ===================== SUBS (SQLite) =====================
+    return "📈 *Сильні сигнали:*\n\n" + "\n".join(text_lines)
+
+# =========================
+# ПІДПИСКА (SQLite)
+# =========================
 DB_PATH = "subs.db"
+
 def _db():
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
@@ -239,10 +217,11 @@ def _db():
 def subs_init():
     con = _db(); cur = con.cursor()
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS subs (
-      user_id INTEGER PRIMARY KEY,
-      expires_at TEXT
-    )""")
+        CREATE TABLE IF NOT EXISTS subs(
+            user_id INTEGER PRIMARY KEY,
+            expires_at TEXT
+        )
+    """)
     con.commit(); con.close()
 
 def sub_set(user_id: int, days: int = SUB_DAYS):
@@ -265,7 +244,7 @@ def sub_get(user_id: int):
     except Exception:
         return None
 
-async def sub_active(user_id: int) -> bool:
+def sub_active(user_id: int) -> bool:
     exp = sub_get(user_id)
     return bool(exp and exp > datetime.utcnow())
 
@@ -275,24 +254,28 @@ def sub_days_left(user_id: int) -> int:
     left = (exp - datetime.utcnow()).total_seconds()
     return max(0, int((left + 86399)//86400))
 
-# ===================== TRON VERIFY =====================
+# =========================
+# TronGrid: перевірка TX
+# =========================
 async def verify_tron_usdt_tx(tx_hash: str) -> tuple[bool, str]:
     if not TRON_API_KEY:
         return False, "TRON_API_KEY не задано."
     if not WALLET_ADDRESS:
         return False, "WALLET_ADDRESS не задано."
+
     headers = {"TRON-PRO-API-KEY": TRON_API_KEY}
 
-    # події Transfer
+    # 1) Події (Transfer)
     url_events = f"{TRON_API_BASE}/v1/transactions/{tx_hash}/events"
-    async with aiohttp.ClientSession() as s:
-        try:
+    try:
+        async with aiohttp.ClientSession() as s:
             async with s.get(url_events, headers=headers, timeout=20) as r:
                 if r.status != 200:
                     return False, f"TronGrid events HTTP {r.status}"
                 data = await r.json()
-        except Exception as e:
-            return False, f"Помилка TronGrid events: {e}"
+    except Exception as e:
+        return False, f"Помилка TronGrid events: {e}"
+
     events = data.get("data") or []
     if not events:
         return False, "Події не знайдено (невалідний TX?)."
@@ -315,19 +298,21 @@ async def verify_tron_usdt_tx(tx_hash: str) -> tuple[bool, str]:
             ok = True
             found_amt = amt
             break
+
     if not ok:
         return False, "Не знайдено USDT-TRC20 переказу на твою адресу з достатньою сумою."
 
-    # стан TX
+    # 2) Статус TX
     url_tx = f"{TRON_API_BASE}/v1/transactions/{tx_hash}"
-    async with aiohttp.ClientSession() as s:
-        try:
+    try:
+        async with aiohttp.ClientSession() as s:
             async with s.get(url_tx, headers=headers, timeout=20) as r:
                 if r.status != 200:
                     return False, f"TronGrid tx HTTP {r.status}"
                 data_tx = await r.json()
-        except Exception as e:
-            return False, f"Помилка TronGrid tx: {e}"
+    except Exception as e:
+        return False, f"Помилка TronGrid tx: {e}"
+
     txs = data_tx.get("data") or []
     if not txs:
         return False, "TX не знайдено."
@@ -337,7 +322,9 @@ async def verify_tron_usdt_tx(tx_hash: str) -> tuple[bool, str]:
 
     return True, f"Оплату підтверджено: {found_amt:.2f} USDT"
 
-# ===================== UI / COMMANDS =====================
+# =========================
+# UI / КНОПКИ / ГЕЙТ
+# =========================
 KB = ReplyKeyboardMarkup(
     [
         ["/signals", "/status"],
@@ -351,88 +338,50 @@ def split_long(text: str, chunk_len: int = 3500) -> List[str]:
     if not text: return [""]
     out = []
     while len(text) > chunk_len:
-        out.append(text[:chunk_len]); text = text[chunk_len:]
-    out.append(text); return out
+        out.append(text[:chunk_len])
+        text = text[chunk_len:]
+    out.append(text)
+    return out
 
+def is_admin(update: Update) -> bool:
+    return bool(update.effective_user) and (update.effective_user.id == ADMIN_ID)
+
+def require_sub(handler):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id
+        if ADMIN_ID and uid == ADMIN_ID:
+            return await handler(update, context)
+        if not sub_active(uid):
+            await update.message.reply_text("🔒 Немає активної підписки. Оплатити: /pay")
+            return
+        return await handler(update, context)
+    return wrapper
+
+# =========================
+# КОМАНДИ
+# =========================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     STATE.setdefault(update.effective_chat.id, {"auto_on": False, "every": 15})
     await update.message.reply_text(
         "👋 Готовий!\n\nКоманди:\n"
-        "• /signals — сканувати зараз (потрібна підписка; адмін — без обмежень)\n"
+        "• /signals — сканувати зараз (потрібна активна підписка)\n"
         "• /auto_on 15 — автопуш кожні N хв (5–120)\n"
         "• /auto_off — вимкнути автопуш\n"
-        "• /pay — оплатити підписку USDT (TRC20)\n"
-        "• /claim <tx_hash> — підтвердити оплату\n"
+        "• /pay — оплатити підписку\n"
         "• /mysub — статус підписки\n"
-        "• /status — стан автопушу",
+        "• /status — стан",
         reply_markup=KB
     )
 
-async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not WALLET_ADDRESS:
-        await update.message.reply_text("Адреса гаманця не налаштована (WALLET_ADDRESS).")
-        return
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Я оплатив — надішлю TX hash", callback_data="paid")]])
-    txt = (
-        f"💳 Підписка *{SUB_DAYS} днів* — *${SUB_PRICE:.2f}*\n\n"
-        f"Надішліть *{max(MIN_AMOUNT_USDT, SUB_PRICE):.2f} USDT (TRC20)* на адресу:\n"
-        f"`{WALLET_ADDRESS}`\n\n"
-        f"Після оплати: `/claim <tx_hash>` або натисніть кнопку нижче."
-    )
-    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
-
-async def cb_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    await q.edit_message_text("Відправте TX hash командою: `/claim <tx_hash>`", parse_mode=ParseMode.MARKDOWN)
-
-async def claim_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Використання: `/claim <tx_hash>`", parse_mode=ParseMode.MARKDOWN)
-        return
-    tx = context.args[0].strip()
-    ok, msg = await verify_tron_usdt_tx(tx)
-    if not ok:
-        await update.message.reply_text(f"❌ {msg}")
-        return
-    until = sub_set(update.effective_user.id, SUB_DAYS)
-    await update.message.reply_text(
-        f"✅ {msg}\nДоступ відкрито до *{until.strftime('%Y-%m-%d %H:%M UTC')}*.",
-        parse_mode=ParseMode.MARKDOWN
-    )
-    if ADMIN_ID:
-        u = update.effective_user
-        try:
-            await context.bot.send_message(ADMIN_ID, f"✅ Оплата: @{u.username or u.id} · TX {tx} · до {until.isoformat()}")
-        except:
-            pass
-
-async def mysub_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await sub_active(update.effective_user.id):
-        exp = sub_get(update.effective_user.id)
-        left = sub_days_left(update.effective_user.id)
-        await update.message.reply_text(f"🔐 Підписка активна: {left} дн. (до {exp.strftime('%Y-%m-%d %H:%M UTC')})")
-    else:
-        await update.message.reply_text("🔒 Підписки немає або закінчилась. Оплатити: /pay")
-
-# ------- МІНІ-ПРАВКИ: адмін обходить підписку -------
+@require_sub
 async def signals_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_admin(uid):
-        if not await sub_active(uid):
-            await update.message.reply_text("🔒 Потрібна активна підписка. Оплатити: /pay")
-            return
     txt = await build_signals_text()
     for chunk in split_long(txt):
         await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
 
+@require_sub
 async def auto_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    # якщо не адмін — перевірка підписки
-    if not is_admin(chat_id):
-        if not await sub_active(chat_id):
-            await update.message.reply_text("🔒 Підписка неактивна. Автопуш недоступний. Оплатити: /pay")
-            return
     st = STATE.setdefault(chat_id, {"auto_on": False, "every": 15})
     minutes = 15
     if context.args:
@@ -463,46 +412,118 @@ async def auto_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     st = STATE.setdefault(chat_id, {"auto_on": False, "every": 15})
-    await update.message.reply_text(f"Статус: {'ON' if st['auto_on'] else 'OFF'} · кожні {st['every']} хв.")
+    await update.message.reply_text(f"Статус автопушу: {'ON' if st['auto_on'] else 'OFF'} · кожні {st['every']} хв.")
 
+# --- Платежі
+async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not WALLET_ADDRESS:
+        await update.message.reply_text("⚠️ WALLET_ADDRESS не налаштовано.")
+        return
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Я оплатив — надішлю TX hash", callback_data="paid")]])
+    txt = (
+        f"💳 Підписка *{SUB_DAYS} днів* — *${SUB_PRICE:.2f}*\n\n"
+        f"Надішліть *{max(MIN_AMOUNT_USDT, SUB_PRICE):.2f} USDT (TRC20)* на адресу:\n"
+        f"`{WALLET_ADDRESS}`\n\n"
+        f"Після оплати скористайтесь командою `/claim <tx_hash>` або натисніть кнопку нижче."
+    )
+    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+
+async def cb_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text("Відправте TX hash відповіддю або командою: `/claim <tx_hash>`", parse_mode=ParseMode.MARKDOWN)
+
+async def claim_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Використання: `/claim <tx_hash>`", parse_mode=ParseMode.MARKDOWN)
+        return
+    tx = context.args[0].strip()
+    ok, msg = await verify_tron_usdt_tx(tx)
+    if not ok:
+        await update.message.reply_text(f"❌ {msg}")
+        return
+    until = sub_set(update.effective_user.id, SUB_DAYS)
+    await update.message.reply_text(
+        f"✅ {msg}\nДоступ відкрито до *{until.strftime('%Y-%m-%d %H:%M UTC')}*.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    if ADMIN_ID:
+        u = update.effective_user
+        try:
+            await context.bot.send_message(ADMIN_ID, f"✅ Оплата: @{u.username or u.id} · TX {tx} · до {until.isoformat()}")
+        except:
+            pass
+
+async def mysub_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_admin(update):
+        await update.message.reply_text("🔑 Ти адмін: доступ постійний, без підписки.")
+        return
+    if sub_active(update.effective_user.id):
+        exp = sub_get(update.effective_user.id)
+        left = sub_days_left(update.effective_user.id)
+        await update.message.reply_text(f"🔐 Підписка активна: {left} дн. (до {exp.strftime('%Y-%m-%d %H:%M UTC')})")
+    else:
+        await update.message.reply_text("🔒 Підписки немає або закінчилась. Оплатити: /pay")
+
+# --- Автопуш джоб
 async def auto_push_job(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.data["chat_id"]
     st = STATE.get(chat_id, {})
     if not st or not st.get("auto_on"):
         return
-
-    # якщо не адмін — блокуємо без підписки
-    if not is_admin(chat_id):
-        if not await sub_active(chat_id):
-            try:
-                await context.bot.send_message(chat_id, "🔒 Підписка неактивна. Автопуш призупинено. Оплатити: /pay")
-            except:
-                pass
-            name = f"auto_{chat_id}"
-            for j in context.application.job_queue.get_jobs_by_name(name):
-                j.schedule_removal()
-            return
-
+    # гейт підписки:
+    if (not ADMIN_ID or chat_id != ADMIN_ID) and not sub_active(chat_id):
+        try:
+            await context.bot.send_message(chat_id, "🔒 Підписка неактивна. Автопуш призупинено. Оплатити: /pay")
+        except: pass
+        name = f"auto_{chat_id}"
+        for j in context.application.job_queue.get_jobs_by_name(name):
+            j.schedule_removal()
+        return
     try:
         txt = await build_signals_text()
         for chunk in split_long(txt):
             await context.bot.send_message(chat_id=chat_id, text=chunk, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Автопуш помилка: {e}")
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Автопуш помилка: {e}")
+        except: pass
 
-# ===================== MAIN =====================
+# --- Heartbeat адміну
+START_TS = time.time()
+def _fmt_uptime():
+    secs = int(time.time() - START_TS)
+    d, r = divmod(secs, 86400)
+    h, r = divmod(r, 3600)
+    m, s = divmod(r, 60)
+    parts = []
+    if d: parts.append(f"{d}d")
+    if h: parts.append(f"{h}h")
+    if m: parts.append(f"{m}m")
+    parts.append(f"{s}s")
+    return " ".join(parts)
+
+async def heartbeat(context: ContextTypes.DEFAULT_TYPE):
+    if not ADMIN_ID: return
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
+    text = f"✅ Heartbeat · Uptime {_fmt_uptime()} · UTC {now}"
+    try:
+        await context.bot.send_message(chat_id=ADMIN_ID, text=text)
+    except Exception as e:
+        print("Heartbeat error:", e)
+
 async def setup_jobs(app: Application):
-    # heartbeat кожні HEARTBEAT_MIN хв (за замовч. 60)
     hb_minutes = int(os.environ.get("HEARTBEAT_MIN", "60"))
     app.job_queue.run_repeating(heartbeat, interval=timedelta(minutes=hb_minutes), first=10)
 
+# =========================
+# MAIN
+# =========================
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        print("Set TELEGRAM_BOT_TOKEN or check .env")
-        return
-
-    print("Bot running | BASE=CoinGecko")
+        print("Set TELEGRAM_BOT_TOKEN env var"); return
     subs_init()
+    print("Bot running | BASE=CoinGecko | Paid gates=TRON USDT")
 
     app = (
         Application.builder()
@@ -516,6 +537,7 @@ def main():
     app.add_handler(CommandHandler("auto_on", auto_on_cmd))
     app.add_handler(CommandHandler("auto_off", auto_off_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
+
     app.add_handler(CommandHandler("pay", pay_cmd))
     app.add_handler(CallbackQueryHandler(cb_paid, pattern="^paid$"))
     app.add_handler(CommandHandler("claim", claim_cmd))
