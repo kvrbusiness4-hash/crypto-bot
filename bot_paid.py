@@ -1,7 +1,7 @@
-# bot_clean.py
+# bot_paid.py
 # -*- coding: utf-8 -*-
 
-import os, math, time, aiohttp
+import os, math, time, asyncio, aiohttp
 from typing import List, Tuple, Dict, Optional
 from datetime import datetime, timedelta
 
@@ -9,13 +9,11 @@ from telegram import Update, ReplyKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ===== Налаштування =====
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# ===================== ENV / CONFIG =====================
 
-# хто отримує heartbeat
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-# раз на скільки хвилин надсилати heartbeat
-HEARTBEAT_MIN = int(os.getenv("HEARTBEAT_MIN", "60"))
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))                 # не обов’язково
+HEARTBEAT_MIN = int(os.getenv("HEARTBEAT_MIN", "60"))      # раз на N хвилин
 
 # CoinGecko: топ-120 монет з ціною, sparkline та % за 24h
 MARKET_URL = (
@@ -30,7 +28,8 @@ STABLES = {"USDT","USDC","DAI","TUSD","FDUSD","USDD","PYUSD","EURS","EURT","BUSD
 # простий in-memory стейт: chat_id -> {"auto_on": bool, "every": int}
 STATE: Dict[int, Dict[str, int | bool]] = {}
 
-# ===== Технічні індикатори =====
+# ===================== INDICATORS =====================
+
 def ema(series: List[float], period: int) -> List[float]:
     if not series or period <= 1:
         return series[:]
@@ -75,9 +74,12 @@ def macd(series: List[float], fast:int=12, slow:int=26, signal:int=9) -> Tuple[L
     L = min(len(macd_line), len(sig))
     return macd_line[-L:], sig[-L:]
 
-# ===== Логіка оцінки монети =====
+# ===================== SIGNAL LOGIC =====================
+
 def decide_signal(prices: List[float], p24: Optional[float]) -> Tuple[str, float, float, str]:
-    """Повертає: (direction 'LONG/SHORT/NONE', sl_price, tp_price, пояснення)"""
+    """
+    -> (direction 'LONG/SHORT/NONE', sl_price, tp_price, пояснення)
+    """
     explain: List[str] = []
     if not prices or len(prices) < 40:
         return "NONE", 0.0, 0.0, "недостатньо даних"
@@ -88,9 +90,11 @@ def decide_signal(prices: List[float], p24: Optional[float]) -> Tuple[str, float
     ema50 = ema(series, 50)
     ema200 = ema(series, min(200, len(series)//2 if len(series) >= 200 else 100))
     trend = 0
-    if len(ema50) and len(ema200):
-        if ema50[-1] > ema200[-1]: trend = 1
-        elif ema50[-1] < ema200[-1]: trend = -1
+    if ema50 and ema200:
+        if ema50[-1] > ema200[-1]:
+            trend = 1
+        elif ema50[-1] < ema200[-1]:
+            trend = -1
 
     rsi15 = rsi(series, 7)
     rsi30 = rsi(series, 14)
@@ -104,9 +108,9 @@ def decide_signal(prices: List[float], p24: Optional[float]) -> Tuple[str, float
         if last >= 70: return -1
         return 0
 
-    if rsi15: votes += rsi_vote(rsi15[-1]); explain.append(f"RSI15={rsi15[-1]:.1f}{'→L' if rsi15[-1]<=30 else '→S' if rsi15[-1]>=70 else ''}")
-    if rsi30: votes += rsi_vote(rsi30[-1]); explain.append(f"RSI30={rsi30[-1]:.1f}{'→L' if rsi30[-1]<=30 else '→S' if rsi30[-1]>=70 else ''}")
-    if rsi60: votes += rsi_vote(rsi60[-1]); explain.append(f"RSI60={rsi60[-1]:.1f}{'→L' if rsi60[-1]<=30 else '→S' if rsi60[-1]>=70 else ''}")
+    if rsi15: votes += rsi_vote(rsi15[-1]); explain.append(f"RSI15={rsi15[-1]:.1f}")
+    if rsi30: votes += rsi_vote(rsi30[-1]); explain.append(f"RSI30={rsi30[-1]:.1f}")
+    if rsi60: votes += rsi_vote(rsi60[-1]); explain.append(f"RSI60={rsi60[-1]:.1f}")
 
     if macd_line and macd_sig:
         if macd_line[-1] > macd_sig[-1]:
@@ -114,8 +118,10 @@ def decide_signal(prices: List[float], p24: Optional[float]) -> Tuple[str, float
         elif macd_line[-1] < macd_sig[-1]:
             votes -= 1; explain.append("MACD↓")
 
-    if trend > 0: votes += 1; explain.append("Trend=UP")
-    elif trend < 0: votes -= 1; explain.append("Trend=DOWN")
+    if trend > 0:
+        votes += 1; explain.append("Trend=UP")
+    elif trend < 0:
+        votes -= 1; explain.append("Trend=DOWN")
 
     direction = "NONE"
     if votes >= 2: direction = "LONG"
@@ -126,7 +132,7 @@ def decide_signal(prices: List[float], p24: Optional[float]) -> Tuple[str, float
         mean = sum(tail)/len(tail)
         var = sum((x-mean)**2 for x in tail)/len(tail)
         stdev = math.sqrt(var)
-        vol_pct = (stdev/px)*100.0
+        vol_pct = (stdev/px) * 100.0
     else:
         vol_pct = 1.0
 
@@ -145,7 +151,8 @@ def decide_signal(prices: List[float], p24: Optional[float]) -> Tuple[str, float
 
     return direction, round(sl_price, 6), round(tp_price, 6), " | ".join(explain)
 
-# ===== Завантаження ринку =====
+# ===================== MARKET =====================
+
 async def fetch_market(session: aiohttp.ClientSession) -> List[dict]:
     async with session.get(MARKET_URL, timeout=25) as r:
         r.raise_for_status()
@@ -158,8 +165,8 @@ def is_good_symbol(item: dict) -> bool:
         return False
     return True
 
-# ===== Формування тексту сигналів =====
 async def build_signals_text(top_n: int = 3) -> str:
+    text_lines: List[str] = []
     async with aiohttp.ClientSession() as s:
         try:
             market = await fetch_market(s)
@@ -175,11 +182,13 @@ async def build_signals_text(top_n: int = 3) -> str:
         prices = (((it.get("sparkline_in_7d") or {}).get("price")) or [])
         p24 = it.get("price_change_percentage_24h")
         direction, sl, tp, note = decide_signal(prices, p24)
+
         score = 0
-        if direction in ("LONG", "SHORT"):
-            score = 2
+        if direction == "LONG":  score = 2
+        if direction == "SHORT": score = 2
         if p24 is not None:
             score += min(2, abs(p24)/10.0)
+
         scored.append((score, direction, sl, tp, note, it))
 
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -187,19 +196,20 @@ async def build_signals_text(top_n: int = 3) -> str:
     if not top:
         return "⚠️ Зараз сильних підтверджених сигналів немає."
 
-    lines: List[str] = []
     for _, direction, sl, tp, note, it in top:
         sym = (it.get("symbol") or "").upper()
         px = it.get("current_price")
         p24 = it.get("price_change_percentage_24h") or 0.0
-        lines.append(
+        text_lines.append(
             f"• {sym}: *{direction}* @ {px}\n"
             f"  SL: `{sl}` · TP: `{tp}` · 24h: {p24:.2f}%\n"
             f"  {note}\n"
         )
-    return "📈 *Сильні сигнали:*\n\n" + "\n".join(lines)
 
-# ===== Команди =====
+    return "📈 *Сильні сигнали:*\n\n" + "\n".join(text_lines)
+
+# ===================== COMMANDS =====================
+
 KB = ReplyKeyboardMarkup(
     [["/signals", "/auto_on 15"], ["/auto_off", "/status"]],
     resize_keyboard=True
@@ -260,7 +270,8 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st = STATE.setdefault(chat_id, {"auto_on": False, "every": 15})
     await update.message.reply_text(f"Статус: {'ON' if st['auto_on'] else 'OFF'} · кожні {st['every']} хв.")
 
-# ===== Автопуш =====
+# ===================== AUTOPUSH JOB =====================
+
 async def auto_push_job(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.data["chat_id"]
     st = STATE.get(chat_id, {})
@@ -273,10 +284,22 @@ async def auto_push_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Автопуш помилка: {e}")
 
-# ===== Утиліти =====
+# ===================== HEARTBEAT =====================
+
+async def heartbeat(_: ContextTypes.DEFAULT_TYPE):
+    """Кожну годину пише адмінам, що бот живий (якщо ADMIN_ID заданий)."""
+    if not ADMIN_ID:
+        return
+    try:
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
+        await _.bot.send_message(ADMIN_ID, f"✅ Bot is alive | UTC {now}")
+    except Exception as e:
+        print(f"[heartbeat] send failed: {e}")
+
+# ===================== HELPERS =====================
+
 def split_long(text: str, chunk_len: int = 3500) -> List[str]:
-    if not text:
-        return [""]
+    if not text: return [""]
     chunks = []
     while len(text) > chunk_len:
         chunks.append(text[:chunk_len])
@@ -284,73 +307,49 @@ def split_long(text: str, chunk_len: int = 3500) -> List[str]:
     chunks.append(text)
     return chunks
 
-# ===== Heartbeat =====
-START_TS = time.time()
+# ===================== MAIN =====================
 
-def _fmt_uptime() -> str:
-    secs = int(time.time() - START_TS)
-    d, r = divmod(secs, 86400)
-    h, r = divmod(r, 3600)
-    m, s = divmod(r, 60)
-    parts = []
-    if d: parts.append(f"{d}d")
-    if h: parts.append(f"{h}h")
-    if m: parts.append(f"{m}m")
-    parts.append(f"{s}s")
-    return " ".join(parts)
-
-async def heartbeat(_: ContextTypes.DEFAULT_TYPE):
-    if not ADMIN_ID:
-        return
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
-    msg = (
-        "✅ Bot is alive\n"
-        f"⏱ Uptime: {_fmt_uptime()}\n"
-        f"🕒 UTC: {now}"
-    )
-    try:
-        await _.bot.send_message(chat_id=ADMIN_ID, text=msg)
-    except Exception as e:
-        print(f"[heartbeat] send failed: {e}")
-
-async def setup_jobs(app: Application):
-    app.job_queue.run_repeating(
-        heartbeat,
-        interval=timedelta(minutes=HEARTBEAT_MIN),
-        first=10,
-        name="heartbeat",
-    )
-
-# ===== Main =====
 def build_app() -> Application:
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("Set TELEGRAM_BOT_TOKEN env var")
-
-    print("Bot running | BASE=CoinGecko")
+    # ОБОВ’ЯЗКОВО додаємо .job_queue(), інакше її не буде
     app = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
-        .post_init(setup_jobs)
+        .job_queue()  # <<< це виправляє "No 'JobQueue' set up"
         .build()
     )
 
+    # Handlers
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("signals", signals_cmd))
     app.add_handler(CommandHandler("auto_on", auto_on_cmd))
     app.add_handler(CommandHandler("auto_off", auto_off_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
 
+    # Heartbeat job
+    app.job_queue.run_repeating(
+        heartbeat,
+        interval=timedelta(minutes=HEARTBEAT_MIN),
+        first=10,
+        name="heartbeat"
+    )
     return app
 
 def main():
+    if not TELEGRAM_BOT_TOKEN:
+        print("Set TELEGRAM_BOT_TOKEN env var"); return
+
+    print("Bot running | BASE=CoinGecko")
+
+    # нескінченний цикл: якщо щось впаде — перезапуск через 5с
     while True:
+        app = build_app()
         try:
-            app = build_app()
-            app.run_polling(drop_pending_updates=True)
-            print("[STOP] Polling finished. Restarting in 5s…")
+            app.run_polling(close_loop=False)  # не закриваємо loop, щоб while продовжився
         except Exception as e:
             print(f"[CRASH] {e}. Restarting in 5s…")
-        time.sleep(5)
+            time.sleep(5)
+            continue
+        break
 
 if __name__ == "__main__":
     main()
