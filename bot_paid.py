@@ -329,3 +329,7 @@ def build_app() -> Application:
         jq.run_repeating(heartbeat, interval=timedelta(minutes=HEARTBEAT_MIN), first=10, name="heartbeat")
 
     return app
+
+if __name__ == "__main__":
+    app = build_app()
+    app.run_polling()
