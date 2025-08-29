@@ -310,12 +310,10 @@ def split_long(text: str, chunk_len: int = 3500) -> List[str]:
 # ===================== MAIN =====================
 
 def build_app() -> Application:
-    # ОБОВ’ЯЗКОВО додаємо .job_queue(), інакше її не буде
     app = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
-        .job_queue()  # <<< це виправляє "No 'JobQueue' set up"
-        .build()
+        .build()        # ✅ цього достатньо
     )
 
     # Handlers
@@ -333,7 +331,6 @@ def build_app() -> Application:
         name="heartbeat"
     )
     return app
-
 def main():
     if not TELEGRAM_BOT_TOKEN:
         print("Set TELEGRAM_BOT_TOKEN env var"); return
