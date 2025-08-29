@@ -1,1 +1,1 @@
-worker: python bot_paid.py
+worker: python -u bot_paid.py
