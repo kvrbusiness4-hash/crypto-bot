@@ -309,44 +309,23 @@ def split_long(text: str, chunk_len: int = 3500) -> List[str]:
 
 # ===================== MAIN =====================
 
-def build_app() -> Application:
-    app = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .build()        # ✅ цього достатньо
-    )
+from datetime import timedelta
 
-    # Handlers
+def build_app() -> Application:
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # handlers
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("signals", signals_cmd))
     app.add_handler(CommandHandler("auto_on", auto_on_cmd))
     app.add_handler(CommandHandler("auto_off", auto_off_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
 
-    # Heartbeat job
-    app.job_queue.run_repeating(
-        heartbeat,
-        interval=timedelta(minutes=HEARTBEAT_MIN),
-        first=10,
-        name="heartbeat"
-    )
+    # heartbeat (працює якщо є job-queue)
+    jq = app.job_queue
+    if jq is None:
+        print("[WARN] JobQueue недоступний. Встанови dependency: python-telegram-bot[job-queue]")
+    else:
+        jq.run_repeating(heartbeat, interval=timedelta(minutes=HEARTBEAT_MIN), first=10, name="heartbeat")
+
     return app
-def main():
-    if not TELEGRAM_BOT_TOKEN:
-        print("Set TELEGRAM_BOT_TOKEN env var"); return
-
-    print("Bot running | BASE=CoinGecko")
-
-    # нескінченний цикл: якщо щось впаде — перезапуск через 5с
-    while True:
-        app = build_app()
-        try:
-            app.run_polling(close_loop=False)  # не закриваємо loop, щоб while продовжився
-        except Exception as e:
-            print(f"[CRASH] {e}. Restarting in 5s…")
-            time.sleep(5)
-            continue
-        break
-
-if __name__ == "__main__":
-    main()
