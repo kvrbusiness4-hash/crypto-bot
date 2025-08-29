@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.ext import (
+from telegram.ext import Application
     Application, CommandHandler, ContextTypes,
     MessageHandler, CallbackQueryHandler, filters
 )
@@ -571,40 +571,40 @@ async def plan_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # тут можна налаштувати логіку для вибору тарифів
     await query.edit_message_text(
         text="Виберіть план підписки:\n\n1) 7 днів – 5 USDT\n2) 30 днів – 15 USDT"
-    )
-from datetime import timedelta
-from telegram.ext import Application    
-    async def setup_jobs(app: Application) -> None:
+    )    
+    # ============================== MAIN ==============================
+
+# ЦЯ ФУНКЦІЯ МАЄ БУТИ ВИЩЕ ЗА main().
+# Якщо вже додав — дубль НЕ потрібен.
+async def setup_jobs(app: Application):
+    """Реєструємо періодичний heartbeat після старту бота."""
     hb_minutes = int(os.environ.get("HEARTBEAT_MIN", "60"))
     app.job_queue.run_repeating(
         heartbeat,
         interval=timedelta(minutes=hb_minutes),
         first=10,
     )
-# =====================================================================
-#                   MAIN
-# =====================================================================
-# ================================ MAIN ================================
+
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        print("Set TELEGRAM_BOT_TOKEN or check env")
+        print("Set TELEGRAM_BOT_TOKEN or ENV variable")
         return
 
-    print("Bot running | BASE=CoinGecko | paid access via TRON")
+    print("Bot running | BASE=CoinGecko")
 
-    # 1) ініціалізація локального сховища підписок
+    # 1) ініціалізація локального сховища/підписок (залиши як у тебе)
     subs_init()
 
-    # 2) створюємо застосунок бота
+    # 2) створюємо застосунок бота і підв’язуємо post_init для джоб
     app = (
-    Application
-    .builder()
-    .token(TELEGRAM_BOT_TOKEN)
-    .post_init(setup_jobs)
-    .build()
+        Application
+        .builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(setup_jobs)   # тут реєструється heartbeat після старту
+        .build()
     )
 
-    # 3) Команди
+    # 3) твої хендлери (залиши свій перелік — нижче приклад)
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("signals", signals_cmd))
     app.add_handler(CallbackQueryHandler(plan_cb, pattern=r"^plan:"))
@@ -613,11 +613,9 @@ def main():
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("auto_on", auto_on_cmd))
     app.add_handler(CommandHandler("auto_off", auto_off_cmd))
-    app.add_handler(CallbackQueryHandler(plan_cb, pattern="plan"))
+    # ... інші твої хендлери за потреби ...
 
-    # 4) Heartbeat: пінг адміна кожні N хвилин
-
-    # 5) запуск бота
+    # 4) запуск бота
     app.run_polling()
 
 
