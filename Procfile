@@ -1,1 +1,1 @@
-worker: bash start.sh
+worker: python bot_paid.py
