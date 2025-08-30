@@ -1,345 +1,407 @@
-import os, hmac, hashlib, time, json, math, asyncio, logging
-from datetime import datetime, timezone
-from urllib.parse import urlencode
+import os, time, hmac, hashlib, json, math, asyncio
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Any, List, Tuple, Optional
 
 import aiohttp
+from aiohttp import ClientResponse
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
-    Application, AIORateLimiter, CommandHandler, ContextTypes, JobQueue
+    Application, CommandHandler, ContextTypes, AIORateLimiter
 )
 
-# ---------- CONFIG from ENV ----------
+UTC = timezone.utc
 
-BOT_TOKEN          = os.getenv("TELEGRAM_BOT_TOKEN", "")
-ADMIN_ID           = int(os.getenv("ADMIN_ID", "0"))
+# ======== ENV ========
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-BYBIT_API_KEY      = os.getenv("BYBIT_API_KEY", "")
-BYBIT_API_SECRET   = os.getenv("BYBIT_API_SECRET", "")
-BYBIT_BASE_URL     = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com")
+BYBIT_KEY = os.getenv("BYBIT_API_KEY", "")
+BYBIT_SECRET = os.getenv("BYBIT_API_SECRET", "")
+BYBIT_BASE = os.getenv("BYBIT_BASE", "https://api.bybit.com").rstrip("/")
 
-# trading params (editable командою)
-DEFAULT_SIZE_USDT  = float(os.getenv("SIZE_USDT", "5"))       # 5 USDT
-DEFAULT_LEVERAGE   = int(os.getenv("LEVERAGE", "3"))          # x3
-DEFAULT_SL_PCT     = float(os.getenv("SL_PCT", "3"))          # 3%
-DEFAULT_TP_PCT     = float(os.getenv("TP_PCT", "5"))          # 5%
-TRADE_ENABLED_DEF  = os.getenv("TRADE_ENABLED", "0") in ("1", "true", "True")
+# runtime config (можна міняти з ТГ)
+SIZE_USDT = float(os.getenv("SIZE_USDT", "5"))
+LEVERAGE = int(os.getenv("LEVERAGE", "3"))
+SL_PCT = float(os.getenv("SL_PCT", "3"))       # 3 -> 3%
+TP_PCT = float(os.getenv("TP_PCT", "5"))       # 5 -> 5%
+STRONG_VOTE = float(os.getenv("STRONG_VOTE", "2.2"))  # поріг сили
+TRADE_ENABLED = os.getenv("TRADE_ENABLED", "1") in ("1","true","True","on","ON")
+TRADE_WHITELIST = [s.strip().upper() for s in os.getenv("TRADE_WHITELIST","").split(",") if s.strip()]
 
-# scan
-AUTO_MINUTES_DEF   = int(os.getenv("HEARTBEAT_MINUTES", "15"))  # інтервал автоскану
+FILTER = "TOP30"  # поки фіксовано — як ти просив
 
-# ---------- LOGGING ----------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-L = logging.getLogger("bot")
+# ======== Utils ========
+def now_ts_ms() -> str:
+    return str(int(time.time()*1000))
 
-# ---------- GLOBAL STATE (runtime) ----------
-state = {
-    "size_usdt":  DEFAULT_SIZE_USDT,
-    "leverage":   DEFAULT_LEVERAGE,
-    "sl_pct":     DEFAULT_SL_PCT,
-    "tp_pct":     DEFAULT_TP_PCT,
-    "trade_on":   TRADE_ENABLED_DEF,
-    "auto_job":   None,
-    "auto_mins":  AUTO_MINUTES_DEF,
-    "last_scan":  None,
-    "filter":     "TOP30",   # поки один режим
-}
+def sign(params: Dict[str, Any]) -> str:
+    query = "&".join([f"{k}={params[k]}" for k in sorted(params.keys())])
+    return hmac.new(BYBIT_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
-# ---------- BYBIT HELPERS ----------
-def _ts_ms() -> str:
-    return str(int(time.time() * 1000))
+def fmt_pct(x: float) -> str:
+    return f"{x:.2f}%"
 
-def _sign(payload: str) -> str:
-    return hmac.new(BYBIT_API_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+def safe_get_env_float(val: str, default: float) -> float:
+    try:
+        return float(val)
+    except:
+        return default
 
-async def bybit_public(session: aiohttp.ClientSession, path: str, params: dict = None):
-    url = f"{BYBIT_BASE_URL}{path}"
-    if params:
-        url += "?" + urlencode(params, doseq=True)
-    async with session.get(url, timeout=30) as r:
-        # деякі помилки Bybit віддають text/html -> страхуємося
-        txt = await r.text()
-        try:
-            return json.loads(txt)
-        except json.JSONDecodeError:
-            raise RuntimeError(f"Bybit public non-JSON: {r.status} {txt[:120]}")
+# ======== HTTP with JSON guard ========
+async def ensure_json(resp: ClientResponse) -> Any:
+    ct = resp.headers.get("Content-Type","").lower()
+    txt = await resp.text()
+    if "application/json" not in ct:
+        # Bybit US-block або HTML капча/заглушка
+        raise RuntimeError(f"Bybit non-JSON (possible IP block): {txt[:120]}")
+    try:
+        return json.loads(txt)
+    except Exception as e:
+        raise RuntimeError(f"JSON decode error: {e}; body:{txt[:120]}")
 
-async def bybit_private(session: aiohttp.ClientSession, path: str, method: str = "POST", body: dict = None, query: dict = None):
-    if not (BYBIT_API_KEY and BYBIT_API_SECRET):
-        raise RuntimeError("Bybit keys are not set")
+async def bybit_get(session: aiohttp.ClientSession, path: str, params: Dict[str, Any]) -> Any:
+    url = f"{BYBIT_BASE}{path}"
+    async with session.get(url, params=params, timeout=20) as r:
+        return await ensure_json(r)
 
-    if body is None:
-        body = {}
-    if query is None:
-        query = {}
-
-    t = _ts_ms()
-    recv = "20000"
-    body_str = json.dumps(body) if body else ""
-    qs = urlencode(query) if query else ""
-    prehash = t + BYBIT_API_KEY + recv + body_str
-    sign = _sign(prehash)
-
-    headers = {
-        "X-BAPI-API-KEY": BYBIT_API_KEY,
-        "X-BAPI-SIGN": sign,
-        "X-BAPI-TIMESTAMP": t,
-        "X-BAPI-RECV-WINDOW": recv,
-        "Content-Type": "application/json",
+async def bybit_private_post(session: aiohttp.ClientSession, path: str, body: Dict[str, Any]) -> Any:
+    url = f"{BYBIT_BASE}{path}"
+    if not BYBIT_KEY or not BYBIT_SECRET:
+        raise RuntimeError("BYBIT API keys missing")
+    common = {
+        "api_key": BYBIT_KEY,
+        "timestamp": now_ts_ms(),
+        "recv_window": "5000"
     }
+    allp = {**common, **body}
+    allp["sign"] = sign(allp)
+    headers = {"Content-Type":"application/x-www-form-urlencoded"}
+    async with session.post(url, data=allp, headers=headers, timeout=20) as r:
+        return await ensure_json(r)
 
-    url = f"{BYBIT_BASE_URL}{path}"
-    if qs:
-        url += "?" + qs
+# ======== Market/Indicators ========
+async def fetch_top30_linear(session: aiohttp.ClientSession) -> List[Dict[str,Any]]:
+    """V5 tickers, category=linear; повертаємо топ-30 за 24h turnover"""
+    data = await bybit_get(session, "/v5/market/tickers", {"category":"linear"})
+    lst = data.get("result",{}).get("list",[])
+    # Сортуємо за 24h turnover (quoteVolume(USDT) може називатись "turnover24h")
+    def vol(x):
+        try:
+            return float(x.get("turnover24h","0"))
+        except: return 0.0
+    lst.sort(key=vol, reverse=True)
+    return lst[:30]
 
-    if method == "POST":
-        async with session.post(url, data=body_str, headers=headers, timeout=30) as r:
-            txt = await r.text()
-            try:
-                return json.loads(txt)
-            except json.JSONDecodeError:
-                raise RuntimeError(f"Bybit private non-JSON: {r.status} {txt[:120]}")
-    else:
-        async with session.get(url, headers=headers, timeout=30) as r:
-            txt = await r.text()
-            try:
-                return json.loads(txt)
-            except json.JSONDecodeError:
-                raise RuntimeError(f"Bybit private non-JSON: {r.status} {txt[:120]}")
+async def fetch_ohlc(session: aiohttp.ClientSession, symbol: str, interval: str = "15") -> List[List[float]]:
+    """V5 kline linear"""
+    params = {"category":"linear", "symbol":symbol, "interval":interval, "limit":"200"}
+    data = await bybit_get(session, "/v5/market/kline", params)
+    kl = data.get("result",{}).get("list",[])
+    # list entries: [start, open, high, low, close, volume, turnover]
+    # Вертаю у зручному форматі float close.
+    out=[]
+    for row in kl[::-1]:
+        try:
+            out.append(float(row[4]))
+        except: pass
+    return out
 
-async def ensure_leverage(session: aiohttp.ClientSession, symbol: str, lev: int):
-    # category=linear, mode=REGULAR
-    body = {"category": "linear", "symbol": symbol, "buyLeverage": str(lev), "sellLeverage": str(lev)}
-    res = await bybit_private(session, "/v5/position/set-leverage", "POST", body=body)
-    if str(res.get("retCode")) != "0":
-        raise RuntimeError(f"set-leverage failed: {res}")
+def rsi(values: List[float], period: int=14) -> float:
+    if len(values) < period+1: return 50.0
+    gains=0.0; losses=0.0
+    for i in range(-period,0):
+        diff = values[i] - values[i-1]
+        if diff>0: gains += diff
+        else: losses -= diff
+    if losses==0: return 70.0
+    rs = gains/losses
+    return 100 - (100/(1+rs))
 
-async def place_market_order(session: aiohttp.ClientSession, symbol: str, side: str, qty: str, sl_px: float, tp_px: float):
-    # timeInForce GTC; takeProfit/stopLoss – у лінійних
+def trend_score(r15: float, r30: float, r60: float) -> float:
+    # простий скоринг: чим нижче RSI, тим сильніший short; чим вище — long
+    # сила = |(rsi-50)| сумарно по 3 таймфреймам, масштаб 0..3.5
+    s = (abs(r15-50)+abs(r30-50)+abs(r60-50))/30
+    return round(s,2)
+
+def side_from_rsi(r15: float, r30: float, r60: float) -> str:
+    avg = (r15+r30+r60)/3
+    return "LONG" if avg<50 else "SHORT"  # якщо перепроданість — LONG; перекупленість — SHORT
+
+# ======== Trading ========
+async def ensure_leverage(session: aiohttp.ClientSession, symbol: str, lev: int) -> None:
+    body = {"category":"linear", "symbol":symbol, "buyLeverage":str(lev), "sellLeverage":str(lev)}
+    await bybit_private_post(session, "/v5/position/set-leverage", body)
+
+async def place_order(session: aiohttp.ClientSession, symbol: str, side: str, qty: float,
+                      sl_price: float, tp_price: float) -> Tuple[bool,str]:
     body = {
-        "category": "linear",
-        "symbol": symbol,
-        "side": side,                # "Buy" / "Sell"
-        "orderType": "Market",
-        "qty": qty,
-        "timeInForce": "GTC",
-        "takeProfit": f"{tp_px:.6f}",
-        "stopLoss": f"{sl_px:.6f}",
-        "tpslMode": "Full",
+        "category":"linear",
+        "symbol":symbol,
+        "side": side,                # BUY/LONG або SELL/SHORT у V5: side=Buy/Sell + positionIdx?
+        "orderType":"Market",
+        "qty": str(qty),
+        "timeInForce":"IOC",
+        "reduceOnly":"false",
+        "tpTriggerBy":"LastPrice",
+        "slTriggerBy":"LastPrice",
+        "takeProfit": str(tp_price),
+        "stopLoss": str(sl_price)
     }
-    res = await bybit_private(session, "/v5/order/create", "POST", body=body)
-    return res
+    # V5 очікує side = Buy/Sell
+    body["side"] = "Buy" if side.upper()=="LONG" else "Sell"
+    resp = await bybit_private_post(session, "/v5/order/create", body)
+    ret = resp.get("retCode", -1)
+    if ret==0:
+        return True, resp.get("result",{}).get("orderId","ok")
+    return False, f'{ret} {resp.get("retMsg","")[:120]}'
 
-# ---------- ANALYTICS ----------
-def pick_strong_from_tickers(tickers: list):
-    """
-    Дуже легкий фільтр: беремо пари з USDT з топ-кап (Bybit вже дає популярні),
-    рахуємо «силу» як |price24hPcnt| + обсяг/вага.
-    Віддаємо 1-2 найсильніших із TOP30.
-    """
-    # лишаємо лише *USDT
-    rows = [t for t in tickers if t.get("symbol","").endswith("USDT")]
-    # топ30 за turnover24h (обʼєм)
-    rows.sort(key=lambda x: float(x.get("turnover24h","0") or 0.0), reverse=True)
-    rows = rows[:30]
+def calc_tp_sl(entry: float, side: str, sl_pct: float, tp_pct: float) -> Tuple[float,float]:
+    if side=="LONG":
+        sl = entry * (1 - sl_pct/100)
+        tp = entry * (1 + tp_pct/100)
+    else:
+        sl = entry * (1 + sl_pct/100)
+        tp = entry * (1 - tp_pct/100)
+    return round(sl,4), round(tp,4)
 
-    scored = []
-    for t in rows:
+def calc_qty_usdt(entry: float, size_usdt: float, lev: int) -> float:
+    # qty in coin ≈ (USDT * lev) / price
+    if entry<=0: return 0.0
+    return round((size_usdt*lev)/entry, 6)
+
+# ======== Scanner ========
+async def scan_market(session: aiohttp.ClientSession) -> List[Dict[str,Any]]:
+    top = await fetch_top30_linear(session)
+    picks=[]
+    for t in top:
+        sym = t.get("symbol","")
+        if not sym.endswith("USDT"): 
+            continue
+        if TRADE_WHITELIST and sym not in TRADE_WHITELIST:
+            continue
+        # ціна
         try:
-            ch = abs(float(t.get("price24hPcnt","0")))*100.0  # у %
-            vol = float(t.get("turnover24h","0"))
-            score = ch + math.log10(vol+1)
-            # напрям: якщо 24hPcnt < 0 — short, >0 — long
-            side = "Sell" if float(t.get("price24hPcnt","0")) < 0 else "Buy"
             last = float(t.get("lastPrice","0"))
-            scored.append((score, t["symbol"], side, last))
         except:
             continue
-    scored.sort(reverse=True, key=lambda x: x[0])
-    return scored[:2]  # 1-2 ордери
+        # індикатори
+        close15 = await fetch_ohlc(session, sym, "15")
+        close30 = await fetch_ohlc(session, sym, "30")
+        close60 = await fetch_ohlc(session, sym, "60")
+        r15 = rsi(close15,14); r30=rsi(close30,14); r60=rsi(close60,14)
+        score = trend_score(r15,r30,r60)
+        side = side_from_rsi(r15,r30,r60)
+        picks.append({
+            "symbol": sym, "price": last, "r15":r15, "r30":r30, "r60":r60,
+            "score": score, "side": side
+        })
+    # сильні сигнали
+    picks.sort(key=lambda x: x["score"], reverse=True)
+    strong = [x for x in picks if x["score"]>=STRONG_VOTE]
+    return strong[:2] if strong else []
 
-# ---------- SCAN + (optional) TRADE ----------
-async def do_scan_and_maybe_trade(app: Application):
-    state["last_scan"] = datetime.now(timezone.utc)
-    async with aiohttp.ClientSession() as s:
-        try:
-            # Візьмемо ринок лінійних фʼючерсів
-            data = await bybit_public(s, "/v5/market/tickers", {"category":"linear"})
-        except Exception as e:
-            L.error(f"initial scan error: {e}")
-            return
+# ======== Telegram Handlers ========
+def status_text() -> str:
+    return (f"Статус: {'ON' if AUTO_ON else 'OFF'} · кожні {AUTO_MIN} хв.\n"
+            f"SL={fmt_pct(SL_PCT)} · TP={fmt_pct(TP_PCT)}\n"
+            f"TRADE_ENABLED={'ON' if TRADE_ENABLED else 'OFF'} · SIZE={SIZE_USDT:.2f} USDT\n"
+            f"· LEV={LEVERAGE}\nФільтр: {FILTER}\nUTC: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%SZ')}")
 
-        if str(data.get("retCode")) != "0":
-            L.warning(f"tickers ret !=0: {data}")
-            return
+AUTO_ON = False
+AUTO_MIN = 15
+scheduler: Optional[AsyncIOScheduler] = None
+app: Optional[Application] = None
 
-        tickers = data.get("result", {}).get("list", []) or []
-        picks = pick_strong_from_tickers(tickers)
-
-        # Розсилка сигналів у бот (лише один чат — адмін)
-        if picks:
-            msg_lines = ["📈 Сильні сигнали (топ30)"]
-            for sc, sym, side, price in picks:
-                sl = price * (1 - state["sl_pct"]/100) if side=="Buy" else price * (1 + state["sl_pct"]/100)
-                tp = price * (1 + state["tp_pct"]/100) if side=="Buy" else price * (1 - state["tp_pct"]/100)
-                msg_lines.append(f"• {sym}: *{('LONG' if side=='Buy' else 'SHORT')}* @ {price:.4f} "
-                                 f"SL {state['sl_pct']:.2f}% → {sl:.6f} · TP {state['tp_pct']:.2f}% → {tp:.6f}\n"
-                                 f"lev×{state['leverage']} · size {state['size_usdt']:.2f} USDT · score {sc:.2f}")
-            try:
-                await app.bot.send_message(chat_id=ADMIN_ID, text="\n".join(msg_lines), parse_mode=ParseMode.MARKDOWN)
-            except Exception:
-                pass
-
-        # Автоторгівля
-        if state["trade_on"] and picks and BYBIT_API_KEY and BYBIT_API_SECRET:
-            for _, sym, side, price in picks:
-                # розрахунок кількості: (size_usdt * lev)/price
-                notional = state["size_usdt"] * state["leverage"]
-                qty = max(0.001, round(notional / price, 3))  # округлимо до 0.001
-                sl = price * (1 - state["sl_pct"]/100) if side=="Buy" else price * (1 + state["sl_pct"]/100)
-                tp = price * (1 + state["tp_pct"]/100) if side=="Buy" else price * (1 - state["tp_pct"]/100)
-                try:
-                    async with aiohttp.ClientSession() as s2:
-                        await ensure_leverage(s2, sym, state["leverage"])
-                        res = await place_market_order(s2, sym, side, str(qty), sl, tp)
-                    ok = str(res.get("retCode")) == "0"
-                    text = "✅ Ордер виконано" if ok else f"❌ Помилка ордера: {res.get('retCode')}, {res.get('retMsg')}"
-                except Exception as e:
-                    text = f"❌ Помилка ордера: {e}"
-                try:
-                    await app.bot.send_message(chat_id=ADMIN_ID, text=f"{text}\n{sym} {side} qty={qty}")
-                except Exception:
-                    pass
-
-# ---------- COMMANDS ----------
-def user_ok(update: Update) -> bool:
-    return (ADMIN_ID == 0) or (update.effective_user and update.effective_user.id == ADMIN_ID)
-
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not user_ok(update): return
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Готовий!\n\nКоманди:\n"
-        "/signals — сканувати зараз\n"
-        "/auto_on 15 — автоскан кожні N хв (5–120)\n"
-        "/auto_off — вимкнути автоскан\n"
-        "/trade_on — увімкнути автоторгівлю\n"
-        "/trade_off — вимкнути автоторгівлю\n"
-        "/set_size 5 — сума угоди, USDT\n"
-        "/set_lev 3 — плече\n"
-        "/set_risk 3 5 — SL/TP у %\n"
-        "/status — стан"
+        "Команди:\n"
+        "• /signals — сканувати зараз (+автотрейд якщо увімкнено)\n"
+        f"• /auto_on {AUTO_MIN} — автопуш кожні N хв (5–120)\n"
+        "• /auto_off — вимкнути автопуш\n"
+        "• /set_size 5 — розмір угоди (USDT)\n"
+        "• /set_lev 3 — плече\n"
+        "• /set_risk 3 5 — SL/TP у %\n"
+        "• /trade_on, /trade_off — вмикає/вимикає виставлення ордерів\n"
+        "• /status — стан"
     )
 
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not user_ok(update): return
-    on = "ON" if state["auto_job"] else "OFF"
-    utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
-    txt = (f"Статус: {on} · кожні {state['auto_mins']} хв.\n"
-           f"SL={state['sl_pct']:.2f}% · TP={state['tp_pct']:.2f}%\n"
-           f"TRADE_ENABLED={'ON' if state['trade_on'] else 'OFF'} · SIZE={state['size_usdt']:.2f} USDT · LEV={state['leverage']}\n"
-           f"Фільтр: {state['filter']}\nUTC: {utc}")
-    await update.message.reply_text(txt)
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(status_text())
 
-async def set_size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not user_ok(update): return
+async def cmd_set_size(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global SIZE_USDT
     try:
-        v = float(context.args[0])
-        if v <= 0: raise ValueError()
-        state["size_usdt"] = v
-        await update.message.reply_text(f"✅ Розмір угоди встановлено: {v:.2f} USDT")
+        SIZE_USDT = float(ctx.args[0])
+        await update.message.reply_text(f"✅ Розмір угоди встановлено: {SIZE_USDT:.2f} USDT")
     except:
         await update.message.reply_text("Формат: /set_size 5")
 
-async def set_lev_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not user_ok(update): return
+async def cmd_set_lev(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global LEVERAGE
     try:
-        lev = int(context.args[0])
-        if lev < 1 or lev > 50: raise ValueError()
-        state["leverage"] = lev
-        await update.message.reply_text(f"✅ Плече встановлено: x{lev}")
+        LEVERAGE = max(1, int(ctx.args[0]))
+        await update.message.reply_text(f"✅ Плече: x{LEVERAGE}")
     except:
-        await update.message.reply_text("Формат: /set_lev 3  (1–50)")
+        await update.message.reply_text("Формат: /set_lev 3")
 
-async def set_risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not user_ok(update): return
+async def cmd_set_risk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global SL_PCT, TP_PCT
     try:
-        sl = float(context.args[0]); tp = float(context.args[1])
-        if sl <= 0 or tp <= 0: raise ValueError()
-        state["sl_pct"] = sl; state["tp_pct"] = tp
-        await update.message.reply_text(f"✅ Ризик: SL={sl:.2f}% · TP={tp:.2f}%")
+        sl = safe_get_env_float(ctx.args[0], SL_PCT)
+        tp = safe_get_env_float(ctx.args[1], TP_PCT)
+        SL_PCT, TP_PCT = sl, tp
+        await update.message.reply_text(f"✅ Ризик: SL={fmt_pct(SL_PCT)} · TP={fmt_pct(TP_PCT)}")
     except:
         await update.message.reply_text("Формат: /set_risk 3 5")
 
-async def signals_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not user_ok(update): return
-    await update.message.reply_text("🔎 Сканую ринок…")
-    await do_scan_and_maybe_trade(context.application)
+async def cmd_trade_on(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global TRADE_ENABLED
+    TRADE_ENABLED = True
+    await update.message.reply_text("Автоторгівля: УВІМКНЕНА ✅")
 
-async def auto_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not user_ok(update): return
+async def cmd_trade_off(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global TRADE_ENABLED
+    TRADE_ENABLED = False
+    await update.message.reply_text("Автоторгівля: ВИМКНЕНА ⛔")
+
+async def cmd_auto_on(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global AUTO_ON, AUTO_MIN
     try:
-        mins = int(context.args[0]) if context.args else state["auto_mins"]
-        mins = max(5, min(120, mins))
-        state["auto_mins"] = mins
-    except:
-        pass
+        n = int(ctx.args[0]) if ctx.args else AUTO_MIN
+        n = min(120, max(5, n))
+        AUTO_MIN = n
+        AUTO_ON = True
+        scheduler.add_job(scan_and_maybe_trade, "interval", minutes=AUTO_MIN, next_run_time=datetime.now(UTC))
+        await update.message.reply_text(f"Автоскан увімкнено: кожні {AUTO_MIN} хв.")
+    except Exception as e:
+        await update.message.reply_text(f"Помилка автоскану: {e}")
 
-    if state["auto_job"]:
-        state["auto_job"].schedule_removal()
-        state["auto_job"] = None
-
-    job = context.job_queue.run_repeating(lambda ctx: asyncio.create_task(do_scan_and_maybe_trade(ctx.application)),
-                                          interval=state["auto_mins"]*60, first=1)
-    state["auto_job"] = job
-    await update.message.reply_text(f"Автоскан увімкнено: кожні {state['auto_mins']} хв.")
-
-async def auto_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not user_ok(update): return
-    if state["auto_job"]:
-        state["auto_job"].schedule_removal()
-        state["auto_job"] = None
+async def cmd_auto_off(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global AUTO_ON
+    AUTO_ON = False
+    for j in scheduler.get_jobs():
+        j.remove()
     await update.message.reply_text("Автоскан вимкнено.")
 
-async def trade_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not user_ok(update): return
-    state["trade_on"] = True
-    await update.message.reply_text("Автоторгівля: УВІМКНЕНО ✅")
+def score_block(s: Dict[str,Any]) -> str:
+    return (f"{s['symbol']}: *{s['side']}* @ {s['price']:.4f} "
+            f"• score {s['score']}\n"
+            f"RSI15={s['r15']:.1f} | RSI30={s['r30']:.1f} | RSI60={s['r60']:.1f}")
 
-async def trade_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not user_ok(update): return
-    state["trade_on"] = False
-    await update.message.reply_text("Автоторгівля: ВИМКНЕНО ⛔️")
+async def cmd_signals(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔎 Сканую ринок…")
+    text=""
+    async with aiohttp.ClientSession() as session:
+        try:
+            picks = await scan_market(session)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Помилка сканера: {e}")
+            return
+        if not picks:
+            await update.message.reply_text("⚠️ Сильних сигналів не знайдено.")
+            return
+        for p in picks:
+            text += "• "+score_block(p)+"\n\n"
+        await update.message.reply_text(f"📈 Сильні сигнали (топ30)\n\n{text}", parse_mode=ParseMode.MARKDOWN)
 
-# ---------- MAIN ----------
-def build_app() -> Application:
+        if TRADE_ENABLED:
+            results=[]
+            for p in picks:
+                symbol = p["symbol"]
+                side = p["side"]
+                price = p["price"]
+                qty = calc_qty_usdt(price, SIZE_USDT, LEVERAGE)
+                sl, tp = calc_tp_sl(price, side, SL_PCT, TP_PCT)
+                try:
+                    await ensure_leverage(session, symbol, LEVERAGE)
+                    ok, msg = await place_order(session, symbol, side, qty, sl, tp)
+                    if ok:
+                        results.append(f"✅ Ордер {symbol} {side} qty={qty} SL={sl} TP={tp}")
+                    else:
+                        results.append(f"❌ {symbol}: {msg}")
+                except Exception as e:
+                    results.append(f"❌ {symbol}: {e}")
+            await update.message.reply_text("\n".join(results))
+
+async def scan_and_maybe_trade():
+    # для JobQueue / scheduler
+    try:
+        dummy_update = None
+        dummy_ctx = None
+        # посилаємо сигнал в ADMIN чат якщо є
+        async with aiohttp.ClientSession() as session:
+            picks = await scan_market(session)
+            if not picks:
+                if app and ADMIN_ID:
+                    await app.bot.send_message(ADMIN_ID, "⚠️ Сильних сигналів не знайдено.")
+                return
+            msg = "📈 Сильні сигнали (топ30)\n\n" + "\n\n".join(["• "+score_block(p) for p in picks])
+            if app and ADMIN_ID:
+                await app.bot.send_message(ADMIN_ID, msg, parse_mode=ParseMode.MARKDOWN)
+
+            if TRADE_ENABLED:
+                res=[]
+                for p in picks:
+                    symbol=p["symbol"]; side=p["side"]; price=p["price"]
+                    qty = calc_qty_usdt(price, SIZE_USDT, LEVERAGE)
+                    sl, tp = calc_tp_sl(price, side, SL_PCT, TP_PCT)
+                    try:
+                        await ensure_leverage(session, symbol, LEVERAGE)
+                        ok, mid = await place_order(session, symbol, side, qty, sl, tp)
+                        res.append(("✅" if ok else "❌")+f" {symbol} {side} qty={qty} SL={sl} TP={tp} {mid}")
+                    except Exception as e:
+                        res.append(f"❌ {symbol}: {e}")
+                if app and ADMIN_ID:
+                    await app.bot.send_message(ADMIN_ID, "\n".join(res))
+    except Exception as e:
+        if app and ADMIN_ID:
+            await app.bot.send_message(ADMIN_ID, f"❌ Помилка автосканера: {e}")
+
+# ======== Main ========
+async def main():
+    global scheduler, app
     if not BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is empty")
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
 
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .rate_limiter(AIORateLimiter())  # <— потребує extras у requirements
-        .build()
-    )
+    app = (Application.builder()
+           .token(BOT_TOKEN)
+           .rate_limiter(AIORateLimiter())
+           .build())
 
-    app.add_handler(CommandHandler("start",      start_cmd))
-    app.add_handler(CommandHandler("status",     status_cmd))
-    app.add_handler(CommandHandler("signals",    signals_cmd))
-    app.add_handler(CommandHandler("auto_on",    auto_on_cmd))
-    app.add_handler(CommandHandler("auto_off",   auto_off_cmd))
-    app.add_handler(CommandHandler("trade_on",   trade_on_cmd))
-    app.add_handler(CommandHandler("trade_off",  trade_off_cmd))
-    app.add_handler(CommandHandler("set_size",   set_size_cmd))
-    app.add_handler(CommandHandler("set_lev",    set_lev_cmd))
-    app.add_handler(CommandHandler("set_risk",   set_risk_cmd))
-    return app
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("set_size", cmd_set_size))
+    app.add_handler(CommandHandler("set_lev", cmd_set_lev))
+    app.add_handler(CommandHandler("set_risk", cmd_set_risk))
+    app.add_handler(CommandHandler("trade_on", cmd_trade_on))
+    app.add_handler(CommandHandler("trade_off", cmd_trade_off))
+    app.add_handler(CommandHandler("signals", cmd_signals))
+    app.add_handler(CommandHandler("auto_on", cmd_auto_on))
+    app.add_handler(CommandHandler("auto_off", cmd_auto_off))
+
+    scheduler = AsyncIOScheduler(timezone=UTC)
+    scheduler.start()
+
+    # heartbeat (видно у логах, що бот живий)
+    async def heartbeat(ctx):
+        if ADMIN_ID:
+            try:
+                await app.bot.send_message(ADMIN_ID, "💓 heartbeat")
+            except: pass
+    scheduler.add_job(lambda: None, "interval", minutes=60)  # заглушка для видимості планувальника
+
+    print("Starting bot…")
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    # не виходимо
+    while True:
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
-    L.info("Starting bot…")
-    app = build_app()
-
-    # якщо є job_queue
-    if app.job_queue:
-        app.job_queue.run_repeating(lambda ctx: L.info("heartbeat"), interval=600, first=30)
-
-    app.run_polling(close_loop=False)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
