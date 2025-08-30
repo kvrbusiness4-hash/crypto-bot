@@ -3,11 +3,11 @@
 
 import os
 import logging
+import asyncio   # <-- додай цей рядок
 from typing import Any, Dict, Optional
 
 import requests
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
 from telegram import Update
 from telegram.ext import (
     Application,
