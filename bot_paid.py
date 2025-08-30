@@ -359,49 +359,34 @@ async def scan_and_maybe_trade():
         if app and ADMIN_ID:
             await app.bot.send_message(ADMIN_ID, f"❌ Помилка автосканера: {e}")
 
-# ======== Main ========
-async def main():
-    global scheduler, app
-    if not BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
+# ======= Main ========
+def main():
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
 
-    app = (Application.builder()
-           .token(BOT_TOKEN)
-           .rate_limiter(AIORateLimiter())
-           .build())
+    # Команди
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("set_size", cmd_set_size))
+    application.add_handler(CommandHandler("set_lev", cmd_set_lev))
+    application.add_handler(CommandHandler("set_risk", cmd_set_risk))
+    application.add_handler(CommandHandler("trade_on", cmd_trade_on))
+    application.add_handler(CommandHandler("trade_off", cmd_trade_off))
+    application.add_handler(CommandHandler("signals", cmd_signals))
+    application.add_handler(CommandHandler("auto_on", cmd_auto_on))
+    application.add_handler(CommandHandler("auto_off", cmd_auto_off))
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("set_size", cmd_set_size))
-    app.add_handler(CommandHandler("set_lev", cmd_set_lev))
-    app.add_handler(CommandHandler("set_risk", cmd_set_risk))
-    app.add_handler(CommandHandler("trade_on", cmd_trade_on))
-    app.add_handler(CommandHandler("trade_off", cmd_trade_off))
-    app.add_handler(CommandHandler("signals", cmd_signals))
-    app.add_handler(CommandHandler("auto_on", cmd_auto_on))
-    app.add_handler(CommandHandler("auto_off", cmd_auto_off))
-
+    # Scheduler для heartbeat чи автоскану (якщо треба)
     scheduler = AsyncIOScheduler(timezone=UTC)
     scheduler.start()
+    scheduler.add_job(lambda: None, "interval", minutes=60)  # заглушка
 
-    # heartbeat (видно у логах, що бот живий)
-    async def heartbeat(ctx):
-        if ADMIN_ID:
-            try:
-                await app.bot.send_message(ADMIN_ID, "💓 heartbeat")
-            except: pass
-    scheduler.add_job(lambda: None, "interval", minutes=60)  # заглушка для видимості планувальника
-
-    print("Starting bot…")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    # не виходимо
-    while True:
-        await asyncio.sleep(3600)
+    print("🚀 Bot is running...")
+    application.run_polling(drop_pending_updates=True)
+    
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    main()
