@@ -2,8 +2,6 @@
 # -*- coding: utf-8 -*-
 
 import os
-import json
-import asyncio
 import logging
 from typing import Any, Dict, Optional
 
@@ -16,6 +14,7 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
+    AIORateLimiter,   # ✅ правильний імпорт
 )
 from telegram.ext._rate_limiter import AIORateLimiter  # PTB 20.x
 
