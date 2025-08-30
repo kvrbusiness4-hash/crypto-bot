@@ -177,15 +177,42 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text)
 
+# ======= /status =======
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Визначаємо інтервал автоскану (в хвилинах) без крешів
+    def get_interval_min(job) -> int:
+        if not job:
+            return int(DEFAULT_SCAN_MIN)
+        try:
+            # APScheduler: job.trigger.interval -> timedelta
+            trig = getattr(job, "trigger", None)
+            if trig is not None:
+                iv = getattr(trig, "interval", None)
+                if iv is not None:
+                    # timedelta
+                    sec = int(getattr(iv, "total_seconds", lambda: iv.total_seconds())())
+                    return max(1, sec // 60) if sec >= 60 else max(1, sec)
+            # PTB JobQueue (деякі версії мають .interval у секундах/td)
+            iv = getattr(job, "interval", None)
+            if iv is not None:
+                if hasattr(iv, "total_seconds"):
+                    sec = int(iv.total_seconds())
+                else:
+                    sec = int(iv)
+                return max(1, sec // 60) if sec >= 60 else max(1, sec)
+        except Exception:
+            pass
+        return int(DEFAULT_SCAN_MIN)
+
+    interval_min = get_interval_min(auto_scan_job)
     proxy_state = "используется" if PROXY_URL else "не используется"
+
     text = (
-        f"Статус: {'ON' if auto_scan_job else 'OFF'} · каждые "
-        f"{DEFAULT_SCAN_MIN if not auto_scan_job else int(auto_scan_job.interval.total_seconds()/60)} мин.\n"
+        f"Статус: {'ON' if auto_scan_job else 'OFF'} · каждые {interval_min} мин.\n"
         f"SL={SL_PCT:.2f}% · TP={TP_PCT:.2f}%\n"
         f"TRADE_ENABLED={'ON' if TRADE_ENABLED else 'OFF'} · SIZE={SIZE_USDT:.2f} USDT\n"
         f"· LEV={LEVERAGE}\n"
-        "Фильтр: TOP30\n"
+        f"Фильтр: TOP30\n"
         f"Прокси: {proxy_state}\n"
         f"UTC: {utc_now_str()}"
     )
