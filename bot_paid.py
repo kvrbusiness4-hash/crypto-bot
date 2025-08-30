@@ -16,7 +16,6 @@ from telegram.ext import (
     ContextTypes,
     AIORateLimiter,   # ← ось тут тепер правильно
 )
-from telegram.ext._rate_limiter import AIORateLimiter  # PTB 20.x
 
 # ------------ Логи ------------
 logging.basicConfig(
