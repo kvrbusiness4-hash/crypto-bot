@@ -14,7 +14,7 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
-    AIORateLimiter,   # ✅ правильний імпорт
+    AIORateLimiter,   # ← ось тут тепер правильно
 )
 from telegram.ext._rate_limiter import AIORateLimiter  # PTB 20.x
 
