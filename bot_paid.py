@@ -337,6 +337,9 @@ def build_app() -> Application:
 if __name__ == "__main__":
     L.info("Starting bot…")
     app = build_app()
-    # невеликий «heartbeat» кожні 10 хв для живості
-    app.job_queue.run_repeating(lambda ctx: L.info("heartbeat"), interval=600, first=30)
+
+    # якщо є job_queue
+    if app.job_queue:
+        app.job_queue.run_repeating(lambda ctx: L.info("heartbeat"), interval=600, first=30)
+
     app.run_polling(close_loop=False)
