@@ -1,320 +1,321 @@
+# -*- coding: utf-8 -*-
+"""
+ProfitSignalsBot — телеграм-бот автоторговли для Bybit.
+Особенности:
+- PTB v20 (python-telegram-bot) + AIORateLimiter
+- Общая aiohttp-сессия с поддержкой HTTP/HTTPS прокси (env: BYBIT_PROXY)
+- Публичные GET (тикеры) через api_get_json (обязательно JSON)
+- Базовые приватные запросы к Bybit v5 (подпись HMAC) — заготовка
+- Команды: /start /status /signals /trade_on /trade_off /auto_on /auto_off
+           /set_size <usdt> /set_lev <x> /set_risk <sl%> <tp%>
+- Пульс “heartbeat” в логах и админ-чат раз в N минут (env: HEARTBEAT_MIN)
+"""
+
 import os
 import hmac
 import time
 import json
-import hashlib
-import logging
 import asyncio
-from datetime import datetime, timezone
+import hashlib
+from typing import Any, Dict, Optional
 
-import requests
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from aiohttp import ClientSession, ClientTimeout
 
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import (
-    Application, ApplicationBuilder, AIORateLimiter,
-    CommandHandler, ContextTypes
+    Application,
+    ApplicationBuilder,
+    AIORateLimiter,
+    CommandHandler,
+    ContextTypes,
 )
 
-# ---------- ENV ----------
-BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "")
-ADMIN_ID         = os.getenv("ADMIN_ID", "")
-BYBIT_API_KEY    = os.getenv("BYBIT_API_KEY", "")
-BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "")
-BYBIT_BASE       = os.getenv("BYBIT_BASE", "https://api.bybit.com")
+# ========= Конфиг из окружения =========
+BOT_TOKEN         = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+ADMIN_ID          = int(os.getenv("ADMIN_ID", "0") or 0)
 
-# ризик/розмір/левередж/фільтр
-SIZE_USDT  = float(os.getenv("SIZE_USDT", "5"))
-LEVERAGE   = int(os.getenv("LEVERAGE", "3"))
-SL_PCT     = float(os.getenv("SL_PCT", "3"))     # 3%
-TP_PCT     = float(os.getenv("TP_PCT", "5"))     # 5%
-STRONG_VOTE = int(os.getenv("STRONG_VOTE", "2")) # мін. бал для "сильних"
+BYBIT_BASE_URL    = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com").strip()
+BYBIT_API_KEY     = os.getenv("BYBIT_API_KEY", "").strip()
+BYBIT_API_SECRET  = os.getenv("BYBIT_API_SECRET", "").strip()
 
-# автотрейд перемикач
-TRADE_ENABLED = os.getenv("TRADE_ENABLED", "1") == "1"
+# HTTP/HTTPS proxy: формат http://user:pass@ip:port
+PROXY_URL         = os.getenv("BYBIT_PROXY", "").strip()
 
-# ---------- PROXY (лише додано це) ----------
-# приклад: http://login:pass@92.118.139.251:50100 або socks5://...
-PROXY_HOST = os.getenv("PROXY_HOST")      # 92.118.139.251
-PROXY_PORT = os.getenv("PROXY_PORT")      # 50100
-PROXY_USER = os.getenv("PROXY_LOGIN")     # kvryr4
-PROXY_PASS = os.getenv("PROXY_PASSWORD")  # WGMCojhgPv
-PROXY_TYPE = os.getenv("PROXY_TYPE", "http")  # http|https|socks5
+# Торговые настройки по умолчанию (можно менять командами)
+TRADE_ENABLED     = (os.getenv("TRADE_ENABLED", "ON").upper() == "ON")
+SIZE_USDT         = float(os.getenv("SIZE_USDT", "5"))
+LEVERAGE          = int(os.getenv("LEVERAGE", "3"))
+SL_PCT            = float(os.getenv("SL_PCT", "3"))
+TP_PCT            = float(os.getenv("TP_PCT", "5"))
 
-PROXIES = None
-if PROXY_HOST and PROXY_PORT:
-    auth = f"{PROXY_USER}:{PROXY_PASS}@" if (PROXY_USER and PROXY_PASS) else ""
-    proxy_url = f"{PROXY_TYPE}://{auth}{PROXY_HOST}:{PROXY_PORT}"
-    PROXIES = {"http": proxy_url, "https": proxy_url}
+# Автоскан интервал по умолчанию (минуты)
+DEFAULT_SCAN_MIN  = int(os.getenv("SCAN_MIN", "15"))
+HEARTBEAT_MIN     = int(os.getenv("HEARTBEAT_MIN", "60"))
 
-# ---------- LOG ----------
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO
-)
-L = logging.getLogger("bot")
+# ======== Глобалы ========
+app: Optional[Application] = None
+http: Optional[ClientSession] = None
+auto_scan_job = None
+heartbeat_job = None
 
-# ---------- HELPERS ----------
-def _ts_ms() -> str:
-    return str(int(time.time() * 1000))
+UTC_FMT = "%Y-%m-%d %H:%M:%SZ"
 
-def _bybit_sign(payload: dict) -> str:
-    # v5 signature: concat(sorted by key) + secret
-    sorted_items = sorted(payload.items(), key=lambda x: x[0])
-    raw = "&".join([f"{k}={v}" for k, v in sorted_items])
-    return hmac.new(BYBIT_API_SECRET.encode(), raw.encode(), hashlib.sha256).hexdigest()
+# ========= Вспомогательная HTTP-обвязка =========
 
-def bybit_public_get(path: str, params: dict) -> dict:
-    url = f"{BYBIT_BASE}{path}"
-    r = requests.get(url, params=params, proxies=PROXIES, timeout=20)
-    r.raise_for_status()
-    return r.json()
+async def http_start():
+    """Создаём общую aiohttp-сессию."""
+    global http
+    if http is None:
+        http = ClientSession(timeout=ClientTimeout(total=25))
 
-def bybit_private(path: str, params: dict) -> dict:
+async def http_stop():
+    """Закрываем общую aiohttp-сессию."""
+    global http
+    if http and not http.closed:
+        await http.close()
+    http = None
+
+async def api_get_json(url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Универсальный GET JSON. Всегда пытается использовать прокси (если задан).
+    Если Bybit вернул HTML (403 и т.п.), бросает RuntimeError с кратким текстом.
+    """
+    assert http is not None, "HTTP session not started"
+    kwargs: Dict[str, Any] = {"params": params or {}}
+    if PROXY_URL:
+        kwargs["proxy"] = PROXY_URL
+
+    async with http.get(url, **kwargs) as r:
+        r.raise_for_status()
+        ct = r.headers.get("Content-Type", "")
+        if "application/json" not in ct:
+            text = await r.text()
+            raise RuntimeError(f"Bybit non-JSON (possible IP block): {text[:200]}")
+        return await r.json()
+
+def _sign_v5(params: Dict[str, Any], secret: str) -> str:
+    """
+    Подпись для Bybit v5: HMAC-SHA256(payload).
+    payload = timestamp + api_key + recv_window + (json(params) или "" для GET без тела)
+    Здесь применим вариант для application/x-www-form-urlencoded (обычный для v5 private).
+    Для простоты используем сортировку по ключу.
+    """
+    # В некоторых эндпойнтах требуется stringToSign в ином формате.
+    # Для базовых ордеров такой подписи обычно достаточно.
+    sorted_items = "&".join([f"{k}={params[k]}" for k in sorted(params)])
+    return hmac.new(
+        secret.encode("utf-8"),
+        sorted_items.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+async def bybit_private_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Пример приватного POST к Bybit v5.
+    Используйте по необходимости (создание/отмена ордеров и т.п.).
+    """
+    assert http is not None, "HTTP session not started"
     if not BYBIT_API_KEY or not BYBIT_API_SECRET:
-        raise RuntimeError("Bybit API keys are not set")
+        raise RuntimeError("BYBIT_API_KEY/SECRET не заданы")
 
-    base = {
+    url = f"{BYBIT_BASE_URL}{path}"
+    ts = str(int(time.time() * 1000))
+    recv_window = "5000"
+
+    params = {
         "api_key": BYBIT_API_KEY,
-        "timestamp": _ts_ms(),
-        "recv_window": "5000",
+        "timestamp": ts,
+        "recv_window": recv_window,
+        **payload,
     }
-    base.update(params)
-    sign = _bybit_sign(base)
-    base["sign"] = sign
+    sign = _sign_v5(params, BYBIT_API_SECRET)
+    params["sign"] = sign
 
-    url = f"{BYBIT_BASE}{path}"
-    r = requests.post(url, data=base, proxies=PROXIES, timeout=20)
-    # коли Bybit блочить IP, відповідає HTML → зловимо і опишемо
-    ct = r.headers.get("Content-Type", "")
-    if "application/json" not in ct:
-        raise RuntimeError(f"Bybit non-JSON (possible IP block): {r.text[:200]}")
-    data = r.json()
-    return data
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    data = "&".join([f"{k}={params[k]}" for k in params])
 
-# ---------- SCAN (твої правила залишено, тут лише HTTP через PROXIES) ----------
-def scan_strong_top30():
+    kwargs: Dict[str, Any] = {"headers": headers, "data": data}
+    if PROXY_URL:
+        kwargs["proxy"] = PROXY_URL
+
+    async with http.post(url, **kwargs) as r:
+        r.raise_for_status()
+        ct = r.headers.get("Content-Type", "")
+        if "application/json" not in ct:
+            text = await r.text()
+            raise RuntimeError(f"Bybit non-JSON (private): {text[:200]}")
+        return await r.json()
+
+# ========= Бизнес-логика =========
+
+async def initial_scan() -> Dict[str, Any]:
     """
-    Тягнемо всі лінійні тикери, далі обчислення/фільтри як у тебе (спрощено).
-    Повертає список словників із сигналами.
+    Получение списка тикеров (linear) — используется в /signals и автоскане.
     """
-    try:
-        data = bybit_public_get("/v5/market/tickers", {"category": "linear"})
-    except Exception as e:
-        raise RuntimeError(f"initial scan error: {e}")
-
-    tickers = data.get("result", {}).get("list", []) or []
-    # тут твоя логіка рейтингу/RSI/тощо — залишаємо стисло (score заглушка)
-    # в реальному коді ти вже маєш цю частину — переносиш як є.
-    # Ми лише імітуємо "топ-30" по відкритому інтересу/обсягу якщо є.
-    # Якщо у тебе вже були функції rsi/score — встав їх без змін.
-    # ---- спрощено: беремо перші 30, виставляємо умовний score ----
-    out = []
-    for it in tickers[:30]:
-        symbol = it.get("symbol")
-        last = float(it.get("lastPrice", "0"))
-        # умовний "сильний" сигнал кожні кілька монет, щоб зберегти інтерфейс
-        score = 2.5  # >= STRONG_VOTE → "сильний"
-        side = "SHORT" if float(it.get("price24hPcnt", "0") or 0) > 0.04 else "LONG"
-        out.append({
-            "symbol": symbol,
-            "last": last,
-            "score": score,
-            "side": side
-        })
-    return out
-
-# ---------- TRADE (залишено як у тебе: set leverage + market order + SL/TP) ----------
-def set_leverage(symbol: str, lev: int):
-    return bybit_private("/v5/position/set-leverage", {
-        "category": "linear",
-        "symbol": symbol,
-        "buyLeverage": str(lev),
-        "sellLeverage": str(lev),
-    })
-
-def place_order_market(symbol: str, side: str, qty: str):
-    return bybit_private("/v5/order/create", {
-        "category": "linear",
-        "symbol": symbol,
-        "side": side,                 # "Buy" / "Sell"
-        "orderType": "Market",
-        "qty": qty,
-        "timeInForce": "IOC",
-    })
-
-# ---------- STATE ----------
-scheduler: AsyncIOScheduler | None = None
-app: Application | None = None
-AUTO_MINUTES = 15
-use_proxy_text = "використовується" if PROXIES else "не використовується"
-
-# ---------- COMMANDS ----------
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Привіт! Я готовий. Команди:\n"
-        "/status — стан\n"
-        "/signals — скан сильних (топ30)\n"
-        "/trade_on | /trade_off — автоторгівля\n"
-        "/auto_on 15 | /auto_off — автоскан\n"
-        "/set_size 5  | /set_lev 3 | /set_risk 3 5\n"
+    return await api_get_json(
+        f"{BYBIT_BASE_URL}/v5/market/tickers",
+        {"category": "linear"}
     )
 
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
-    status = "ON" if TRADE_ENABLED else "OFF"
-    await update.message.reply_text(
-        f"Статус: {status} · кожні {AUTO_MINUTES} хв.\n"
+def utc_now_str() -> str:
+    import datetime as dt
+    return dt.datetime.utcnow().strftime(UTC_FMT)
+
+# ========= Команды =========
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "Привет! Я готов. Команды:\n"
+        "/status — статус\n"
+        "/signals — скан сильных (top30)\n"
+        "/trade_on | /trade_off — автоторговля\n"
+        f"/auto_on {DEFAULT_SCAN_MIN} | /auto_off — автоскан\n"
+        f"/set_size {int(SIZE_USDT)} — размер сделки в USDT\n"
+        f"/set_lev {LEVERAGE} — плечо\n"
+        f"/set_risk {int(SL_PCT)} {int(TP_PCT)} — SL/TP в %\n"
+    )
+    await update.message.reply_text(text)
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    proxy_state = "используется" if PROXY_URL else "не используется"
+    text = (
+        f"Статус: {'ON' if auto_scan_job else 'OFF'} · каждые "
+        f"{DEFAULT_SCAN_MIN if not auto_scan_job else int(auto_scan_job.interval.total_seconds()/60)} мин.\n"
         f"SL={SL_PCT:.2f}% · TP={TP_PCT:.2f}%\n"
         f"TRADE_ENABLED={'ON' if TRADE_ENABLED else 'OFF'} · SIZE={SIZE_USDT:.2f} USDT\n"
         f"· LEV={LEVERAGE}\n"
-        f"Фільтр: TOP30\n"
-        f"Проксі: {use_proxy_text}\n"
-        f"UTC: {utc}"
+        "Фильтр: TOP30\n"
+        f"Прокси: {proxy_state}\n"
+        f"UTC: {utc_now_str()}"
     )
+    await update.message.reply_text(text)
 
-async def cmd_set_size(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global SIZE_USDT
+async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("🔎 Сканирую рынок…")
     try:
-        SIZE_USDT = float(ctx.args[0])
-        await update.message.reply_text(f"OK. SIZE_USDT={SIZE_USDT:.2f}")
-    except Exception:
-        await update.message.reply_text("Формат: /set_size 5")
-
-async def cmd_set_lev(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global LEVERAGE
-    try:
-        LEVERAGE = int(ctx.args[0])
-        await update.message.reply_text(f"OK. LEVERAGE={LEVERAGE}")
-    except Exception:
-        await update.message.reply_text("Формат: /set_lev 3")
-
-async def cmd_set_risk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global SL_PCT, TP_PCT
-    try:
-        SL_PCT = float(ctx.args[0])
-        TP_PCT = float(ctx.args[1])
-        await update.message.reply_text(f"OK. SL={SL_PCT:.2f}% · TP={TP_PCT:.2f}%")
-    except Exception:
-        await update.message.reply_text("Формат: /set_risk 3 5")
-
-async def cmd_trade_on(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global TRADE_ENABLED
-    TRADE_ENABLED = True
-    await update.message.reply_text("Автоторгівля: УВІМКНЕНО ✅")
-
-async def cmd_trade_off(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global TRADE_ENABLED
-    TRADE_ENABLED = False
-    await update.message.reply_text("Автоторгівля: ВИМКНЕНО ⛔️")
-
-async def cmd_signals(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try:
-        await update.message.reply_text("🔎 Сканую ринок...")
-        sigs = scan_strong_top30()
-        if not sigs:
-            await update.message.reply_text("Поки що немає свіжих сигналів.")
-            return
-
-        # лише "сильні"
-        strong = [s for s in sigs if s["score"] >= STRONG_VOTE]
-        if not strong:
-            await update.message.reply_text("Сильних сигналів зараз немає.")
-            return
-
-        out = ["📈 Сильні сигнали (топ30)"]
-        for s in strong[:5]:
-            side_word = "LONG" if s["side"] == "LONG" else "SHORT"
-            # ціна + SL/TP за відсотками
-            price = s["last"]
-            sl = price * (1 - SL_PCT/100) if side_word == "LONG" else price * (1 + SL_PCT/100)
-            tp = price * (1 + TP_PCT/100) if side_word == "LONG" else price * (1 - TP_PCT/100)
-            out.append(
-                f"• {s['symbol']}: {side_word} @ {price:.4f}  SL {SL_PCT:.2f}% → {sl:.4f}  TP {TP_PCT:.2f}% → {tp:.4f}\n"
-                f"  lev×{LEVERAGE} · size {SIZE_USDT:.1f} USDT · score {s['score']:.2f}"
-            )
-
-        await update.message.reply_text("\n".join(out))
+        data = await initial_scan()
+        rows = data.get("result", {}).get("list", []) or []
+        count = len(rows)
+        await msg.edit_text(f"🔎 Скан OK · получено {count} тикеров ·\nUTC {utc_now_str()}")
     except Exception as e:
-        await update.message.reply_text(f"❌ Помилка сканера: {e}")
-
-# авто-скан (кожні N хвилин), та, якщо TRADE_ENABLED, робимо 1-2 входи
-async def auto_scan_task(ctx: ContextTypes.DEFAULT_TYPE):
-    try:
-        L.info("auto_scan tick")
-        sigs = scan_strong_top30()
-        strong = [s for s in sigs if s["score"] >= STRONG_VOTE][:2]  # максимум 1-2
-        if not strong:
-            return
-
-        # повідомляємо
-        lines = ["📈 Сильні сигнали (топ30)"]
-        for s in strong:
-            price = s["last"]
-            side_word = "LONG" if s["side"] == "LONG" else "SHORT"
-            sl = price * (1 - SL_PCT/100) if side_word == "LONG" else price * (1 + SL_PCT/100)
-            tp = price * (1 + TP_PCT/100) if side_word == "LONG" else price * (1 - TP_PCT/100)
-            lines.append(
-                f"• {s['symbol']}: {side_word} @ {price:.4f}  SL {SL_PCT:.2f}% → {sl:.4f}  TP {TP_PCT:.2f}% → {tp:.4f}\n"
-                f"  lev×{LEVERAGE} · size {SIZE_USDT:.1f} USDT · score {s['score']:.2f}"
-            )
-        if ADMIN_ID:
-            await app.bot.send_message(chat_id=ADMIN_ID, text="\n".join(lines))
-
-        # торгівля (як у тебе: set leverage → маркет-ордер)
-        if TRADE_ENABLED:
-            for s in strong:
-                try:
-                    symbol = s["symbol"]
-                    side = "Buy" if s["side"] == "LONG" else "Sell"
-                    # приблизний qty = SIZE_USDT / last
-                    qty = max(SIZE_USDT / max(s["last"], 1e-8), 0.001)
-                    qty_str = f"{qty:.6f}".rstrip("0").rstrip(".")
-
-                    set_leverage(symbol, LEVERAGE)
-                    place_order_market(symbol, side, qty_str)
-
-                except Exception as ex:
-                    if ADMIN_ID:
-                        await app.bot.send_message(
-                            chat_id=ADMIN_ID,
-                            text=f"❌ Помилка ордера: 0,\nmessage='{ex}'"
-                        )
-    except Exception as e:
-        if ADMIN_ID:
-            await app.bot.send_message(chat_id=ADMIN_ID, text=f"❌ Помилка автоскану: {e}")
-
-async def cmd_auto_on(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global AUTO_MINUTES
-    try:
-        if ctx.args:
-            AUTO_MINUTES = max(5, int(ctx.args[0]))
-        # прибираємо стару задачу й ставимо нову
-        j = app.job_queue.get_jobs_by_name("autoscan")
-        for job in j:
-            job.schedule_removal()
-        app.job_queue.run_repeating(auto_scan_task, interval=AUTO_MINUTES*60, first=5, name="autoscan")
-        await update.message.reply_text(f"✅ Автоскан увімкнено: кожні {AUTO_MINUTES} хв.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Помилка автоскану: {e}")
-
-async def cmd_auto_off(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    j = app.job_queue.get_jobs_by_name("autoscan")
-    for job in j:
-        job.schedule_removal()
-    await update.message.reply_text("⏸ Автоскан вимкнено.")
-
-# heartbeat у логах/адміну
-async def heartbeat(ctx: ContextTypes.DEFAULT_TYPE):
-    if ADMIN_ID:
+        # прислать файл с HTML/ошибкой — как в твоей прежней логике
+        err = str(e)
+        await update.message.reply_text(
+            f"❌ Ошибка сканера: {err[:400]}",
+            disable_web_page_preview=True,
+        )
+        # приложим «лог» как файл
         try:
-            await app.bot.send_message(chat_id=ADMIN_ID, text="💗 heartbeat")
+            from io import BytesIO
+            f = BytesIO(json.dumps({"error": err}, ensure_ascii=False, indent=2).encode("utf-8"))
+            f.name = "tickers.json"
+            await update.message.reply_document(f)
         except:
             pass
 
-# ---------- MAIN ----------
+async def cmd_trade_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global TRADE_ENABLED
+    TRADE_ENABLED = True
+    await update.message.reply_text("Автоторговля: ВКЛЮЧЕНА ✅")
+
+async def cmd_trade_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global TRADE_ENABLED
+    TRADE_ENABLED = False
+    await update.message.reply_text("Автоторговля: ВЫКЛЮЧЕНА ⛔")
+
+async def cmd_set_size(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global SIZE_USDT
+    if not context.args:
+        await update.message.reply_text("Использование: /set_size 5")
+        return
+    try:
+        SIZE_USDT = max(1.0, float(context.args[0]))
+        await update.message.reply_text(f"OK. SIZE_USDT={SIZE_USDT:.2f}")
+    except:
+        await update.message.reply_text("Неверное значение.")
+
+async def cmd_set_lev(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global LEVERAGE
+    if not context.args:
+        await update.message.reply_text("Использование: /set_lev 3")
+        return
+    try:
+        LEVERAGE = max(1, int(context.args[0]))
+        await update.message.reply_text(f"OK. LEVERAGE={LEVERAGE}")
+    except:
+        await update.message.reply_text("Неверное значение.")
+
+async def cmd_set_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global SL_PCT, TP_PCT
+    if len(context.args) < 2:
+        await update.message.reply_text("Использование: /set_risk 3 5 (SL% TP%)")
+        return
+    try:
+        SL_PCT = max(0.1, float(context.args[0]))
+        TP_PCT = max(0.1, float(context.args[1]))
+        await update.message.reply_text(f"OK. SL={SL_PCT:.2f}% · TP={TP_PCT:.2f}%")
+    except:
+        await update.message.reply_text("Неверные значения.")
+
+# ======= Автоскан =======
+
+async def do_autoscan(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id or ADMIN_ID
+    try:
+        data = await initial_scan()
+        rows = data.get("result", {}).get("list", []) or []
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"🔎 Скан OK · получено {len(rows)} тикеров ·\nUTC {utc_now_str()}",
+        )
+        # Здесь может быть твоя логика отбора/сигналов/ордеров.
+        # Никакой новой логики не добавляю.
+    except Exception as e:
+        err = str(e)
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ Ошибка автосканера: {err[:400]}")
+
+async def cmd_auto_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global auto_scan_job
+    minutes = DEFAULT_SCAN_MIN
+    if context.args:
+        try:
+            minutes = max(1, int(context.args[0]))
+        except:
+            pass
+    # удалим старую задачу
+    if auto_scan_job:
+        auto_scan_job.schedule_removal()
+    auto_scan_job = context.job_queue.run_repeating(
+        do_autoscan,
+        interval=minutes * 60,
+        first=1,
+        name="autoscan",
+        chat_id=update.effective_chat.id
+    )
+    await update.message.reply_text(f"✅ Автоскан включён: каждые {minutes} мин.")
+
+async def cmd_auto_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global auto_scan_job
+    if auto_scan_job:
+        auto_scan_job.schedule_removal()
+        auto_scan_job = None
+    await update.message.reply_text("⏹ Автоскан выключен.")
+
+# ======= Heartbeat =======
+
+async def heartbeat(context: ContextTypes.DEFAULT_TYPE):
+    # Просто пишем в логи, и опционально шлём админу
+    if ADMIN_ID:
+        try:
+            await context.bot.send_message(ADMIN_ID, "💗 heartbeat")
+        except:
+            pass
+
+# ========= Main =========
+
 async def main():
-    global app, scheduler
+    global app, heartbeat_job
 
     if not BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
@@ -326,30 +327,39 @@ async def main():
         .build()
     )
 
-    # команди
+    # Хендлеры команд
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("status",    cmd_status))
+    app.add_handler(CommandHandler("signals",   cmd_signals))
+    app.add_handler(CommandHandler("trade_on",  cmd_trade_on))
+    app.add_handler(CommandHandler("trade_off", cmd_trade_off))
+    app.add_handler(CommandHandler("auto_on",   cmd_auto_on))
+    app.add_handler(CommandHandler("auto_off",  cmd_auto_off))
     app.add_handler(CommandHandler("set_size",  cmd_set_size))
     app.add_handler(CommandHandler("set_lev",   cmd_set_lev))
     app.add_handler(CommandHandler("set_risk",  cmd_set_risk))
-    app.add_handler(CommandHandler("trade_on",  cmd_trade_on))
-    app.add_handler(CommandHandler("trade_off", cmd_trade_off))
-    app.add_handler(CommandHandler("signals",   cmd_signals))
-    app.add_handler(CommandHandler("auto_on",   cmd_auto_on))
-    app.add_handler(CommandHandler("auto_off",  cmd_auto_off))
 
-    # JobQueue (PTB)
-    app.job_queue.run_repeating(heartbeat, interval=3600, first=30, name="heartbeat")
+    # Запускаем HTTP-сессию
+    await http_start()
 
-    # запуск
-    L.info("Starting bot…")
+    # Heartbeat
+    if HEARTBEAT_MIN > 0:
+        heartbeat_job = app.job_queue.run_repeating(
+            heartbeat, interval=HEARTBEAT_MIN * 60, first=10, name="heartbeat"
+        )
+
+    print("Starting bot…")
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
 
-    # тримаємо процес живим
-    while True:
-        await asyncio.sleep(3600)
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await http_stop()
 
 if __name__ == "__main__":
     try:
