@@ -13,21 +13,22 @@ TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 BYBIT_KEY = os.getenv("BYBIT_API_KEY", "").strip()
 BYBIT_SEC = os.getenv("BYBIT_API_SECRET", "").strip()
 BYBIT_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com").rstrip("/")
-BYBIT_PROXY = os.getenv("BYBIT_PROXY", "").strip()  # напр.: http://user:pass@ip:port або socks5://user:pass@ip:port
-# Трейдинг параметри (можна міняти командами)
-SIZE_USDT = float(os.getenv("SIZE_USDT", "5"))   # розмір однієї угоди в USDT
-LEVERAGE  = int(os.getenv("LEVERAGE", "3"))      # плече
-SL_PCT    = float(os.getenv("SL_PCT", "3"))      # стоп-лосс у %
-TP_PCT    = float(os.getenv("TP_PCT", "5"))      # тейк-профіт у %
-MAX_OPEN_POS = int(os.getenv("MAX_OPEN_POS", "2"))  # максимум одночасно відкритих позицій
-DEFAULT_AUTO_MIN = int(os.getenv("DEFAULT_AUTO_MIN", "15"))
+
+# проксі: http://user:pass@ip:port або socks5://user:pass@ip:port
 BYBIT_PROXY = os.getenv("BYBIT_PROXY", "").strip()
 if BYBIT_PROXY:
-    # щоб aiohttp автоматично брав проксі з env
-    os.environ["HTTP_PROXY"]  = BYBIT_PROXY
+    # на випадок, якщо використовуєш HTTP/HTTPS-проксі й хочеш, щоб aiohttp читав їх із env
+    os.environ["HTTP_PROXY"] = BYBIT_PROXY
     os.environ["HTTPS_PROXY"] = BYBIT_PROXY
-# Скільки сигналів показувати / намагатись торгувати (1 або 2)
-TOP_N = int(os.getenv("TOP_N", "2"))
+
+# Трейдинг параметри (можна міняти командами)
+SIZE_USDT = float(os.getenv("SIZE_USDT", "5"))      # розмір однієї угоди в USDT
+LEVERAGE  = int(os.getenv("LEVERAGE", "3"))         # плече
+SL_PCT    = float(os.getenv("SL_PCT", "3"))         # стоп-лосс у %
+TP_PCT    = float(os.getenv("TP_PCT", "5"))         # тейк-профіт у %
+MAX_OPEN_POS = int(os.getenv("MAX_OPEN_POS", "2"))  # максимум одночасно відкритих позицій
+DEFAULT_AUTO_MIN = int(os.getenv("DEFAULT_AUTO_MIN", "15"))
+TOP_N = int(os.getenv("TOP_N", "2"))                # 1 або 2 сигнали
 
 # Логи
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -43,7 +44,6 @@ KB = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True
 )
-
 STATE: Dict[int, Dict[str, int | bool | float]] = {}  # chat_id state
 TRADE_ENABLED = os.getenv("TRADE_ENABLED", "ON").upper() == "ON"
 
@@ -57,21 +57,22 @@ def split_long(text: str, n: int = 3500) -> List[str]:
 
 def utc_now() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
+
 # ============ Proxy helpers ============
 try:
-    # для socks5 потрібен пакет: pip install aiohttp-socks
+    # для socks5 потрібен пакет "aiohttp-socks" (не обов'язково, якщо HTTP/HTTPS проксі)
     from aiohttp_socks import ProxyConnector
 except Exception:
     ProxyConnector = None
 
 def _make_connector():
-    """Повертає ProxyConnector для socks5 або None (для http/https)."""
+    """Повертає ProxyConnector для socks або None (для http/https)."""
     if BYBIT_PROXY and BYBIT_PROXY.startswith(("socks5://", "socks4://")) and ProxyConnector:
         return ProxyConnector.from_url(BYBIT_PROXY)
     return None
 
 def _proxy_kwargs() -> dict:
-    """Повертає kwargs для aiohttp-запитів (http/https проксі через параметр proxy)."""
+    """kwargs для aiohttp-запитів (HTTP/HTTPS проксі через параметр proxy)."""
     if BYBIT_PROXY and BYBIT_PROXY.startswith(("http://", "https://")):
         return {"proxy": BYBIT_PROXY}
     return {}
@@ -80,8 +81,9 @@ def create_session() -> aiohttp.ClientSession:
     """Створює сесію з socks-connector’ом (якщо треба) або звичайну."""
     conn = _make_connector()
     if conn:
-        return aiohttp.ClientSession(connector=conn)
-    return aiohttp.ClientSession()
+        return aiohttp.ClientSession(connector=conn, trust_env=True)
+    return aiohttp.ClientSession(trust_env=True)
+
 # ============ Indicators ============
 def ema(series: List[float], period: int) -> List[float]:
     if not series or period <= 1:
@@ -163,15 +165,13 @@ async def http_json(session: aiohttp.ClientSession, url: str, params: dict | Non
             async with session.get(url, params=params, timeout=25, **_proxy_kwargs()) as r:
                 r.raise_for_status()
                 return await r.json()
-        except Exception as e:
+        except Exception:
             if i == 1:
                 raise
             await asyncio.sleep(0.7)
 
-BYBIT = "https://api.bybit.com"
-
 async def bybit_top_symbols(session: aiohttp.ClientSession, top:int=30) -> List[dict]:
-    data = await http_json(session, f"{BYBIT}/v5/market/tickers", {"category":"linear"})
+    data = await http_json(session, f"{BYBIT_URL}/v5/market/tickers", {"category":"linear"})
     lst = ((data.get("result") or {}).get("list")) or []
     def _volume(x):
         try: return float(x.get("turnover24h") or 0)
@@ -180,7 +180,11 @@ async def bybit_top_symbols(session: aiohttp.ClientSession, top:int=30) -> List[
     return [x for x in lst if str(x.get("symbol","")).endswith("USDT")][:top]
 
 async def bybit_klines(session: aiohttp.ClientSession, symbol: str, interval: str, limit: int = 300) -> List[float]:
-    data = await http_json(session, f"{BYBIT}/v5/market/kline", {"category":"linear","symbol":symbol,"interval":interval,"limit":str(limit)})
+    data = await http_json(
+        session,
+        f"{BYBIT_URL}/v5/market/kline",
+        {"category":"linear","symbol":symbol,"interval":interval,"limit":str(limit)}
+    )
     rows = list(reversed(((data.get("result") or {}).get("list")) or []))
     closes = []
     for r in rows:
@@ -209,7 +213,7 @@ async def private_post(session: aiohttp.ClientSession, path: str, params: Dict[s
             return json.loads(txt)
         except:
             raise RuntimeError(f"HTTP {r.status}: {txt[:400]}")
-            
+
 async def private_get(session: aiohttp.ClientSession, path: str, params: Dict[str, str]) -> dict:
     url = f"{BYBIT_URL}{path}"
     p = sign_v5(params.copy())
@@ -247,7 +251,7 @@ async def ensure_leverage(session: aiohttp.ClientSession, symbol: str, lev: int)
 
 async def place_order_with_sl_tp(session: aiohttp.ClientSession, symbol: str, side: str, size_usdt: float, px: float, sl_pct: float, tp_pct: float):
     """
-    Маркет-ордер з одразу вшитими SL/TP (triggerPrice / takeProfit).
+    Маркет-ордер з одразу вшитими SL/TP.
     """
     qty = max(0.001, round((size_usdt/px), 6))  # приблизно; біржа приведе до мін. кроку
 
@@ -265,12 +269,10 @@ async def place_order_with_sl_tp(session: aiohttp.ClientSession, symbol: str, si
         "orderType":"Market",
         "qty":str(qty),
         "timeInForce":"GoodTillCancel",
-        # TP/SL
         "takeProfit": f"{tp_price:.6f}",
         "stopLoss":   f"{sl_price:.6f}",
         "tpTriggerBy":"LastPrice",
         "slTriggerBy":"LastPrice",
-        # reduce only для SL/TP робить біржа автоматично
     }
     data = await private_post(session, "/v5/order/create", params)
     if str(data.get("retCode")) != "0":
@@ -280,7 +282,7 @@ async def place_order_with_sl_tp(session: aiohttp.ClientSession, symbol: str, si
 # ============ Signals + Trade ============
 async def build_signals_and_trade(chat_id: int) -> str:
     """
-    Скани top30, сформуй сигнали, якщо TRADE_ENABLED — відкрий до 2 позицій.
+    Скани top30, сформуй сигнали; якщо TRADE_ENABLED — відкрий до 2 позицій.
     """
     st = STATE.setdefault(chat_id, {"sl": SL_PCT, "tp": TP_PCT, "top_n": TOP_N})
     sl_pct = float(st.get("sl", SL_PCT))
@@ -363,21 +365,20 @@ async def build_signals_and_trade(chat_id: int) -> str:
         # 4) Трейдинг (до 2 позицій)
         opened = 0
         if TRADE_ENABLED and BYBIT_KEY and BYBIT_SEC:
-            # скільки вже відкрито
             open_count = sum(1 for p in open_pos if float(p.get("size") or 0) > 0)
             can_open = max(0, MAX_OPEN_POS - open_count)
 
             for sc, sym, direction, px, note, bsl, btp in picks:
                 if opened >= can_open:
                     break
-                # не відкривати, якщо вже є позиція в цьому символі
                 if symbol_in_positions(open_pos, sym):
                     report_lines.append(f"• {sym}: {direction} (пропущено — вже відкрита позиція)")
                     continue
                 side = "Buy" if direction=="LONG" else "Sell"
                 try:
                     await ensure_leverage(s, sym, LEVERAGE)
-                except: pass
+                except:
+                    pass
                 try:
                     await place_order_with_sl_tp(s, sym, side, SIZE_USDT, px, bsl, btp)
                     opened += 1
@@ -390,7 +391,6 @@ async def build_signals_and_trade(chat_id: int) -> str:
 
         # 5) Формуємо звіт
         if not report_lines:
-            # просто текст сигналів (якщо трейдинг вимкнено або не відкрив нічого)
             body = []
             for sc, sym, direction, px, note, bsl, btp in picks:
                 if direction == "LONG":
