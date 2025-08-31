@@ -251,68 +251,82 @@ async def build_signals_and_trade(chat_id: int) -> str:
     report_lines = []
 
     async with aiohttp.ClientSession() as s:
+    # 1) Тікери
+    try:
+        tickers = await bybit_top_symbols(s, 15)  # було 30
+    except Exception as e:
+        return f"⚠️ Ринок недоступний: {e}"
+
+    # 2) Поточні позиції (якщо трейд увімкнено)
+    open_pos = []
+    if TRADE_ENABLED and BYBIT_KEY and BYBIT_SEC:
         try:
-            tickers = await bybit_top_symbols(s, 15)   # було 30
+            open_pos = await get_open_positions(s)
         except Exception as e:
-            return f"⚠️ Ринок недоступний: {e}"
+            log.warning("get_open_positions fail: %s", e)
 
-        open_pos = []
-        if TRADE_ENABLED and BYBIT_KEY and BYBIT_SEC:
-            try:
-                open_pos = await get_open_positions(s)
-            except Exception as e:
-                log.warning("get_open_positions fail: %s", e)
+    scored: List[Tuple[float, str, str, float, str, float, float]] = []
 
-        scored: List[Tuple[float, str, str, float, str, float, float]] = []
+    # 3) Оцінка кожного символу
+    for t in tickers:
+        sym = t.get("symbol", "")
 
-        for t in tickers:
-            sym = t.get("symbol","")
-            try:
-                px  = float(t.get("lastPrice") or 0.0)
-                ch24 = float(t.get("price24hPcnt") or 0.0) * 100.0
-            except:
-                px, ch24 = 0.0, 0.0
-            if px <= 0: continue
+        # ціна/зміна
+        try:
+            px = float(t.get("lastPrice") or 0.0)
+            ch24 = float(t.get("price24hPcnt") or 0.0) * 100.0
+        except Exception:
+            px, ch24 = 0.0, 0.0
+        if px <= 0:
+            continue
 
-            try:
-                k15, k30, k60 = await asyncio.gather(
+        # свічки 15/30/60
+        try:
+            k15, k30, k60 = await asyncio.gather(
                 bybit_klines(s, sym, "15", 300),
                 bybit_klines(s, sym, "30", 300),
                 bybit_klines(s, sym, "60", 300),
-                 )
-             except:
-                continue
+            )
+            # невелика пауза, щоб не зловити 429
+            await asyncio.sleep(0.30)
+        except Exception:
+            continue
+        if not (k15 and k30 and k60):
+            continue
 
-# ↓ дати біржі «віддихатись», щоб не ловити 429
-await asyncio.sleep(0.30)   # 0.30–0.40 c — норм
-            if not (k15 and k30 and k60): continue
+        v15 = votes_from_series(k15)
+        v30 = votes_from_series(k30)
+        v60 = votes_from_series(k60)
+        direction = decide_direction(v15["vote"], v30["vote"], v60["vote"])
+        if not direction:
+            continue
 
-            v15 = votes_from_series(k15)
-            v30 = votes_from_series(k30)
-            v60 = votes_from_series(k60)
-            direction = decide_direction(v15["vote"], v30["vote"], v60["vote"])
-            if not direction: continue
+        # SL/TP
+        if float(STATE.setdefault(chat_id, {}).get("sl", SL_PCT)) <= 0 or \
+           float(STATE.setdefault(chat_id, {}).get("tp", TP_PCT)) <= 0:
+            base_sl, base_tp = auto_sl_tp_by_vol(k15, px)
+        else:
+            base_sl = float(STATE[chat_id].get("sl", SL_PCT))
+            base_tp = float(STATE[chat_id].get("tp", TP_PCT))
 
-            if sl_pct <= 0 or tp_pct <= 0:
-                base_sl, base_tp = auto_sl_tp_by_vol(k15, px)
-            else:
-                base_sl, base_tp = sl_pct, tp_pct
+        # score
+        score = v15["vote"] + v30["vote"] + v60["vote"]
+        if v60["ema_trend"] == 1 and direction == "LONG":
+            score += 1
+        if v60["ema_trend"] == -1 and direction == "SHORT":
+            score += 1
+        score += min(2.0, abs(ch24) / 10.0)
 
-            score = v15["vote"] + v30["vote"] + v60["vote"]
-            if v60["ema_trend"] == 1 and direction == "LONG": score += 1
-            if v60["ema_trend"] == -1 and direction == "SHORT": score += 1
-            score += min(2.0, abs(ch24)/10.0)
+        def mark(v):
+            r = v["rsi"]; rtxt = f"{r:.0f}" if isinstance(r, (int, float)) else "-"
+            m = v["macd"]; sgn = v["sig"]
+            mtxt = "↑" if (m is not None and sgn is not None and m > sgn) else \
+                   ("↓" if (m is not None and sgn is not None and m < sgn) else "·")
+            et = v["ema_trend"]; etxt = "↑" if et == 1 else ("↓" if et == -1 else "·")
+            return f"RSI:{rtxt} MACD:{mtxt} EMA:{etxt}"
 
-            def mark(v):
-                r = v["rsi"]; rtxt = f"{r:.0f}" if isinstance(r,(int,float)) else "-"
-                m = v["macd"]; sgn = v["sig"]
-                mtxt = "↑" if (m is not None and sgn is not None and m > sgn) else ("↓" if (m is not None and sgn is not None and m < sgn) else "·")
-                et = v["ema_trend"]; etxt = "↑" if et==1 else ("↓" if et==-1 else "·")
-                return f"RSI:{rtxt} MACD:{mtxt} EMA:{etxt}"
-
-            note = f"15m[{mark(v15)}] | 30m[{mark(v30)}] | 1h[{mark(v60)}]"
-            scored.append((float(score), sym, direction, px, note, float(base_sl), float(base_tp)))
-
+        note = f"15m[{mark(v15)}] | 30m[{mark(v30)}] | 1h[{mark(v60)}]"
+        scored.append((float(score), sym, direction, px, note, float(base_sl), float(base_tp)))
         if not scored:
             return "⚠️ Узгоджених сильних сигналів немає."
 
