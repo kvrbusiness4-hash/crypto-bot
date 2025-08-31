@@ -21,7 +21,11 @@ SL_PCT    = float(os.getenv("SL_PCT", "3"))      # стоп-лосс у %
 TP_PCT    = float(os.getenv("TP_PCT", "5"))      # тейк-профіт у %
 MAX_OPEN_POS = int(os.getenv("MAX_OPEN_POS", "2"))  # максимум одночасно відкритих позицій
 DEFAULT_AUTO_MIN = int(os.getenv("DEFAULT_AUTO_MIN", "15"))
-
+BYBIT_PROXY = os.getenv("BYBIT_PROXY", "").strip()
+if BYBIT_PROXY:
+    # щоб aiohttp автоматично брав проксі з env
+    os.environ["HTTP_PROXY"]  = BYBIT_PROXY
+    os.environ["HTTPS_PROXY"] = BYBIT_PROXY
 # Скільки сигналів показувати / намагатись торгувати (1 або 2)
 TOP_N = int(os.getenv("TOP_N", "2"))
 
