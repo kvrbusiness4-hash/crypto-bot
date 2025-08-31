@@ -367,7 +367,7 @@ async def build_signals_and_trade(chat_id: int) -> str:
 
     async with aiohttp.ClientSession() as s:
         try:
-            tickers = await bybit_top_symbols(s, 15)
+            tickers = await bybit_top_symbols(s, 15)   # топ-15 як було у тебе
         except Exception as e:
             return f"⚠️ Ринок недоступний: {e}"
 
@@ -378,43 +378,51 @@ async def build_signals_and_trade(chat_id: int) -> str:
             except Exception as e:
                 log.warning("get_open_positions fail: %s", e)
 
-        scored: List[Tuple[float, str, str, float, str, float, float, float]] = []
         # (score, symbol, direction, last_px, note, slpct, tppct, ch24_abs)
+        scored: List[Tuple[float, str, str, float, str, float, float, float]] = []
 
         for t in tickers:
             sym = t.get("symbol","")
             try:
-                px  = float(t.get("lastPrice") or 0.0)
+                px   = float(t.get("lastPrice") or 0.0)
                 ch24 = float(t.get("price24hPcnt") or 0.0) * 100.0
             except:
                 px, ch24 = 0.0, 0.0
-            if px <= 0: continue
+            if px <= 0:
+                continue
 
+            # === послідовно, без gather, з паузами (щоб не було 429) ===
             try:
-                k15 = await bybit_klines(s, sym, "15", 300),
+                k15 = await bybit_klines(s, sym, "15", 300)
                 await asyncio.sleep(0.35)
-                k30 = await bybit_klines(s, sym, "30", 300),
+                k30 = await bybit_klines(s, sym, "30", 300)
                 await asyncio.sleep(0.35)
-                k60 = await bybit_klines(s, sym, "60", 300),
-            )
+                k60 = await bybit_klines(s, sym, "60", 300)
             except:
                 continue
-            if not (k15 and k30 and k60): continue
+            if not (k15 and k30 and k60):
+                continue
+            # ==========================================================
 
             v15 = votes_from_series(k15)
             v30 = votes_from_series(k30)
             v60 = votes_from_series(k60)
             direction = decide_direction(v15["vote"], v30["vote"], v60["vote"])
-            if not direction: continue
+            if not direction:
+                continue
 
+            # SL/TP: авто або фікс
             if sl_pct <= 0 or tp_pct <= 0:
                 base_sl, base_tp = auto_sl_tp_by_vol(k15, px)
             else:
                 base_sl, base_tp = sl_pct, tp_pct
 
+            # скоринг
             score = v15["vote"] + v30["vote"] + v60["vote"]
-            if v60["ema_trend"] == 1 and direction == "LONG": score += 1
-            if v60["ema_trend"] == -1 and direction == "SHORT": score += 1
+            if v60["ema_trend"] == 1 and direction == "LONG":
+                score += 1
+            if v60["ema_trend"] == -1 and direction == "SHORT":
+                score += 1
             score += min(2.0, abs(ch24)/10.0)
 
             def mark(v):
@@ -426,7 +434,8 @@ async def build_signals_and_trade(chat_id: int) -> str:
 
             note = f"15m[{mark(v15)}] | 30m[{mark(v30)}] | 1h[{mark(v60)}]"
             scored.append((float(score), sym, direction, px, note, float(base_sl), float(base_tp), abs(ch24)))
-            await asyncio.sleep(0.75)
+
+            await asyncio.sleep(0.75)  # невелика глобальна пауза між символами
 
         if not scored:
             return "⚠️ Узгоджених сильних сигналів немає."
@@ -440,16 +449,17 @@ async def build_signals_and_trade(chat_id: int) -> str:
             can_open = max(0, MAX_OPEN_POS - open_count)
 
             for sc, sym, direction, px, note, bsl, btp, ch24_abs in picks:
-                if opened >= can_open: break
+                if opened >= can_open:
+                    break
                 if symbol_in_positions(open_pos, sym):
                     report_lines.append(f"• {sym}: {direction} (пропущено — вже відкрита позиція)")
                     continue
-                side = "Buy" if direction=="LONG" else "Sell"
+                side = "Buy" if direction == "LONG" else "Sell"
                 try:
+                    # передаємо k15 для авто-волатильності у place_order_with_sl_tp
                     resp, used_lev = await place_order_with_sl_tp(
                         s, sym, side, SIZE_USDT, px, bsl, btp,
-                        k15_for_vol=None,  # можна передати k15 для точнішої волатильності
-                        ch24_abs=ch24_abs
+                        k15_for_vol=k15, ch24_abs=ch24_abs
                     )
                     opened += 1
                     oid = ((resp.get("result") or {}).get("orderId"))
