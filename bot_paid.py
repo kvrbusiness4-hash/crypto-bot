@@ -275,13 +275,16 @@ async def build_signals_and_trade(chat_id: int) -> str:
             if px <= 0: continue
 
             try:
-                k15, k30, k60 = await asyncio.gather(
-                    bybit_klines(s, sym, "15", 300),
-                    bybit_klines(s, sym, "30", 300),
-                    bybit_klines(s, sym, "60", 300),
-                )
-            except:
-                continue
+    k15, k30, k60 = await asyncio.gather(
+        bybit_klines(s, sym, "15", 300),
+        bybit_klines(s, sym, "30", 300),
+        bybit_klines(s, sym, "60", 300),
+    )
+except:
+    continue
+
+# ↓ дати біржі «віддихатись», щоб не ловити 429
+await asyncio.sleep(0.30)   # 0.30–0.40 c — норм
             if not (k15 and k30 and k60): continue
 
             v15 = votes_from_series(k15)
