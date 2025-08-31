@@ -53,7 +53,7 @@ def split_long(text: str, n: int = 3500) -> List[str]:
 def utc_now() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
 
-# Проксі тільки для наших aiohttp-запитів (НЕ ставимо HTTP_PROXY/HTTPS_PROXY у глобальне оточення!)
+# Проксі тільки для наших aiohttp-запитів
 def _proxy_kwargs() -> dict:
     if BYBIT_PROXY.startswith(("http://", "https://")):
         return {"proxy": BYBIT_PROXY}
@@ -134,6 +134,8 @@ def auto_sl_tp_by_vol(series: List[float], px: float) -> Tuple[float,float]:
     return sl, tp
 
 # ============ HTTP (public) ============
+BYBIT = "https://api.bybit.com"
+
 async def http_json(session: aiohttp.ClientSession, url: str, params: dict | None = None) -> dict:
     for i in range(2):
         try:
@@ -144,8 +146,6 @@ async def http_json(session: aiohttp.ClientSession, url: str, params: dict | Non
             if i == 1:
                 raise
             await asyncio.sleep(0.7)
-
-BYBIT = "https://api.bybit.com"
 
 async def bybit_top_symbols(session: aiohttp.ClientSession, top:int=30) -> List[dict]:
     data = await http_json(session, f"{BYBIT}/v5/market/tickers", {"category":"linear"})
@@ -166,6 +166,35 @@ async def bybit_klines(session: aiohttp.ClientSession, symbol: str, interval: st
         try: closes.append(float(r[4]))
         except: pass
     return closes
+
+# --- instruments info & qty normalization ---
+async def get_instrument_info(session: aiohttp.ClientSession, symbol: str) -> dict:
+    data = await http_json(session, f"{BYBIT}/v5/market/instruments-info",
+                           {"category":"linear","symbol":symbol})
+    lst = ((data.get("result") or {}).get("list")) or []
+    return lst[0] if lst else {}
+
+def _round_step(value: float, step: float) -> float:
+    if step <= 0:
+        return value
+    return math.floor(value / step) * step
+
+def normalize_qty(symbol_info: dict, qty: float) -> float:
+    lot = (symbol_info.get("lotSizeFilter") or {})
+    try:
+        step = float(lot.get("qtyStep") or 0)
+        min_qty = float(lot.get("minOrderQty") or 0)
+    except:
+        step = 0.0; min_qty = 0.0
+    q = qty
+    if step > 0:
+        q = _round_step(q, step)
+    if min_qty > 0 and q < min_qty:
+        q = min_qty
+        if step > 0:
+            q = _round_step(q, step)
+    q = max(q, 0.0)
+    return float(f"{q:.10f}")
 
 # ============ PRIVATE (sign & post) ============
 def sign_v5(params: Dict[str, str]) -> Dict[str, str]:
@@ -226,23 +255,36 @@ async def ensure_leverage(session: aiohttp.ClientSession, symbol: str, lev: int)
 
 async def place_order_with_sl_tp(session: aiohttp.ClientSession, symbol: str, side: str,
                                  size_usdt: float, px: float, sl_pct: float, tp_pct: float):
-    qty = max(0.001, round((size_usdt/px), 6))
+    info = await get_instrument_info(session, symbol)
+    raw_qty = size_usdt / max(px, 1e-9)
+    qty = normalize_qty(info, raw_qty)
+    if qty <= 0:
+        raise RuntimeError(f"qty too small for {symbol}: {raw_qty:.12f}")
+
     if side == "Buy":
         sl_price = px * (1 - sl_pct/100.0); tp_price = px * (1 + tp_pct/100.0)
     else:
         sl_price = px * (1 + sl_pct/100.0); tp_price = px * (1 - tp_pct/100.0)
+
     params = {
-        "category":"linear", "symbol":symbol, "side":side, "orderType":"Market",
-        "qty":str(qty), "timeInForce":"GoodTillCancel",
-        "takeProfit": f"{tp_price:.6f}", "stopLoss": f"{sl_price:.6f}",
-        "tpTriggerBy":"LastPrice", "slTriggerBy":"LastPrice",
+        "category":"linear",
+        "symbol":symbol,
+        "side":side,
+        "orderType":"Market",
+        "qty": f"{qty}",
+        "timeInForce":"GoodTillCancel",
+        "takeProfit": f"{tp_price:.6f}",
+        "stopLoss":   f"{sl_price:.6f}",
+        "tpTriggerBy":"LastPrice",
+        "slTriggerBy":"LastPrice",
     }
     data = await private_post(session, "/v5/order/create", params)
-    if str(data.get("retCode")) != "0":
-        raise RuntimeError(f"Bybit order error: {data}")
+    ret = str(data.get("retCode"))
+    msg = data.get("retMsg")
+    if ret != "0":
+        raise RuntimeError(f"Bybit error {ret}: {msg} | resp={data}")
     return data
 
-# ============ Signals + Trade ============
 # ============ Signals + Trade ============
 async def build_signals_and_trade(chat_id: int) -> str:
     st = STATE.setdefault(chat_id, {"sl": SL_PCT, "tp": TP_PCT, "top_n": TOP_N})
@@ -253,7 +295,7 @@ async def build_signals_and_trade(chat_id: int) -> str:
 
     async with aiohttp.ClientSession() as s:
         try:
-            tickers = await bybit_top_symbols(s, 15)  # було 30
+            tickers = await bybit_top_symbols(s, 30)
         except Exception as e:
             return f"⚠️ Ринок недоступний: {e}"
 
@@ -267,14 +309,13 @@ async def build_signals_and_trade(chat_id: int) -> str:
         scored: List[Tuple[float, str, str, float, str, float, float]] = []
 
         for t in tickers:
-            sym = t.get("symbol", "")
+            sym = t.get("symbol","")
             try:
-                px = float(t.get("lastPrice") or 0.0)
+                px  = float(t.get("lastPrice") or 0.0)
                 ch24 = float(t.get("price24hPcnt") or 0.0) * 100.0
-            except Exception:
+            except:
                 px, ch24 = 0.0, 0.0
-            if px <= 0:
-                continue
+            if px <= 0: continue
 
             try:
                 k15, k30, k60 = await asyncio.gather(
@@ -282,43 +323,36 @@ async def build_signals_and_trade(chat_id: int) -> str:
                     bybit_klines(s, sym, "30", 300),
                     bybit_klines(s, sym, "60", 300),
                 )
-                await asyncio.sleep(0.30)  # невелика пауза щоб уникнути 429
-            except Exception:
+            except:
                 continue
+            if not (k15 and k30 and k60): continue
 
             v15 = votes_from_series(k15)
             v30 = votes_from_series(k30)
             v60 = votes_from_series(k60)
             direction = decide_direction(v15["vote"], v30["vote"], v60["vote"])
-            if not direction:
-                continue
+            if not direction: continue
 
-            # SL/TP
             if sl_pct <= 0 or tp_pct <= 0:
                 base_sl, base_tp = auto_sl_tp_by_vol(k15, px)
             else:
                 base_sl, base_tp = sl_pct, tp_pct
 
-            # Score
             score = v15["vote"] + v30["vote"] + v60["vote"]
-            if v60["ema_trend"] == 1 and direction == "LONG":
-                score += 1
-            if v60["ema_trend"] == -1 and direction == "SHORT":
-                score += 1
-            score += min(2.0, abs(ch24) / 10.0)
+            if v60["ema_trend"] == 1 and direction == "LONG": score += 1
+            if v60["ema_trend"] == -1 and direction == "SHORT": score += 1
+            score += min(2.0, abs(ch24)/10.0)
 
             def mark(v):
-                r = v["rsi"]
-                rtxt = f"{r:.0f}" if isinstance(r, (int, float)) else "-"
-                m = v["macd"]
-                sgn = v["sig"]
+                r = v["rsi"]; rtxt = f"{r:.0f}" if isinstance(r,(int,float)) else "-"
+                m = v["macd"]; sgn = v["sig"]
                 mtxt = "↑" if (m is not None and sgn is not None and m > sgn) else ("↓" if (m is not None and sgn is not None and m < sgn) else "·")
-                et = v["ema_trend"]
-                etxt = "↑" if et == 1 else ("↓" if et == -1 else "·")
+                et = v["ema_trend"]; etxt = "↑" if et==1 else ("↓" if et==-1 else "·")
                 return f"RSI:{rtxt} MACD:{mtxt} EMA:{etxt}"
 
             note = f"15m[{mark(v15)}] | 30m[{mark(v30)}] | 1h[{mark(v60)}]"
             scored.append((float(score), sym, direction, px, note, float(base_sl), float(base_tp)))
+            await asyncio.sleep(0.30)  # обережно до 429
 
         if not scored:
             return "⚠️ Узгоджених сильних сигналів немає."
@@ -332,22 +366,21 @@ async def build_signals_and_trade(chat_id: int) -> str:
             can_open = max(0, MAX_OPEN_POS - open_count)
 
             for sc, sym, direction, px, note, bsl, btp in picks:
-                if opened >= can_open:
-                    break
+                if opened >= can_open: break
                 if symbol_in_positions(open_pos, sym):
                     report_lines.append(f"• {sym}: {direction} (пропущено — вже відкрита позиція)")
                     continue
-                side = "Buy" if direction == "LONG" else "Sell"
+                side = "Buy" if direction=="LONG" else "Sell"
                 try:
                     await ensure_leverage(s, sym, LEVERAGE)
-                except Exception:
-                    pass
+                except: pass
                 try:
-                    await place_order_with_sl_tp(s, sym, side, SIZE_USDT, px, bsl, btp)
+                    resp = await place_order_with_sl_tp(s, sym, side, SIZE_USDT, px, bsl, btp)
                     opened += 1
+                    oid = ((resp.get("result") or {}).get("orderId"))
                     report_lines.append(
-                        f"✅ TRADE {sym} {direction} @ {px:.6f} · SL~{bsl:.2f}% TP~{btp:.2f}%\n"
-                        f"   {note}"
+                        f"✅ TRADE {sym} {direction} @ {px:.6f} · SL~{bsl:.2f}% TP~{btp:.2f}%"
+                        + (f" · id:{oid}" if oid else "") + f"\n   {note}"
                     )
                 except Exception as e:
                     report_lines.append(f"❌ {sym} {direction}: {e}")
@@ -356,11 +389,9 @@ async def build_signals_and_trade(chat_id: int) -> str:
             body = []
             for sc, sym, direction, px, note, bsl, btp in picks:
                 if direction == "LONG":
-                    slp = px * (1 - bsl / 100.0)
-                    tpp = px * (1 + btp / 100.0)
+                    slp = px*(1-bsl/100.0); tpp = px*(1+btp/100.0)
                 else:
-                    slp = px * (1 + bsl / 100.0)
-                    tpp = px * (1 - btp / 100.0)
+                    slp = px*(1+bsl/100.0); tpp = px*(1-btp/100.0)
                 body.append(
                     f"• {sym}: *{direction}* @ {px:.6f}\n"
                     f"  SL: `{slp:.6f}` · TP: `{tpp:.6f}`\n"
@@ -510,3 +541,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+```0
