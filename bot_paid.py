@@ -250,14 +250,12 @@ async def build_signals_and_trade(chat_id: int) -> str:
     top_n  = int(st.get("top_n", TOP_N))
     report_lines = []
 
-    async with aiohttp.ClientSession() as s:
-    # 1) Тікери
+async with aiohttp.ClientSession() as s:
     try:
         tickers = await bybit_top_symbols(s, 15)  # було 30
     except Exception as e:
         return f"⚠️ Ринок недоступний: {e}"
 
-    # 2) Поточні позиції (якщо трейд увімкнено)
     open_pos = []
     if TRADE_ENABLED and BYBIT_KEY and BYBIT_SEC:
         try:
@@ -267,11 +265,8 @@ async def build_signals_and_trade(chat_id: int) -> str:
 
     scored: List[Tuple[float, str, str, float, str, float, float]] = []
 
-    # 3) Оцінка кожного символу
     for t in tickers:
         sym = t.get("symbol", "")
-
-        # ціна/зміна
         try:
             px = float(t.get("lastPrice") or 0.0)
             ch24 = float(t.get("price24hPcnt") or 0.0) * 100.0
@@ -280,17 +275,16 @@ async def build_signals_and_trade(chat_id: int) -> str:
         if px <= 0:
             continue
 
-        # свічки 15/30/60
         try:
             k15, k30, k60 = await asyncio.gather(
                 bybit_klines(s, sym, "15", 300),
                 bybit_klines(s, sym, "30", 300),
                 bybit_klines(s, sym, "60", 300),
             )
-            # невелика пауза, щоб не зловити 429
-            await asyncio.sleep(0.30)
+            await asyncio.sleep(0.30)  # пауза щоб уникнути 429
         except Exception:
             continue
+            
         if not (k15 and k30 and k60):
             continue
 
