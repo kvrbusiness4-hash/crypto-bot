@@ -13,7 +13,7 @@ TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 BYBIT_KEY = os.getenv("BYBIT_API_KEY", "").strip()
 BYBIT_SEC = os.getenv("BYBIT_API_SECRET", "").strip()
 BYBIT_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com").rstrip("/")
-
+BYBIT_PROXY = os.getenv("BYBIT_PROXY", "").strip()  # напр.: http://user:pass@ip:port або socks5://user:pass@ip:port
 # Трейдинг параметри (можна міняти командами)
 SIZE_USDT = float(os.getenv("SIZE_USDT", "5"))   # розмір однієї угоди в USDT
 LEVERAGE  = int(os.getenv("LEVERAGE", "3"))      # плече
@@ -53,7 +53,31 @@ def split_long(text: str, n: int = 3500) -> List[str]:
 
 def utc_now() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
+# ============ Proxy helpers ============
+try:
+    # для socks5 потрібен пакет: pip install aiohttp-socks
+    from aiohttp_socks import ProxyConnector
+except Exception:
+    ProxyConnector = None
 
+def _make_connector():
+    """Повертає ProxyConnector для socks5 або None (для http/https)."""
+    if BYBIT_PROXY and BYBIT_PROXY.startswith(("socks5://", "socks4://")) and ProxyConnector:
+        return ProxyConnector.from_url(BYBIT_PROXY)
+    return None
+
+def _proxy_kwargs() -> dict:
+    """Повертає kwargs для aiohttp-запитів (http/https проксі через параметр proxy)."""
+    if BYBIT_PROXY and BYBIT_PROXY.startswith(("http://", "https://")):
+        return {"proxy": BYBIT_PROXY}
+    return {}
+
+def create_session() -> aiohttp.ClientSession:
+    """Створює сесію з socks-connector’ом (якщо треба) або звичайну."""
+    conn = _make_connector()
+    if conn:
+        return aiohttp.ClientSession(connector=conn)
+    return aiohttp.ClientSession()
 # ============ Indicators ============
 def ema(series: List[float], period: int) -> List[float]:
     if not series or period <= 1:
@@ -132,11 +156,12 @@ def auto_sl_tp_by_vol(series: List[float], px: float) -> Tuple[float,float]:
 async def http_json(session: aiohttp.ClientSession, url: str, params: dict | None = None) -> dict:
     for i in range(2):
         try:
-            async with session.get(url, params=params, timeout=25) as r:
+            async with session.get(url, params=params, timeout=25, **_proxy_kwargs()) as r:
                 r.raise_for_status()
                 return await r.json()
         except Exception as e:
-            if i == 1: raise
+            if i == 1:
+                raise
             await asyncio.sleep(0.7)
 
 BYBIT = "https://api.bybit.com"
@@ -173,18 +198,18 @@ def sign_v5(params: Dict[str, str]) -> Dict[str, str]:
 async def private_post(session: aiohttp.ClientSession, path: str, params: Dict[str, str]) -> dict:
     url = f"{BYBIT_URL}{path}"
     p = sign_v5(params.copy())
-    async with session.post(url, data=p, timeout=25) as r:
+    async with session.post(url, data=p, timeout=25, **_proxy_kwargs()) as r:
         txt = await r.text()
         try:
             r.raise_for_status()
             return json.loads(txt)
         except:
             raise RuntimeError(f"HTTP {r.status}: {txt[:400]}")
-
+            
 async def private_get(session: aiohttp.ClientSession, path: str, params: Dict[str, str]) -> dict:
     url = f"{BYBIT_URL}{path}"
     p = sign_v5(params.copy())
-    async with session.get(url, params=p, timeout=25) as r:
+    async with session.get(url, params=p, timeout=25, **_proxy_kwargs()) as r:
         txt = await r.text()
         try:
             r.raise_for_status()
@@ -259,7 +284,7 @@ async def build_signals_and_trade(chat_id: int) -> str:
     top_n  = int(st.get("top_n", TOP_N))
     report_lines = []
 
-    async with aiohttp.ClientSession() as s:
+    async with create_session() as s:
         # 1) Отримаємо топ-30
         try:
             tickers = await bybit_top_symbols(s, 30)
