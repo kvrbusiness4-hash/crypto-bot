@@ -252,7 +252,7 @@ async def build_signals_and_trade(chat_id: int) -> str:
 
     async with aiohttp.ClientSession() as s:
         try:
-            tickers = await bybit_top_symbols(s, 30)
+            tickers = await bybit_top_symbols(s, 15)   # було 30
         except Exception as e:
             return f"⚠️ Ринок недоступний: {e}"
 
