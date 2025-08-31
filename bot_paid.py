@@ -31,15 +31,12 @@ HEDGE_MODE       = os.getenv("HEDGE_MODE", "OFF").upper() == "ON"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("bot")
 
-# ============ UI (чиста клавіатура) ============
+# ============ UI (компактна клавіатура) ============
 KB = ReplyKeyboardMarkup(
     [
         ["/signals"],
         [f"/auto_on {DEFAULT_AUTO_MIN}", "/auto_off"],
-        ["/trade_on", "/trade_off"],
         ["/status"],
-        ["/set_size 5", "/set_lev 3"],
-        ["/set_risk 3 5", f"/set_top {TOP_N}"],
     ],
     resize_keyboard=True
 )
@@ -64,7 +61,8 @@ def _proxy_kwargs() -> dict:
 
 # ============ Indicators ============
 def ema(series: List[float], period: int) -> List[float]:
-    if not series or period <= 1: return series[:]
+    if not series or period <= 1:
+        return series[:]
     k = 2 / (period + 1)
     out = [series[0]]
     for x in series[1:]:
@@ -155,13 +153,19 @@ async def http_json(session: aiohttp.ClientSession, url: str, params: dict | Non
             await asyncio.sleep(delay); delay *= 1.5
 
 async def bybit_top_symbols(session: aiohttp.ClientSession, top:int=15) -> List[dict]:
-    data = await http_json(session, f"{BYBIT}/v5/market/tickers", {"category":"linear"})
-    lst = ((data.get("result") or {}).get("list")) or []
-    def _volume(x):
+    data = await http_json(session, f"{BYBIT}/v5/market/tickers", {"category": "linear"})
+    if not isinstance(data, dict):
+        log.error("tickers: unexpected response type: %r", type(data)); return []
+    result = data.get("result") or {}
+    lst = result.get("list") or []
+    if not isinstance(lst, list):
+        log.error("tickers: 'list' not a list: %r", lst); return []
+    cleaned = [x for x in lst if isinstance(x, dict) and str(x.get("symbol","")).endswith("USDT")]
+    def _volume(x: dict) -> float:
         try: return float(x.get("turnover24h") or 0)
         except: return 0.0
-    lst.sort(key=_volume, reverse=True)
-    return [x for x in lst if str(x.get("symbol","")).endswith("USDT")][:top]
+    cleaned.sort(key=_volume, reverse=True)
+    return cleaned[:top]
 
 async def bybit_klines(session: aiohttp.ClientSession, symbol: str, interval: str, limit: int = 300) -> List[float]:
     data = await http_json(session, f"{BYBIT}/v5/market/kline", {
@@ -174,12 +178,16 @@ async def bybit_klines(session: aiohttp.ClientSession, symbol: str, interval: st
         except: pass
     return closes
 
-# --- instruments info & qty normalization ---
+# --- instruments info & qty/price normalization ---
 async def get_instrument_info(session: aiohttp.ClientSession, symbol: str) -> dict:
     data = await http_json(session, f"{BYBIT}/v5/market/instruments-info",
                            {"category":"linear","symbol":symbol})
+    if not isinstance(data, dict):
+        log.error("No instrument info (type) for %s: %r", symbol, type(data)); return {}
     lst = ((data.get("result") or {}).get("list")) or []
-    return lst[0] if lst else {}
+    if not lst:
+        log.error("Empty instruments list for %s: %s", symbol, data); return {}
+    return lst[0]
 
 def _round_step(value: float, step: float) -> float:
     if step <= 0: return value
@@ -199,6 +207,16 @@ def normalize_qty(symbol_info: dict, qty: float) -> float:
     q = max(q, 0.0)
     return float(f"{q:.10f}")
 
+def normalize_price(symbol_info: dict, price: float) -> float:
+    pf = (symbol_info.get("priceFilter") or {})
+    try:
+        tick = float(pf.get("tickSize") or 0)
+    except:
+        tick = 0.0
+    p = price
+    if tick > 0: p = _round_step(p, tick)
+    return float(f"{p:.10f}")
+
 def calc_vol_pct(series: List[float], px: float) -> float:
     tail = series[-48:] if len(series) >= 48 else series
     if len(tail) < 2 or px <= 0: return 1.0
@@ -208,16 +226,11 @@ def calc_vol_pct(series: List[float], px: float) -> float:
 
 def choose_auto_leverage(symbol_info: dict, ch24_abs: float, vol_pct: float) -> int:
     levf = (symbol_info.get("leverageFilter") or {})
-    try:
-        max_lev = int(float(levf.get("maxLeverage") or 1))
-    except:
-        max_lev = 1
-    if vol_pct < 1.5 and ch24_abs < 2:
-        lev = 5
-    elif vol_pct < 3.0 and ch24_abs < 5:
-        lev = 3
-    else:
-        lev = 2
+    try: max_lev = int(float(levf.get("maxLeverage") or 1))
+    except: max_lev = 1
+    if vol_pct < 1.5 and ch24_abs < 2: lev = 5
+    elif vol_pct < 3.0 and ch24_abs < 5: lev = 3
+    else: lev = 2
     return max(1, min(max_lev, lev))
 
 # ============ PRIVATE (sign & post) ============
@@ -253,7 +266,7 @@ async def private_get(session: aiohttp.ClientSession, path: str, params: Dict[st
         except:
             raise RuntimeError(f"HTTP {r.status}: {txt[:400]}")
 
-# ============ Positions & leverage ============
+# ============ Positions helper ============
 async def get_open_positions(session: aiohttp.ClientSession) -> List[dict]:
     data = await private_get(session, "/v5/position/list", {"category":"linear"})
     return ((data.get("result") or {}).get("list")) or []
@@ -274,8 +287,8 @@ async def ensure_leverage(session: aiohttp.ClientSession, symbol: str, lev: int)
     except Exception as e:
         log.warning("set-leverage fail %s: %s", symbol, e)
 
-# ======= MARKET-ORDER (без SL/TP) =======
-async def place_market_order(
+# ======= РИНКОВЕ ЗАМОВЛЕННЯ БЕЗ SL/TP =======
+async def place_order_market(
     session: aiohttp.ClientSession,
     symbol: str,
     side: str,                # "Buy" або "Sell"
@@ -285,12 +298,12 @@ async def place_market_order(
     ch24_abs: float = 0.0
 ):
     info = await get_instrument_info(session, symbol)
-    if not info:
-        raise RuntimeError(f"instrument info not found for {symbol}")
+    if not info: raise RuntimeError(f"instrument info not found for {symbol}")
 
     raw_qty = size_usdt / max(px, 1e-12)
     qty = normalize_qty(info, raw_qty)
-    min_qty = float((info.get("lotSizeFilter") or {}).get("minOrderQty") or 0)
+    try: min_qty = float((info.get("lotSizeFilter") or {}).get("minOrderQty") or 0)
+    except: min_qty = 0.0
     if qty <= 0 or (min_qty > 0 and qty < min_qty):
         raise RuntimeError(f"qty too small for {symbol}: raw={raw_qty:.12f}, norm={qty}, min={min_qty}")
 
@@ -303,21 +316,18 @@ async def place_market_order(
     params = {
         "category": "linear",
         "symbol": symbol,
-        "side": side,                 # "Buy"/"Sell"
+        "side": side,
         "orderType": "Market",
         "qty": f"{qty:.10f}",
         "timeInForce": "GoodTillCancel",
-        "reduceOnly": "false",
     }
-    if HEDGE_MODE:
-        params["positionIdx"] = "1" if side == "Buy" else "2"
 
-    log.info("CREATE MARKET %s %s qty=%s lev=%s hedge=%s", symbol, side, params["qty"], lev_to_use, HEDGE_MODE)
+    log.info("ORDER %s | side=%s lev=%s | px=%.10f qty=%s", symbol, side, lev_to_use, px, params["qty"])
+
     data = await private_post(session, "/v5/order/create", params)
     if str(data.get("retCode")) != "0":
         log.error("Order rejected for %s: %s", symbol, json.dumps(data))
         raise RuntimeError(f"Bybit error {data.get('retCode')}: {data.get('retMsg')} | resp={data}")
-
     return data, lev_to_use
 
 # ============ Signals + Trade ============
@@ -336,28 +346,24 @@ async def build_signals_and_trade(chat_id: int) -> str:
 
         open_pos = []
         if TRADE_ENABLED and BYBIT_KEY and BYBIT_SEC:
-            try:
-                open_pos = await get_open_positions(s)
-            except Exception as e:
-                log.warning("get_open_positions fail: %s", e)
+            try: open_pos = await get_open_positions(s)
+            except Exception as e: log.warning("get_open_positions fail: %s", e)
 
         scored: List[Tuple[float, str, str, float, str, float, float, float, List[float]]] = []
-        # (score, symbol, direction, px, note, sl, tp, ch24_abs, k15)
 
-        for t in tickers:
+        for t in (tickers or []):
+            if not isinstance(t, dict): continue
             sym = t.get("symbol","")
             try:
                 px  = float(t.get("lastPrice") or 0.0)
                 ch24 = float(t.get("price24hPcnt") or 0.0) * 100.0
             except:
                 px, ch24 = 0.0, 0.0
-            if px <= 0: continue
+            if not sym or px <= 0: continue
 
             try:
-                k15 = await bybit_klines(s, sym, "15", 300)
-                await asyncio.sleep(0.35)
-                k30 = await bybit_klines(s, sym, "30", 300)
-                await asyncio.sleep(0.35)
+                k15 = await bybit_klines(s, sym, "15", 300); await asyncio.sleep(0.35)
+                k30 = await bybit_klines(s, sym, "30", 300); await asyncio.sleep(0.35)
                 k60 = await bybit_klines(s, sym, "60", 300)
             except:
                 continue
@@ -369,7 +375,6 @@ async def build_signals_and_trade(chat_id: int) -> str:
             direction = decide_direction(v15["vote"], v30["vote"], v60["vote"])
             if not direction: continue
 
-            # SL/TP лише для повідомлення
             if sl_pct <= 0 or tp_pct <= 0:
                 base_sl, base_tp = auto_sl_tp_by_vol(k15, px)
             else:
@@ -397,72 +402,61 @@ async def build_signals_and_trade(chat_id: int) -> str:
         scored.sort(key=lambda x: x[0], reverse=True)
         picks = scored[:max(1, min(2, top_n))]
 
-        # 1) Спершу завжди виводимо 2 сильні сигнали з SL/TP та плечем (розрахованим)
-        preview_lines = []
-        for sc, sym, direction, px, note, bsl, btp, ch24_abs, k15 in picks:
-            # оцінимо плече, щоб показати в повідомленні
-            lev_preview = LEVERAGE
-            if AUTO_LEVERAGE:
-                vol_pct = calc_vol_pct(k15 or [], px)
-                lev_preview = choose_auto_leverage({}, abs(ch24_abs), vol_pct)
-            if direction == "LONG":
-                slp = px*(1-bsl/100.0); tpp = px*(1+btp/100.0)
-            else:
-                slp = px*(1+bsl/100.0); tpp = px*(1-btp/100.0)
-            preview_lines.append(
-                f"• {sym}: *{direction}* @ {px:.6f} · lev≈{lev_preview}\n"
-                f"  SL: `{slp:.6f}` · TP: `{tpp:.6f}`\n"
-                f"  {note}"
-            )
-
-        # 2) Якщо трейд увімкнений — відкриваємо без SL/TP та пишемо про це
-        trade_lines = []
+        opened = 0
         if TRADE_ENABLED and BYBIT_KEY and BYBIT_SEC:
-            open_pos = open_pos if 'open_pos' in locals() else []
             open_count = sum(1 for p in open_pos if float(p.get("size") or 0) > 0)
             can_open = max(0, MAX_OPEN_POS - open_count)
-            opened = 0
 
-            async with aiohttp.ClientSession() as s2:
-                for sc, sym, direction, px, note, bsl, btp, ch24_abs, k15 in picks:
-                    if opened >= can_open: break
-                    if symbol_in_positions(open_pos, sym):
-                        trade_lines.append(f"• {sym}: пропущено — вже є відкрита позиція")
-                        continue
-                    side = "Buy" if direction=="LONG" else "Sell"
-                    try:
-                        resp, used_lev = await place_market_order(
-                            s2, sym, side, SIZE_USDT, px,
-                            k15_for_vol=k15, ch24_abs=ch24_abs
-                        )
-                        opened += 1
-                        oid = ((resp.get("result") or {}).get("orderId"))
-                        trade_lines.append(
-                            f"✅ ВІДКРИТО {sym} {direction} @ {px:.6f} · lev={used_lev} · без SL/TP"
-                            + (f" · id:{oid}" if oid else "")
-                        )
-                    except Exception as e:
-                        trade_lines.append(f"❌ {sym} {direction}: {e}")
+            for sc, sym, direction, px, note, bsl, btp, ch24_abs, k15 in picks:
+                if opened >= can_open: break
+                if symbol_in_positions(open_pos, sym):
+                    report_lines.append(f"• {sym}: {direction} (пропущено — вже відкрита позиція)")
+                    continue
+                side = "Buy" if direction=="LONG" else "Sell"
+                try:
+                    resp, used_lev = await place_order_market(
+                        s, sym, side, SIZE_USDT, px,
+                        k15_for_vol=k15, ch24_abs=ch24_abs
+                    )
+                    opened += 1
+                    oid = ((resp.get("result") or {}).get("orderId"))
+                    if direction == "LONG":
+                        slp = px*(1-bsl/100.0); tpp = px*(1+btp/100.0)
+                    else:
+                        slp = px*(1+bsl/100.0); tpp = px*(1-btp/100.0)
+                    report_lines.append(
+                        f"✅ ВІДКРИТО {sym} {direction} @ {px:.6f} · lev={used_lev}"
+                        + (f" · id:{oid}" if oid else "")
+                        + f"\n   Рекомендація: SL `{slp:.6f}` · TP `{tpp:.6f}` (без авто-SL/TP)\n   {note}"
+                    )
+                except Exception as e:
+                    report_lines.append(f"❌ {sym} {direction}: {e}")
 
-        header = "📈 *Сильні сигнали:*\n\n" + "\n\n".join(preview_lines)
-        if trade_lines:
-            header += "\n\n🤖 *Автотрейд*:\n" + "\n".join(trade_lines)
-        return header
+        if not report_lines:
+            body = []
+            for sc, sym, direction, px, note, bsl, btp, _c, _k in picks:
+                if direction == "LONG":
+                    slp = px*(1-bsl/100.0); tpp = px*(1+btp/100.0)
+                else:
+                    slp = px*(1+bsl/100.0); tpp = px*(1-btp/100.0)
+                body.append(
+                    f"• {sym}: *{direction}* @ {px:.6f}\n"
+                    f"  SL: `{slp:.6f}` · TP: `{tpp:.6f}` · LEV: {LEVERAGE}{' (AUTO)' if AUTO_LEVERAGE else ''}\n"
+                    f"  {note}"
+                )
+            return "📈 *Сильні сигнали:*\n\n" + "\n\n".join(body)
+        else:
+            header = "🤖 *Автотрейд виконано*:\n\n" if TRADE_ENABLED else "📈 Сигнали:\n\n"
+            return header + "\n".join(report_lines)
 
 # ============ Commands ============
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     chat_id = u.effective_chat.id
     STATE.setdefault(chat_id, {"auto_on": False, "every": DEFAULT_AUTO_MIN, "sl": SL_PCT, "tp": TP_PCT, "top_n": TOP_N})
     await u.message.reply_text(
-        "👋 Готовий. Команди:\n"
-        "• /signals — скан ринку (покаже 2 сильні сигнали з SL/TP та плечем)\n"
-        f"• /auto_on {DEFAULT_AUTO_MIN} · /auto_off — автоскан/автотрейд\n"
-        "• /trade_on · /trade_off — вкл/викл відкриття ордерів\n"
-        "• /status — поточні налаштування\n"
-        "• /set_size 5 — сума USDT на угоду\n"
-        "• /set_lev 3 — базове плече (може коригуватись авто)\n"
-        "• /set_risk 3 5 — SL/TP у % (0 0 = авто для розрахунку в чаті)\n"
-        f"• /set_top {TOP_N} — 1 або 2 сигнали",
+        "👋 Готовий. Головні команди:\n"
+        f"• /signals\n• /auto_on {DEFAULT_AUTO_MIN} · /auto_off\n• /status\n\n"
+        "Додатково (введи вручну): /trade_on /trade_off /set_size 5 /set_lev 3 /set_risk 3 5 /set_top 2",
         reply_markup=KB
     )
 
@@ -547,7 +541,7 @@ async def set_risk_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     try:
         sl = float(c.args[0]); tp = float(c.args[1]); assert sl >= 0 and tp >= 0
         st["sl"], st["tp"] = sl, tp
-        await u.message.reply_text(f"OK. SL={sl:.2f}% · TP={tp:.2f}% (0 0 = авто в повідомленні)")
+        await u.message.reply_text(f"OK. SL={sl:.2f}% · TP={tp:.2f}% (0 0 = авто)")
     except:
         await u.message.reply_text("Формат: /set_risk 3 5  (0 0 = авто)")
 
