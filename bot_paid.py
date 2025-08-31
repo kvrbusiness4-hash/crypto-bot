@@ -499,12 +499,22 @@ async def auto_off_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text("⏸ Авто вимкнено.", reply_markup=KB)
 
 async def status_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = STATE.setdefault(u.effective_chat.id, {"auto_on": False, "every": DEFAULT_AUTO_MIN, "sl": SL_PCT, "tp": TP_PCT, "top_n": TOP_N})
+    st = STATE.setdefault(
+        u.effective_chat.id,
+        {"auto_on": False, "every": DEFAULT_AUTO_MIN, "sl": SL_PCT, "tp": TP_PCT, "top_n": TOP_N}
+    )
+
+    # Безпечні значення та типи
+    sl    = float((st.get("sl", SL_PCT)       or SL_PCT)   or 0.0)
+    tp    = float((st.get("tp", TP_PCT)       or TP_PCT)   or 0.0)
+    every = int(  (st.get("every", DEFAULT_AUTO_MIN) or DEFAULT_AUTO_MIN) or 0)
+    topn  = int(  (st.get("top_n", TOP_N)     or TOP_N)   or 1)
+    auto  = " (AUTO)" if AUTO_LEVERAGE else ""
+
     text = (
-        f"Статус: {'ON' if st.get('auto_on') else 'OFF'} · кожні {st.get('every')} хв\n"
-        f"TRADE: {'ON' if TRADE_ENABLED else 'OFF'} · SIZE={SIZE_USDT:.2f} USDT · "
-        f"LEV={LEVERAGE}{' (AUTO)' if AUTO_LEVERAGE else ''}{' · HEDGE' if HEDGE_MODE else ''}\n"
-        f"SL={st.get('sl'):.2f}% · TP={st.get('tp'):.2f}% · TOP_N={st.get('top_n')}\n"
+        f"Статус: {'ON' if st.get('auto_on') else 'OFF'} · кожні {every} хв\n"
+        f"TRADE: {'ON' if TRADE_ENABLED else 'OFF'} · SIZE={SIZE_USDT:.2f} USDT · LEV={LEVERAGE}{auto}\n"
+        f"SL={sl:.2f}% · TP={tp:.2f}% · TOP_N={topn}\n"
         f"UTC: {utc_now()}"
     )
     await u.message.reply_text(text)
