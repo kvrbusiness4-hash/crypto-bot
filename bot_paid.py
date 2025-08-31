@@ -284,25 +284,53 @@ async def ensure_leverage(session: aiohttp.ClientSession, symbol: str, lev: int)
     except Exception as e:
         log.warning("set-leverage fail %s: %s", symbol, e)
 
-# ======= UPDATED place_order_with_sl_tp (qty/price нормалізація, auto leverage, Hedge Mode) =======
-async def place_order_with_sl_tp(session: aiohttp.ClientSession, symbol: str,
-                                 side: str, size_usdt: float, px: float,
-                                 sl_pct: float, tp_pct: float,
-                                 k15_for_vol: Optional[List[float]] = None,
-                                 ch24_abs: float = 0.0):
+# ======= place_order_with_sl_tp (оновлено) =======
+async def place_order_with_sl_tp(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    side: str,                # "Buy" або "Sell"
+    size_usdt: float,
+    px: float,
+    sl_pct: float,
+    tp_pct: float,
+    k15_for_vol: Optional[List[float]] = None,  # не обов'язково
+    ch24_abs: float = 0.0                        # не обов'язково
+):
+    """
+    Маркет-ордер з одразу заданими SL/TP.
+    Робимо:
+      • нормалізацію кількості під lotSizeFilter (qtyStep, minOrderQty)
+      • нормалізацію цін SL/TP під priceFilter.tickSize
+      • (якщо AUTO_LEVERAGE) підбираємо адекватне плече в межах maxLeverage
+    """
+
+    # 1) Інфо про інструмент (step, minQty, tickSize, maxLeverage)
     info = await get_instrument_info(session, symbol)
+    lot = (info.get("lotSizeFilter") or {})
+    pf  = (info.get("priceFilter") or {})
+    try:
+        min_qty = float(lot.get("minOrderQty") or 0)
+        qty_step = float(lot.get("qtyStep") or 0)
+        tick = float(pf.get("tickSize") or 0)
+    except:
+        min_qty, qty_step, tick = 0.0, 0.0, 0.0
 
+    # 2) Кількість у базовій валюті з бюджету в USDT
     raw_qty = size_usdt / max(px, 1e-9)
-    qty = normalize_qty(info, raw_qty)
-    if qty <= 0:
-        raise RuntimeError(f"qty too small for {symbol}: {raw_qty:.12f}")
+    qty = normalize_qty(info, raw_qty)  # вже врахує step і minQty
 
+    # Якщо після нормалізації кількість все одно менша за мінімалку — пропускаємо монету
+    if min_qty > 0 and qty < min_qty:
+        raise RuntimeError(f"skip {symbol}: qty({qty}) < minOrderQty({min_qty})")
+
+    # 3) Авто-плече (за бажанням)
     lev_to_use = LEVERAGE
     if AUTO_LEVERAGE:
         vol_pct = calc_vol_pct(k15_for_vol or [], px)
         lev_to_use = choose_auto_leverage(info, abs(ch24_abs), vol_pct)
     await ensure_leverage(session, symbol, lev_to_use)
 
+    # 4) Розрахунок SL/TP та нормалізація цін під tickSize
     if side == "Buy":
         sl_price = px * (1 - sl_pct/100.0)
         tp_price = px * (1 + tp_pct/100.0)
@@ -313,24 +341,31 @@ async def place_order_with_sl_tp(session: aiohttp.ClientSession, symbol: str,
     sl_price = normalize_price(info, sl_price)
     tp_price = normalize_price(info, tp_price)
 
+    # Перестраховка на випадок нульового tickSize
+    if tick > 0:
+        # обрізаємо до кратності tickSize
+        sl_price = _round_step(sl_price, tick)
+        tp_price = _round_step(tp_price, tick)
+
+    # 5) Відправляємо order.create
     params = {
-        "category":"linear",
-        "symbol":symbol,
-        "side":side,                # Buy -> LONG, Sell -> SHORT
-        "orderType":"Market",
-        "qty": f"{qty}",
+        "category":   "linear",
+        "symbol":     symbol,
+        "side":       side,                # строго "Buy"/"Sell"
+        "orderType":  "Market",
+        "qty":        f"{qty}",            # нормалізована кількість
         "timeInForce":"GoodTillCancel",
-        "takeProfit": f"{tp_price:.10f}",
+        "takeProfit": f"{tp_price:.10f}",  # нормалізовані ціни
         "stopLoss":   f"{sl_price:.10f}",
         "tpTriggerBy":"LastPrice",
         "slTriggerBy":"LastPrice",
     }
-    if HEDGE_MODE:
-        params["positionIdx"] = "1" if side == "Buy" else "2"
 
     data = await private_post(session, "/v5/order/create", params)
     if str(data.get("retCode")) != "0":
+        # віддамо оригінальну помилку від Bybit для прозорої діагностики
         raise RuntimeError(f"Bybit error {data.get('retCode')}: {data.get('retMsg')} | resp={data}")
+
     return data, lev_to_use
 
 # ============ Signals + Trade ============
