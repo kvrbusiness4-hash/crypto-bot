@@ -305,11 +305,17 @@ async def place_order_market_no_tp_sl(
     if not info:
         raise RuntimeError(f"instrument info not found for {symbol}")
 
+    # Розрахунок кількості у базовій валюті (qty = COIN, не USDT)
     raw_qty = size_usdt / max(px, 1e-12)
     qty = normalize_qty(info, raw_qty)
     if qty <= 0:
-        raise RuntimeError(f"qty too small for {symbol}: {raw_qty:.12f} -> {qty}")
+        raise RuntimeError(f"qty too small for {symbol}: raw={raw_qty:.12f} -> {qty}")
 
+    # Форматуємо qty без зайвих нулів і наукової нотації
+    qty_str = ("%.10f" % qty).rstrip("0").rstrip(".")
+    if qty_str == "": qty_str = "0"
+
+    # Автоплече
     lev_to_use = lev_hint if isinstance(lev_hint, int) and lev_hint >= 1 else LEVERAGE
     if AUTO_LEVERAGE:
         vol_pct = calc_vol_pct(k15_for_vol or [], px)
@@ -317,22 +323,33 @@ async def place_order_market_no_tp_sl(
     await ensure_leverage(session, symbol, lev_to_use)
 
     params = {
-        "category":"linear",
-        "symbol":symbol,
-        "side":"Buy" if side.lower() in ("buy","long") else "Sell",
-        "orderType":"Market",
-        "qty":f"{qty:.10f}",
-        "timeInForce":"GoodTillCancel",
-        "reduceOnly":"false",
+        "category": "linear",
+        "symbol": symbol,
+        "side": "Buy" if side.lower() in ("buy", "long") else "Sell",
+        "orderType": "Market",
+        "qty": qty_str,
+        # timeInForce для market — "IOC" (ImmediateOrCancel). Можна й взагалі не вказувати,
+        # але явно ставимо коректне значення, щоби не ловити 10001.
+        "timeInForce": "ImmediateOrCancel",
     }
     if HEDGE_MODE:
         params["positionIdx"] = str(side_to_position_idx(side))
 
-    log.info("ORDER %s | side=%s idx=%s lev=%s qty=%s",
-             symbol, params["side"], params.get("positionIdx","-"), lev_to_use, params["qty"])
+    # детальний лог
+    log.info("ORDER CREATE: %s", json.dumps({
+        "path": "/v5/order/create",
+        "params": params,
+        "filters": {
+            "priceFilter": info.get("priceFilter"),
+            "lotSizeFilter": info.get("lotSizeFilter"),
+            "leverageFilter": info.get("leverageFilter"),
+        }
+    }, ensure_ascii=False))
 
     data = await private_post(session, "/v5/order/create", params)
     if str(data.get("retCode")) != "0":
+        # логнемо як є для точного діагнозу
+        log.error("ORDER REJECTED %s: %s", symbol, json.dumps(data, ensure_ascii=False))
         raise RuntimeError(f"Bybit error {data.get('retCode')}: {data.get('retMsg')} | resp={data}")
     return data, lev_to_use
 
