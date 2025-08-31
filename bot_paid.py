@@ -138,15 +138,27 @@ def auto_sl_tp_by_vol(series: List[float], px: float) -> Tuple[float,float]:
 BYBIT = "https://api.bybit.com"
 
 async def http_json(session: aiohttp.ClientSession, url: str, params: dict | None = None) -> dict:
-    for i in range(2):
+    delay = 0.7
+    for i in range(5):
         try:
             async with session.get(url, params=params, timeout=25, **_proxy_kwargs()) as r:
                 r.raise_for_status()
                 return await r.json()
-        except Exception:
-            if i == 1:
+        except aiohttp.ClientResponseError as e:
+            # 429 або інша помилка від сервера/проксі
+            if e.status == 429:
+                await asyncio.sleep(delay)
+                delay *= 1.8
+                continue
+            if i == 4:
                 raise
-            await asyncio.sleep(0.7)
+            await asyncio.sleep(delay)
+            delay *= 1.5
+        except Exception:
+            if i == 4:
+                raise
+            await asyncio.sleep(delay)
+            delay *= 1.5
 
 async def bybit_top_symbols(session: aiohttp.ClientSession, top:int=30) -> List[dict]:
     data = await http_json(session, f"{BYBIT}/v5/market/tickers", {"category":"linear"})
@@ -355,7 +367,7 @@ async def build_signals_and_trade(chat_id: int) -> str:
 
     async with aiohttp.ClientSession() as s:
         try:
-            tickers = await bybit_top_symbols(s, 30)
+            tickers = await bybit_top_symbols(s, 15)
         except Exception as e:
             return f"⚠️ Ринок недоступний: {e}"
 
@@ -381,7 +393,9 @@ async def build_signals_and_trade(chat_id: int) -> str:
             try:
                 k15, k30, k60 = await asyncio.gather(
                     bybit_klines(s, sym, "15", 300),
+                    await asyncio.sleep(0.35)
                     bybit_klines(s, sym, "30", 300),
+                    await asyncio.sleep(0.35)
                     bybit_klines(s, sym, "60", 300),
                 )
             except:
@@ -413,7 +427,7 @@ async def build_signals_and_trade(chat_id: int) -> str:
 
             note = f"15m[{mark(v15)}] | 30m[{mark(v30)}] | 1h[{mark(v60)}]"
             scored.append((float(score), sym, direction, px, note, float(base_sl), float(base_tp), abs(ch24)))
-            await asyncio.sleep(0.30)  # обережно до 429
+            await asyncio.sleep(0.75)
 
         if not scored:
             return "⚠️ Узгоджених сильних сигналів немає."
