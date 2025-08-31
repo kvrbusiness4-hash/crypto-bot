@@ -243,6 +243,7 @@ async def place_order_with_sl_tp(session: aiohttp.ClientSession, symbol: str, si
     return data
 
 # ============ Signals + Trade ============
+# ============ Signals + Trade ============
 async def build_signals_and_trade(chat_id: int) -> str:
     st = STATE.setdefault(chat_id, {"sl": SL_PCT, "tp": TP_PCT, "top_n": TOP_N})
     sl_pct = float(st.get("sl", SL_PCT))
@@ -250,77 +251,75 @@ async def build_signals_and_trade(chat_id: int) -> str:
     top_n  = int(st.get("top_n", TOP_N))
     report_lines = []
 
-async with aiohttp.ClientSession() as s:
-    try:
-        tickers = await bybit_top_symbols(s, 15)  # було 30
-    except Exception as e:
-        return f"⚠️ Ринок недоступний: {e}"
-
-    open_pos = []
-    if TRADE_ENABLED and BYBIT_KEY and BYBIT_SEC:
+    async with aiohttp.ClientSession() as s:
         try:
-            open_pos = await get_open_positions(s)
+            tickers = await bybit_top_symbols(s, 15)  # було 30
         except Exception as e:
-            log.warning("get_open_positions fail: %s", e)
+            return f"⚠️ Ринок недоступний: {e}"
 
-    scored: List[Tuple[float, str, str, float, str, float, float]] = []
+        open_pos = []
+        if TRADE_ENABLED and BYBIT_KEY and BYBIT_SEC:
+            try:
+                open_pos = await get_open_positions(s)
+            except Exception as e:
+                log.warning("get_open_positions fail: %s", e)
 
-    for t in tickers:
-        sym = t.get("symbol", "")
-        try:
-            px = float(t.get("lastPrice") or 0.0)
-            ch24 = float(t.get("price24hPcnt") or 0.0) * 100.0
-        except Exception:
-            px, ch24 = 0.0, 0.0
-        if px <= 0:
-            continue
+        scored: List[Tuple[float, str, str, float, str, float, float]] = []
 
-        try:
-            k15, k30, k60 = await asyncio.gather(
-                bybit_klines(s, sym, "15", 300),
-                bybit_klines(s, sym, "30", 300),
-                bybit_klines(s, sym, "60", 300),
-            )
-            await asyncio.sleep(0.30)  # пауза щоб уникнути 429
-        except Exception:
-            continue
-            
-        if not (k15 and k30 and k60):
-            continue
+        for t in tickers:
+            sym = t.get("symbol", "")
+            try:
+                px = float(t.get("lastPrice") or 0.0)
+                ch24 = float(t.get("price24hPcnt") or 0.0) * 100.0
+            except Exception:
+                px, ch24 = 0.0, 0.0
+            if px <= 0:
+                continue
 
-        v15 = votes_from_series(k15)
-        v30 = votes_from_series(k30)
-        v60 = votes_from_series(k60)
-        direction = decide_direction(v15["vote"], v30["vote"], v60["vote"])
-        if not direction:
-            continue
+            try:
+                k15, k30, k60 = await asyncio.gather(
+                    bybit_klines(s, sym, "15", 300),
+                    bybit_klines(s, sym, "30", 300),
+                    bybit_klines(s, sym, "60", 300),
+                )
+                await asyncio.sleep(0.30)  # невелика пауза щоб уникнути 429
+            except Exception:
+                continue
 
-        # SL/TP
-        if float(STATE.setdefault(chat_id, {}).get("sl", SL_PCT)) <= 0 or \
-           float(STATE.setdefault(chat_id, {}).get("tp", TP_PCT)) <= 0:
-            base_sl, base_tp = auto_sl_tp_by_vol(k15, px)
-        else:
-            base_sl = float(STATE[chat_id].get("sl", SL_PCT))
-            base_tp = float(STATE[chat_id].get("tp", TP_PCT))
+            v15 = votes_from_series(k15)
+            v30 = votes_from_series(k30)
+            v60 = votes_from_series(k60)
+            direction = decide_direction(v15["vote"], v30["vote"], v60["vote"])
+            if not direction:
+                continue
 
-        # score
-        score = v15["vote"] + v30["vote"] + v60["vote"]
-        if v60["ema_trend"] == 1 and direction == "LONG":
-            score += 1
-        if v60["ema_trend"] == -1 and direction == "SHORT":
-            score += 1
-        score += min(2.0, abs(ch24) / 10.0)
+            # SL/TP
+            if sl_pct <= 0 or tp_pct <= 0:
+                base_sl, base_tp = auto_sl_tp_by_vol(k15, px)
+            else:
+                base_sl, base_tp = sl_pct, tp_pct
 
-        def mark(v):
-            r = v["rsi"]; rtxt = f"{r:.0f}" if isinstance(r, (int, float)) else "-"
-            m = v["macd"]; sgn = v["sig"]
-            mtxt = "↑" if (m is not None and sgn is not None and m > sgn) else \
-                   ("↓" if (m is not None and sgn is not None and m < sgn) else "·")
-            et = v["ema_trend"]; etxt = "↑" if et == 1 else ("↓" if et == -1 else "·")
-            return f"RSI:{rtxt} MACD:{mtxt} EMA:{etxt}"
+            # Score
+            score = v15["vote"] + v30["vote"] + v60["vote"]
+            if v60["ema_trend"] == 1 and direction == "LONG":
+                score += 1
+            if v60["ema_trend"] == -1 and direction == "SHORT":
+                score += 1
+            score += min(2.0, abs(ch24) / 10.0)
 
-        note = f"15m[{mark(v15)}] | 30m[{mark(v30)}] | 1h[{mark(v60)}]"
-        scored.append((float(score), sym, direction, px, note, float(base_sl), float(base_tp)))
+            def mark(v):
+                r = v["rsi"]
+                rtxt = f"{r:.0f}" if isinstance(r, (int, float)) else "-"
+                m = v["macd"]
+                sgn = v["sig"]
+                mtxt = "↑" if (m is not None and sgn is not None and m > sgn) else ("↓" if (m is not None and sgn is not None and m < sgn) else "·")
+                et = v["ema_trend"]
+                etxt = "↑" if et == 1 else ("↓" if et == -1 else "·")
+                return f"RSI:{rtxt} MACD:{mtxt} EMA:{etxt}"
+
+            note = f"15m[{mark(v15)}] | 30m[{mark(v30)}] | 1h[{mark(v60)}]"
+            scored.append((float(score), sym, direction, px, note, float(base_sl), float(base_tp)))
+
         if not scored:
             return "⚠️ Узгоджених сильних сигналів немає."
 
@@ -333,14 +332,16 @@ async with aiohttp.ClientSession() as s:
             can_open = max(0, MAX_OPEN_POS - open_count)
 
             for sc, sym, direction, px, note, bsl, btp in picks:
-                if opened >= can_open: break
+                if opened >= can_open:
+                    break
                 if symbol_in_positions(open_pos, sym):
                     report_lines.append(f"• {sym}: {direction} (пропущено — вже відкрита позиція)")
                     continue
-                side = "Buy" if direction=="LONG" else "Sell"
+                side = "Buy" if direction == "LONG" else "Sell"
                 try:
                     await ensure_leverage(s, sym, LEVERAGE)
-                except: pass
+                except Exception:
+                    pass
                 try:
                     await place_order_with_sl_tp(s, sym, side, SIZE_USDT, px, bsl, btp)
                     opened += 1
@@ -355,9 +356,11 @@ async with aiohttp.ClientSession() as s:
             body = []
             for sc, sym, direction, px, note, bsl, btp in picks:
                 if direction == "LONG":
-                    slp = px*(1-bsl/100.0); tpp = px*(1+btp/100.0)
+                    slp = px * (1 - bsl / 100.0)
+                    tpp = px * (1 + btp / 100.0)
                 else:
-                    slp = px*(1+bsl/100.0); tpp = px*(1-btp/100.0)
+                    slp = px * (1 + bsl / 100.0)
+                    tpp = px * (1 - btp / 100.0)
                 body.append(
                     f"• {sym}: *{direction}* @ {px:.6f}\n"
                     f"  SL: `{slp:.6f}` · TP: `{tpp:.6f}`\n"
