@@ -392,11 +392,11 @@ async def build_signals_and_trade(chat_id: int) -> str:
 
             try:
                 k15, k30, k60 = await asyncio.gather(
-                    bybit_klines(s, sym, "15", 300),
+                    k15 = await bybit_klines(s, sym, "15", 300),
                     await asyncio.sleep(0.35)
-                    bybit_klines(s, sym, "30", 300),
+                    k30 = await bybit_klines(s, sym, "30", 300),
                     await asyncio.sleep(0.35)
-                    bybit_klines(s, sym, "60", 300),
+                    k60 = await bybit_klines(s, sym, "60", 300),
                 )
             except:
                 continue
