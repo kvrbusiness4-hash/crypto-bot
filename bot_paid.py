@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# bot_signals.py  — тільки сигнали (без автотрейду)
+# bot_signals.py — сигнали + аналітика, без автотрейду
 
 import os, math, asyncio, aiohttp, logging
 from typing import List, Tuple, Dict, Optional
@@ -11,47 +11,39 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # ============ ENV ============
 TG_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 BYBIT_PUBLIC = "https://api.bybit.com"
-BYBIT_PROXY  = os.getenv("BYBIT_PROXY", "").strip()  # опціонально
+BYBIT_PROXY  = os.getenv("BYBIT_PROXY", "").strip()
 
-# дефолтні параметри бота
-DEF_TOP_N         = 3        # максимум 3 монети
-DEF_STRENGTH_MIN  = 2        # 2 або 3
-DEF_WEIGHTS       = {"rsi": 1, "macd": 1, "ema": 1}  # ваги індикаторів
-DEF_SL            = 3.0
-DEF_TP            = 5.0
-DEF_LEV           = 3
-DEF_MIN_TURNOVER  = 5_000_000     # фільтр шуму: мін. обіг за 24h (USDT)
-DEF_MAX_VOL_PCT   = 12.0          # фільтр шуму: макс. волатильність (стд-відх. % за 48 свічок)
+# ========= Базові дефолти користувача =========
+DEFAULTS = {
+    "top_n": 3,          # макс. монет у відповіді
+    "strength": 2,       # 1..3 (мін. сила сигналу)
+    "noise": 1.0,        # % ATR як фільтр шуму (0.5 .. 3.0)
+    "sl": 3.0,           # базовий SL% (використ. якщо auto дає екстреми)
+    "tp": 5.0,           # базовий TP%
+    "lev_mode": "auto",  # 'auto' або 'manual'
+    "lev_base": 3,       # базове плече у manual
+}
 
-# Логи
+# ========= Логи =========
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("signals-bot")
 
-# ============ Клавіатура ============
-def make_kb(st: dict) -> ReplyKeyboardMarkup:
+# ========= Держава по чатах =========
+STATE: Dict[int, Dict[str, float | int | str]] = {}
+
+# ========= UI (мінімум, тільки корисне) =========
+def kb(st: Dict[str, float | int | str]) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             ["/signals", "/status"],
-            [f"/set_top {st.get('top_n', DEF_TOP_N)}", f"/set_strength {st.get('strength_min', DEF_STRENGTH_MIN)}"],
-            [f"/set_weights {st['w']['rsi']} {st['w']['macd']} {st['w']['ema']}"],
-            [f"/set_risk {st['sl']:.0f} {st['tp']:.0f} {st['lev']}", 
-             f"/set_noise {int(st['min_turn'])} {st['max_vol']:.0f}"],
+            [f"/set_strength {st.get('strength',2)}", f"/set_top {st.get('top_n',3)}"],
+            [f\"/set_noise {st.get('noise',1.0)}\", f\"/set_risk {int(st.get('sl',3))} {int(st.get('tp',5))}\"],
+            [f\"/set_lev {st.get('lev_mode','auto')}\", f\"/set_lev_base {st.get('lev_base',3)}\"],
         ],
         resize_keyboard=True
     )
 
-# Памʼять користувача
-STATE: Dict[int, Dict] = {}
-
-# ============ Допоміжні ============
-def utc_now() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
-
-def _proxy_kwargs() -> dict:
-    if BYBIT_PROXY.startswith(("http://", "https://")):
-        return {"proxy": BYBIT_PROXY}
-    return {}
-
+# ========= Helpers =========
 def split_long(text: str, n: int = 3500) -> List[str]:
     out = []
     while len(text) > n:
@@ -59,10 +51,16 @@ def split_long(text: str, n: int = 3500) -> List[str]:
     out.append(text)
     return out
 
-# ============ Індикатори ============
+def utc_now() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
+
+def _proxy_kwargs() -> dict:
+    return {"proxy": BYBIT_PROXY} if BYBIT_PROXY.startswith(("http://","https://")) else {}
+
+# ========= Indicators =========
 def ema(series: List[float], period: int) -> List[float]:
     if not series or period <= 1: return series[:]
-    k = 2 / (period + 1.0)
+    k = 2 / (period + 1)
     out = [series[0]]
     for x in series[1:]:
         out.append(out[-1] + k * (x - out[-1]))
@@ -92,46 +90,20 @@ def macd(series: List[float], fast=12, slow=26, signal=9) -> Tuple[List[float], 
     L = min(len(macd_line), len(sig))
     return macd_line[-L:], sig[-L:]
 
-def series_vote(series: List[float], w: Dict[str,int]) -> Dict[str, float | int]:
-    out = {"vote": 0.0, "rsi": None, "ema_trend": 0, "macd": None, "sig": None}
-    if len(series) < 60: return out
-    rr     = rsi(series, 14)
-    m, s   = macd(series)
-    e50    = ema(series, 50)
-    e200   = ema(series, 200) if len(series) >= 200 else ema(series, max(100, len(series)//2))
+def atr_from_klines(kl: List[List[str | float]], period: int = 14) -> List[float]:
+    # kline формат Bybit v5: [start, open, high, low, close, volume, ...]
+    if len(kl) < period + 1: return []
+    trs = []
+    prev_close = float(kl[0][4])
+    for i in range(1, len(kl)):
+        h = float(kl[i][2]); l = float(kl[i][3]); c_prev = prev_close
+        tr = max(h-l, abs(h-c_prev), abs(l-c_prev))
+        trs.append(tr)
+        prev_close = float(kl[i][4])
+    # простий EMA(TR) ~ ATR
+    return ema(trs, period)
 
-    if rr:
-        out["rsi"] = rr[-1]
-        if rr[-1] <= 30: out["vote"] += 1 * w["rsi"]
-        if rr[-1] >= 70: out["vote"] -= 1 * w["rsi"]
-
-    if m and s:
-        out["macd"], out["sig"] = m[-1], s[-1]
-        if m[-1] > s[-1]: out["vote"] += 1 * w["macd"]
-        if m[-1] < s[-1]: out["vote"] -= 1 * w["macd"]
-
-    if e50 and e200:
-        out["ema_trend"] = 1 if e50[-1] > e200[-1] else -1
-        out["vote"] += (1 if e50[-1] > e200[-1] else -1) * w["ema"]
-
-    return out
-
-def decide_direction(v15:float, v30:float, v60:float, strength_min:int) -> Optional[str]:
-    total = v15 + v30 + v60
-    pos = sum(1 for v in [v15, v30, v60] if v > 0)
-    neg = sum(1 for v in [v15, v30, v60] if v < 0)
-    if total >= strength_min and pos >= 2:  return "LONG"
-    if total <= -strength_min and neg >= 2: return "SHORT"
-    return None
-
-def calc_vol_pct(series: List[float], px: float) -> float:
-    tail = series[-48:] if len(series) >= 48 else series
-    if len(tail) < 2 or px <= 0: return 0.0
-    mean = sum(tail)/len(tail)
-    var = sum((x-mean)**2 for x in tail)/len(tail)
-    return (math.sqrt(var)/px)*100.0
-
-# ============ HTTP (public) ============
+# ========= HTTP (public) =========
 async def http_json(session: aiohttp.ClientSession, url: str, params: dict | None = None) -> dict:
     delay = 0.7
     for i in range(5):
@@ -148,236 +120,267 @@ async def http_json(session: aiohttp.ClientSession, url: str, params: dict | Non
             if i == 4: raise
             await asyncio.sleep(delay); delay *= 1.5
 
-async def bybit_top_symbols(session: aiohttp.ClientSession, top:int=30) -> List[dict]:
+async def bybit_top_symbols(session: aiohttp.ClientSession, top:int=25) -> List[dict]:
     data = await http_json(session, f"{BYBIT_PUBLIC}/v5/market/tickers", {"category":"linear"})
     lst = ((data.get("result") or {}).get("list")) or []
-    def _volume(x):
-        try: return float(x.get("turnover24h") or 0.0)
+    def _turnover(x):
+        try: return float(x.get("turnover24h") or 0)
         except: return 0.0
-    lst.sort(key=_volume, reverse=True)
-    return lst[:top]
+    lst.sort(key=_turnover, reverse=True)
+    return [x for x in lst if str(x.get("symbol","")).endswith("USDT")][:top]
 
-async def bybit_klines(session: aiohttp.ClientSession, symbol: str, interval: str, limit: int = 300) -> List[float]:
+async def bybit_klines_raw(session: aiohttp.ClientSession, symbol: str, interval: str, limit: int = 300) -> List[List[str | float]]:
     data = await http_json(session, f"{BYBIT_PUBLIC}/v5/market/kline", {
         "category":"linear","symbol":symbol,"interval":interval,"limit":str(limit)
     })
-    rows = list(reversed(((data.get("result") or {}).get("list")) or []))
-    closes = []
-    for r in rows:
-        try: closes.append(float(r[4]))
-        except: pass
-    return closes
+    rows = ((data.get("result") or {}).get("list")) or []
+    rows = list(reversed(rows))  # oldest -> newest
+    return rows
 
-# ============ Побудова сигналів ============
-async def build_signals(chat_id: int) -> str:
-    st = STATE.setdefault(chat_id, {
-        "top_n": DEF_TOP_N,
-        "strength_min": DEF_STRENGTH_MIN,
-        "w": DEF_WEIGHTS.copy(),
-        "sl": DEF_SL, "tp": DEF_TP, "lev": DEF_LEV,
-        "min_turn": DEF_MIN_TURNOVER, "max_vol": DEF_MAX_VOL_PCT
-    })
+# ========= Scoring =========
+def vote_block(series: List[float]) -> Dict[str, float | int]:
+    out = {"vote":0, "rsi":None, "ema_trend":0, "macd":None, "sig":None}
+    if len(series) < 60: return out
+    rr = rsi(series,14); m, s = macd(series)
+    e50 = ema(series,50); e200 = ema(series,200) if len(series)>=200 else ema(series, max(100, len(series)//2))
+    if rr:
+        out["rsi"] = rr[-1]
+        if rr[-1] <= 30: out["vote"] += 1
+        if rr[-1] >= 70: out["vote"] -= 1
+    if m and s:
+        out["macd"], out["sig"] = m[-1], s[-1]
+        out["vote"] += 1 if m[-1] > s[-1] else -1
+    if e50 and e200:
+        trend = 1 if e50[-1] > e200[-1] else -1
+        out["ema_trend"] = trend
+        out["vote"] += trend
+    return out
 
-    w = st["w"]; top_n = int(st["top_n"])
-    strength_min = int(st["strength_min"])
+def decide_direction(v15:int, v30:int, v60:int) -> Optional[str]:
+    total = v15 + v30 + v60
+    pos = sum(1 for v in [v15,v30,v60] if v>0)
+    neg = sum(1 for v in [v15,v30,v60] if v<0)
+    if total >= 3 and pos >= 2: return "LONG"
+    if total <= -3 and neg >= 2: return "SHORT"
+    return None
+
+def lev_auto_from_vol(atr_pct: float) -> int:
+    # проста шкала: менша волатильність -> більше плече
+    if atr_pct < 1.0: return 5
+    if atr_pct < 2.0: return 3
+    return 2
+
+def sl_tp_from_vol(direction:str, price:float, atr_pct:float, base_sl:float, base_tp:float) -> Tuple[float,float,float,float]:
+    # орієнтуємося на ATR% (за 14), але не виходимо за 0.8×..1.8× бази
+    sl_pct = max(0.8*base_sl, min(1.8*base_sl, max(0.7, atr_pct*0.8)))
+    tp_pct = max(0.8*base_tp, min(1.8*base_tp, max(1.0, atr_pct*1.2)))
+    if direction=="LONG":
+        sl = price*(1-sl_pct/100.0); tp = price*(1+tp_pct/100.0)
+    else:
+        sl = price*(1+sl_pct/100.0); tp = price*(1-tp_pct/100.0)
+    return sl, tp, sl_pct, tp_pct
+
+# ========= Аналітика монети =========
+def render_marks(v15, v30, v60) -> str:
+    def mk(v):
+        r = v["rsi"]; rtxt = f"{r:.0f}" if isinstance(r,(int,float)) else "-"
+        m = v["macd"]; s = v["sig"]
+        mtxt = "↑" if (m is not None and s is not None and m>s) else ("↓" if (m is not None and s is not None and m<s) else "·")
+        et = v["ema_trend"]; etxt = "↑" if et==1 else ("↓" if et==-1 else "·")
+        return f"RSI:{rtxt} MACD:{mtxt} EMA:{etxt}"
+    return f"15m {mk(v15)} | 30m {mk(v30)} | 1h {mk(v60)}"
+
+# ========= Головна побудова сигналів =========
+async def build_signals(chat_id:int) -> str:
+    st = STATE.setdefault(chat_id, DEFAULTS.copy())
+    top_n     = int(st.get("top_n",3))
+    strength  = int(st.get("strength",2))
+    noise_pct = float(st.get("noise",1.0))
+    base_sl   = float(st.get("sl",3.0))
+    base_tp   = float(st.get("tp",5.0))
+    lev_mode  = str(st.get("lev_mode","auto"))
+    lev_base  = int(st.get("lev_base",3))
 
     async with aiohttp.ClientSession() as s:
         try:
-            tickers = await bybit_top_symbols(s, 40)  # беремо більше, потім фільтруємо шум
+            tickers = await bybit_top_symbols(s, 25)
         except Exception as e:
             return f"⚠️ Ринок недоступний: {e}"
 
-        scored: List[Tuple[float, str, str, float, str]] = []  # score, symbol, dir, price, note
-
+        scored = []
         for t in tickers:
             sym = t.get("symbol","")
-            if not sym.endswith("USDT"):  # працюємо лише з USDT-перпами
-                continue
-
-            # фільтр шуму за оборотом
-            try:
-                turnover = float(t.get("turnover24h") or 0.0)
-            except:
-                turnover = 0.0
-            if turnover < st["min_turn"]:
-                continue
-
             try:
                 px  = float(t.get("lastPrice") or 0.0)
-                ch24 = float(t.get("price24hPcnt") or 0.0) * 100.0
+                ch24 = float(t.get("price24hPcnt") or 0.0)*100.0
             except:
-                px, ch24 = 0.0, 0.0
-            if px <= 0: 
                 continue
+            if px <= 0: continue
 
-            # таймфрейми
             try:
-                k15 = await bybit_klines(s, sym, "15", 300); await asyncio.sleep(0.2)
-                k30 = await bybit_klines(s, sym, "30", 300); await asyncio.sleep(0.2)
-                k60 = await bybit_klines(s, sym, "60", 300)
-            except:
+                k15 = await bybit_klines_raw(s, sym, "15", 300); await asyncio.sleep(0.2)
+                k30 = await bybit_klines_raw(s, sym, "30", 300); await asyncio.sleep(0.2)
+                k60 = await bybit_klines_raw(s, sym, "60", 300)
+            except: 
                 continue
             if not (k15 and k30 and k60): 
                 continue
 
-            # фільтр шуму за волатильністю
-            vol_pct = calc_vol_pct(k15, px)
-            if vol_pct > st["max_vol"]:
-                continue
+            c15 = [float(x[4]) for x in k15]
+            c30 = [float(x[4]) for x in k30]
+            c60 = [float(x[4]) for x in k60]
 
-            v15 = series_vote(k15, w)
-            v30 = series_vote(k30, w)
-            v60 = series_vote(k60, w)
-            direction = decide_direction(v15["vote"], v30["vote"], v60["vote"], strength_min)
+            v15 = vote_block(c15)
+            v30 = vote_block(c30)
+            v60 = vote_block(c60)
+            direction = decide_direction(v15["vote"], v30["vote"], v60["vote"])
             if not direction: 
                 continue
 
+            # Волатильність (ATR%) на 15м
+            atr = atr_from_klines(k15, 14)
+            if not atr: 
+                continue
+            atr_pct = (atr[-1] / px) * 100.0
+
+            # Мінфільтр «шуму»
+            if atr_pct < noise_pct:
+                continue
+
+            # Сила сигналу (0..5)
             score = v15["vote"] + v30["vote"] + v60["vote"]
-            # легкий бонус за збіг тренду старшого ТФ
-            if v60["ema_trend"] == 1 and direction == "LONG":  score += 0.5
-            if v60["ema_trend"] == -1 and direction == "SHORT": score += 0.5
+            if (v60["ema_trend"]==1 and direction=="LONG") or (v60["ema_trend"]==-1 and direction=="SHORT"):
+                score += 1
             score += min(2.0, abs(ch24)/10.0)
 
-            def mark(v):
-                r = v["rsi"]; rtxt = f"{r:.0f}" if isinstance(r,(int,float)) else "-"
-                m = v["macd"]; sgn = v["sig"]
-                mtxt = "↑" if (m is not None and sgn is not None and m > sgn) else ("↓" if (m is not None and sgn is not None and m < sgn) else "·")
-                et  = v["ema_trend"]; etxt = "↑" if et==1 else ("↓" if et==-1 else "·")
-                return f"15mRSI:{rtxt} MACD:{mtxt} EMA:{etxt}"
+            # strength поріг (2 ~ помірно, 3 ~ високий)
+            if score < strength:
+                continue
 
-            note = (
-                f"{mark(v15)} | "
-                f"30mRSI:{v30.get('rsi') and int(v30['rsi']) or '-'} MACD:{'↑' if (v30.get('macd') and v30.get('sig') and v30['macd']>v30['sig']) else ('↓' if (v30.get('macd') and v30.get('sig') and v30['macd']<v30['sig']) else '·')} EMA:{'↑' if v30['ema_trend']==1 else ('↓' if v30['ema_trend']==-1 else '·')} | "
-                f"1hRSI:{v60.get('rsi') and int(v60['rsi']) or '-'} MACD:{'↑' if (v60.get('macd') and v60.get('sig') and v60['macd']>v60['sig']) else ('↓' if (v60.get('macd') and v60.get('sig') and v60['macd']<v60['sig']) else '·')} EMA:{'↑' if v60['ema_trend']==1 else ('↓' if v60['ema_trend']==-1 else '·')}"
-            )
+            # SL/TP
+            sl, tp, slp, tpp = sl_tp_from_vol(direction, px, atr_pct, base_sl, base_tp)
 
-            scored.append((float(score), sym, direction, px, note))
+            # Плече
+            lev = lev_auto_from_vol(atr_pct) if lev_mode=="auto" else max(1, int(lev_base))
 
-            # невелика пауза, щоб не спамити API
+            marks = render_marks(v15, v30, v60)
+            scored.append((
+                float(score), sym, direction, px, sl, tp, slp, tpp, lev, atr_pct, ch24, marks
+            ))
             await asyncio.sleep(0.25)
 
         if not scored:
-            return "⚠️ За поточними фільтрами/налаштуваннями сильних сигналів немає."
+            return "⚠️ Узгоджених сильних сигналів не знайдено."
 
-        # сортуємо за силою
         scored.sort(key=lambda x: x[0], reverse=True)
         picks = scored[:max(1, min(3, top_n))]
 
-        # Формуємо відповідь
-        lines = ["📈 *Сильні сигнали:*\n"]
-        for score, sym, direction, px, note in picks:
-            slp = px*(1 - st["sl"]/100.0) if direction=="LONG" else px*(1 + st["sl"]/100.0)
-            tpp = px*(1 + st["tp"]/100.0) if direction=="LONG" else px*(1 - st["tp"]/100.0)
+        lines = []
+        for sc, sym, dirn, px, sl, tp, slp, tpp, lev, atrp, ch24, marks in picks:
             lines.append(
-                f"• {sym}: *{direction}* @ {px:.6f}  (score: `{score:.2f}`)\n"
-                f"  SL: `{slp:.6f}` · TP: `{tpp:.6f}` · LEV: {st['lev']}\n"
-                f"  {note}\n"
+                f"• *{sym}*: *{dirn}* @ `{px:.6f}`\n"
+                f"  SL:`{sl:.6f}` ({slp:.1f}%) · TP:`{tp:.6f}` ({tpp:.1f}%) · LEV:`{lev}` · ATR%:`{atrp:.2f}` · 24h:`{ch24:.2f}%`\n"
+                f"  {marks}"
             )
-        lines.append(f"UTC: {utc_now()}  |  налаштування: strength≥{strength_min}, weights(R/M/E)={w['rsi']}/{w['macd']}/{w['ema']}, "
-                     f"noise(min turn={int(st['min_turn'])}, max vol={st['max_vol']:.0f}%)")
-        return "\n".join(lines)
 
-# ============ Команди ============
-def ensure_state(chat_id: int) -> dict:
-    return STATE.setdefault(chat_id, {
-        "top_n": DEF_TOP_N,
-        "strength_min": DEF_STRENGTH_MIN,
-        "w": DEF_WEIGHTS.copy(),
-        "sl": DEF_SL, "tp": DEF_TP, "lev": DEF_LEV,
-        "min_turn": DEF_MIN_TURNOVER, "max_vol": DEF_MAX_VOL_PCT
-    })
+        header = "📈 *Сильні сигнали (аналітика, без автотрейду):*\n"
+        footer = f"\n⚙️ strength:{strength} • noise:{noise_pct:.2f}% • max:{top_n} • lev:{lev_mode}({lev_base}) • UTC:{utc_now()}"
+        return header + "\n\n".join(lines) + footer
 
+# ========= Commands =========
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = ensure_state(u.effective_chat.id)
-    await u.message.reply_text("👋 Готовий. Працюю як аналітик-сигнальщик (без автотрейду).", reply_markup=make_kb(st))
-
-async def status_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = ensure_state(u.effective_chat.id)
-    w = st["w"]
-    text = (
-        f"🔧 Налаштування:\n"
-        f"TOP_N: {st['top_n']}  •  STRENGTH_MIN: {st['strength_min']}\n"
-        f"Weights (RSI/MACD/EMA): {w['rsi']}/{w['macd']}/{w['ema']}\n"
-        f"Risk: SL={st['sl']:.2f}%  TP={st['tp']:.2f}%  LEV={st['lev']}\n"
-        f"Noise filter: min_turnover={int(st['min_turn'])}  max_vol={st['max_vol']:.0f}%\n"
-        f"UTC: {utc_now()}"
-    )
-    await u.message.reply_text(text, reply_markup=make_kb(st))
+    st = STATE.setdefault(u.effective_chat.id, DEFAULTS.copy())
+    await u.message.reply_text("👋 Готовий. Натисни /signals щоб отримати аналітику.", reply_markup=kb(st))
 
 async def signals_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     txt = await build_signals(u.effective_chat.id)
-    for chunk in split_long(txt):
-        await u.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
+    for ch in split_long(txt):
+        await u.message.reply_text(ch, parse_mode=ParseMode.MARKDOWN)
 
-# ---- setters
+async def status_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st = STATE.setdefault(u.effective_chat.id, DEFAULTS.copy())
+    msg = (
+        f"ℹ️ Статус:\n"
+        f"- top_n: {st.get('top_n')}\n"
+        f"- strength: {st.get('strength')}\n"
+        f"- noise (ATR% фільтр): {st.get('noise')}\n"
+        f"- risk (SL/TP): {st.get('sl')}% / {st.get('tp')}%\n"
+        f"- leverage: {st.get('lev_mode')} (base={st.get('lev_base')})\n"
+        f"- UTC: {utc_now()}"
+    )
+    await u.message.reply_text(msg, reply_markup=kb(st))
+
 async def set_top_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = ensure_state(u.effective_chat.id)
+    st = STATE.setdefault(u.effective_chat.id, DEFAULTS.copy())
     try:
         n = int(c.args[0]); assert 1 <= n <= 3
         st["top_n"] = n
-        await u.message.reply_text(f"OK. TOP_N={n}", reply_markup=make_kb(st))
+        await u.message.reply_text(f"OK. Показуватиму до {n} монет.", reply_markup=kb(st))
     except:
         await u.message.reply_text("Формат: /set_top 1..3")
 
 async def set_strength_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = ensure_state(u.effective_chat.id)
+    st = STATE.setdefault(u.effective_chat.id, DEFAULTS.copy())
     try:
-        s = int(c.args[0]); assert s in (2,3)
-        st["strength_min"] = s
-        await u.message.reply_text(f"OK. STRENGTH_MIN={s}", reply_markup=make_kb(st))
+        v = int(c.args[0]); assert 1 <= v <= 3
+        st["strength"] = v
+        await u.message.reply_text(f"OK. Мінімальна сила сигналу = {v}.", reply_markup=kb(st))
     except:
-        await u.message.reply_text("Формат: /set_strength 2|3")
-
-async def set_weights_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = ensure_state(u.effective_chat.id)
-    try:
-        rsi_w  = int(c.args[0]); macd_w = int(c.args[1]); ema_w = int(c.args[2])
-        # дозволимо діапазон -2..3 (нуль — вимкнути індикатор)
-        for v in (rsi_w, macd_w, ema_w):
-            assert -2 <= v <= 3
-        st["w"] = {"rsi": rsi_w, "macd": macd_w, "ema": ema_w}
-        await u.message.reply_text(f"OK. Weights set to RSI/MACD/EMA = {rsi_w}/{macd_w}/{ema_w}", reply_markup=make_kb(st))
-    except:
-        await u.message.reply_text("Формат: /set_weights rsi macd ema   (кожен у діапазоні -2..3)")
-
-async def set_risk_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = ensure_state(u.effective_chat.id)
-    try:
-        sl = float(c.args[0]); tp = float(c.args[1]); lev = int(c.args[2])
-        assert 0 <= sl <= 20 and 0 <= tp <= 30 and 1 <= lev <= 50
-        st["sl"], st["tp"], st["lev"] = sl, tp, lev
-        await u.message.reply_text(f"OK. SL={sl:.2f}% · TP={tp:.2f}% · LEV={lev}", reply_markup=make_kb(st))
-    except:
-        await u.message.reply_text("Формат: /set_risk 3 5 3   (SL% TP% LEV)")
+        await u.message.reply_text("Формат: /set_strength 1..3")
 
 async def set_noise_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = ensure_state(u.effective_chat.id)
+    st = STATE.setdefault(u.effective_chat.id, DEFAULTS.copy())
     try:
-        min_turn = float(c.args[0])          # у USDT
-        max_vol  = float(c.args[1])          # у %
-        assert min_turn >= 0 and 1 <= max_vol <= 50
-        st["min_turn"], st["max_vol"] = min_turn, max_vol
-        await u.message.reply_text(f"OK. Noise: min_turnover={int(min_turn)}, max_vol={max_vol:.0f}%", reply_markup=make_kb(st))
+        v = float(c.args[0]); assert 0.3 <= v <= 5.0
+        st["noise"] = v
+        await u.message.reply_text(f"OK. Noise (ATR%% фільтр) = {v:.2f}%.", reply_markup=kb(st))
     except:
-        await u.message.reply_text("Формат: /set_noise 5000000 12   (мін. оборот за 24h, макс. волатильність %)")
+        await u.message.reply_text("Формат: /set_noise 0.3..5.0")
 
-# ============ Main ============
+async def set_risk_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st = STATE.setdefault(u.effective_chat.id, DEFAULTS.copy())
+    try:
+        sl = float(c.args[0]); tp = float(c.args[1]); assert sl>=0 and tp>=0
+        st["sl"], st["tp"] = sl, tp
+        await u.message.reply_text(f"OK. База SL/TP = {sl:.1f}% / {tp:.1f}%.", reply_markup=kb(st))
+    except:
+        await u.message.reply_text("Формат: /set_risk 3 5")
+
+async def set_levmode_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st = STATE.setdefault(u.effective_chat.id, DEFAULTS.copy())
+    try:
+        mode = str(c.args[0]).lower(); assert mode in ("auto","manual")
+        st["lev_mode"] = mode
+        await u.message.reply_text(f"OK. Режим плеча: {mode}.", reply_markup=kb(st))
+    except:
+        await u.message.reply_text("Формат: /set_lev auto|manual")
+
+async def set_levbase_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st = STATE.setdefault(u.effective_chat.id, DEFAULTS.copy())
+    try:
+        v = int(c.args[0]); assert 1 <= v <= 20
+        st["lev_base"] = v
+        await u.message.reply_text(f"OK. Базове плече = {v}.", reply_markup=kb(st))
+    except:
+        await u.message.reply_text("Формат: /set_lev_base 1..20")
+
+# ========= Main =========
 def main():
     if not TG_TOKEN:
         print("Set TELEGRAM_BOT_TOKEN"); return
+    print("Signals bot running | TF=15/30/60 | top<=3 | RSI/EMA/MACD/ATR | no-trade")
 
-    print("Signals-only bot running | TF=15/30/60 | top<=3 | RSI/MACD/EMA weights | noise filters")
     app = Application.builder().token(TG_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("signals", signals_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
 
     app.add_handler(CommandHandler("set_top", set_top_cmd))
     app.add_handler(CommandHandler("set_strength", set_strength_cmd))
-    app.add_handler(CommandHandler("set_weights", set_weights_cmd))
-    app.add_handler(CommandHandler("set_risk", set_risk_cmd))
     app.add_handler(CommandHandler("set_noise", set_noise_cmd))
+    app.add_handler(CommandHandler("set_risk", set_risk_cmd))
+    app.add_handler(CommandHandler("set_lev", set_levmode_cmd))
+    app.add_handler(CommandHandler("set_lev_base", set_levbase_cmd))
 
     app.run_polling()
 
