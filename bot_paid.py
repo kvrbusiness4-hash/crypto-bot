@@ -5,7 +5,7 @@ import os, math, asyncio, aiohttp, logging
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timezone, time as dtime
 
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, BotCommand
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -20,17 +20,59 @@ TOP_N            = int(os.getenv("TOP_N", "3"))                 # до N мон�
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("signals")
 
+# ========= PROFILES (нове) =========
+PROFILES = {
+    "scalp": {
+        "top_n": 5,
+        "noise": 1.0,
+        "trend_weight": 3,
+        "atr_len": 10,
+        "sl_k": 1.2,
+        "tp_k": 1.8,
+        "rr_min": 1.5,
+        "min_turnover": 100.0,
+        "max_spread_bps": 8,
+        "max_24h_change": 25.0,
+        "cooldown_min": 60,
+        "every": 15,
+    },
+    "default": {
+        "top_n": 3,
+        "noise": 1.8,
+        "trend_weight": 3,
+        "atr_len": 14,
+        "sl_k": 1.5,
+        "tp_k": 2.5,
+        "rr_min": 1.8,
+        "min_turnover": 150.0,
+        "max_spread_bps": 5,
+        "max_24h_change": 15.0,
+        "cooldown_min": 180,
+        "every": 15,
+    },
+    "swing": {
+        "top_n": 3,
+        "noise": 3.0,
+        "trend_weight": 4,
+        "atr_len": 20,
+        "sl_k": 2.0,
+        "tp_k": 3.5,
+        "rr_min": 2.0,
+        "min_turnover": 150.0,
+        "max_spread_bps": 5,
+        "max_24h_change": 20.0,
+        "cooldown_min": 360,
+        "every": 15,
+    },
+}
+
 # ========= UI =========
-def _kb(st) -> ReplyKeyboardMarkup:
+def _kb(_: Dict[str, object]) -> ReplyKeyboardMarkup:
+    # мінімальне меню: профілі + базові команди
     return ReplyKeyboardMarkup(
         [
+            ["/scalp", "/default", "/swing"],
             ["/signals", "/status"],
-            [f"/auto_on {st.get('every', DEFAULT_AUTO_MIN)}", "/auto_off"],
-            ["/set_noise 1.8", "/set_trend 3", "/set_rr 1.8"],
-            ["/set_risk 1.5 2.5", "/set_liq 150", "/set_spread 5"],
-            ["/set_24h 15", "/set_session 12 20", "/set_cooldown 180"],
-            ["/wl_add BTCUSDT ETHUSDT", "/bl_add TRUMPUSDT"],
-            ["/sim 10"],  # симулятор на 10 USDT
         ],
         resize_keyboard=True
     )
@@ -48,7 +90,7 @@ def default_state() -> Dict[str, object]:
         "blacklist": set({"TRUMPUSDT","PUMPFUNUSDT","FARTCOINUSDT","IPUSDT","ENAUSDT"}),
         # логіка тренду/шуму
         "noise": 1.8,              # % мін. амплітуда очікуваного руху
-        "trend_weight": 3,         # 2 або 3 (строгість голосування 15/30/60)
+        "trend_weight": 3,         # суворість голосування 15/30/60
         # ATR/ризики
         "atr_len": 14,
         "sl_k": 1.5,
@@ -214,7 +256,7 @@ async def build_signals(st: Dict[str,object]) -> str:
             sym = str(t.get("symbol",""))
             if st["whitelist"] and sym not in st["whitelist"]:
                 continue
-            if sym in st["blacklist"]: 
+            if sym in st["blacklist"]:
                 continue
             try:
                 vol = float(t.get("turnover24h") or 0)/1e6  # млн USDT
@@ -222,18 +264,18 @@ async def build_signals(st: Dict[str,object]) -> str:
                 px  = float(t.get("lastPrice") or 0)
             except:
                 continue
-            if vol < float(st["min_turnover"]): 
+            if vol < float(st["min_turnover"]):
                 continue
-            if abs(ch24) > float(st["max_24h_change"]): 
+            if abs(ch24) > float(st["max_24h_change"]):
                 continue
-            if px<=0: 
+            if px<=0:
                 continue
             cands.append((sym, px, ch24))
 
         scored=[]
         for sym, px, ch24 in cands:
             sp_bps = await get_orderbook_spread_bps(s, sym)
-            if sp_bps > float(st["max_spread_bps"]): 
+            if sp_bps > float(st["max_spread_bps"]):
                 continue
 
             o15,h15,l15,c15 = await get_klines(s, sym, "15", 300)
@@ -241,18 +283,18 @@ async def build_signals(st: Dict[str,object]) -> str:
             o30,h30,l30,c30 = await get_klines(s, sym, "30", 300)
             await asyncio.sleep(0.15)
             o60,h60,l60,c60 = await get_klines(s, sym, "60", 300)
-            if not (c15 and c30 and c60): 
+            if not (c15 and c30 and c60):
                 continue
 
             v15=votes_from_series(c15)
             v30=votes_from_series(c30)
             v60=votes_from_series(c60)
             direction = decide_direction(v15["vote"], v30["vote"], v60["vote"], int(st["trend_weight"]))
-            if not direction: 
+            if not direction:
                 continue
 
             atr_val = atr(h15,l15,c15,int(st["atr_len"]))
-            if atr_val<=0: 
+            if atr_val<=0:
                 continue
             sl_k, tp_k = float(st["sl_k"]), float(st["tp_k"])
             if direction=="LONG":
@@ -265,7 +307,7 @@ async def build_signals(st: Dict[str,object]) -> str:
             # фільтр шуму + R:R
             if abs(tp-px)/px*100.0 < float(st["noise"]):
                 continue
-            if not rr_ok(px, sl, tp, float(st["rr_min"])): 
+            if not rr_ok(px, sl, tp, float(st["rr_min"])):
                 continue
 
             # кулдаун
@@ -285,7 +327,7 @@ async def build_signals(st: Dict[str,object]) -> str:
         top = scored[:max(1, int(st["top_n"]))]
 
         for _, sym, *_ in top:
-            st["_last_sig_ts"][sym] = now_ts
+            st["_last_sig_ts"][sym] = datetime.utcnow().timestamp()
 
         def mark(v):
             r = v["rsi"]; rtxt = f"{r:.0f}" if isinstance(r,(int,float)) else "-"
@@ -305,19 +347,73 @@ async def build_signals(st: Dict[str,object]) -> str:
             )
         return "📈 *Сильні сигнали:*\n\n" + "\n\n".join(body) + f"\n\nUTC: {utc_now_str()}"
 
+# ========= Auto helpers (нове) =========
+async def _start_autoposting(chat_id: int, app, st: Dict[str, object], minutes: int):
+    st["every"] = minutes
+    st["auto_on"] = True
+    name = f"auto_{chat_id}"
+    for j in app.job_queue.get_jobs_by_name(name):
+        j.schedule_removal()
+    app.job_queue.run_repeating(auto_job, interval=minutes*60, first=5, name=name, data={"chat_id": chat_id})
+
+async def _scan_now_and_send(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    st = STATE.setdefault(chat_id, default_state())
+    txt = await build_signals(st)
+    for ch in split_long(txt):
+        await context.bot.send_message(chat_id=chat_id, text=ch, parse_mode=ParseMode.MARKDOWN)
+
+async def _apply_profile_and_scan(u: Update, c: ContextTypes.DEFAULT_TYPE, key: str):
+    st = STATE.setdefault(u.effective_chat.id, default_state())
+    p = PROFILES[key]
+
+    # застосувати параметри
+    st.update({
+        "top_n": p["top_n"],
+        "noise": p["noise"],
+        "trend_weight": p["trend_weight"],
+        "atr_len": p["atr_len"],
+        "sl_k": p["sl_k"],
+        "tp_k": p["tp_k"],
+        "rr_min": p["rr_min"],
+        "min_turnover": p["min_turnover"],
+        "max_spread_bps": p["max_spread_bps"],
+        "max_24h_change": p["max_24h_change"],
+        "cooldown_min": p["cooldown_min"],
+    })
+
+    # увімкнути автопостинг і показати мінімальне меню
+    await _start_autoposting(u.effective_chat.id, c.application, st, p["every"])
+    await u.message.reply_text(
+        f"✅ Профіль *{key}* застосовано. Автоскан кожні {p['every']} хв.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_kb(st)
+    )
+
+    # миттєвий одноразовий скан
+    await _scan_now_and_send(u.effective_chat.id, c)
+
 # ========= Commands =========
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     st = STATE.setdefault(u.effective_chat.id, default_state())
+    # поставимо коротке меню команд у клієнті Telegram
+    try:
+        await c.bot.set_my_commands([
+            BotCommand("scalp", "Агресивний режим (скальпінг)"),
+            BotCommand("default", "Стандартний режим"),
+            BotCommand("swing", "Середньостроковий режим"),
+            BotCommand("signals", "Сканувати зараз"),
+            BotCommand("status", "Поточні налаштування"),
+        ])
+    except Exception:
+        pass
+
     await u.message.reply_text(
-        "👋 Готово. Бот видає *сигнали без автотрейду*.\nКоманди — на клавіатурі нижче.",
+        "👋 Готово. Бот видає *сигнали без автотрейду*.\nОберіть режим нижче.",
         parse_mode=ParseMode.MARKDOWN, reply_markup=_kb(st)
     )
 
 async def signals_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = STATE.setdefault(u.effective_chat.id, default_state())
-    txt = await build_signals(st)
-    for ch in split_long(txt):
-        await u.message.reply_text(ch, parse_mode=ParseMode.MARKDOWN)
+    await _scan_now_and_send(u.effective_chat.id, c)
 
 async def status_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     st = STATE.setdefault(u.effective_chat.id, default_state())
@@ -331,9 +427,9 @@ async def status_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"blacklist: {', '.join(sorted(st['blacklist'])) or '—'}\n"
         f"UTC: {utc_now_str()}"
     )
-    await u.message.reply_text(text)
+    await u.message.reply_text(text, reply_markup=_kb(st))
 
-# --- setters
+# --- сеттери (залишив працюючими, але їх немає у меню)
 async def set_noise_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     st = STATE.setdefault(u.effective_chat.id, default_state())
     try:
@@ -346,11 +442,11 @@ async def set_noise_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
 async def set_trend_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     st=STATE.setdefault(u.effective_chat.id, default_state())
     try:
-        v=int(c.args[0]); assert v in (2,3)
+        v=int(c.args[0]); assert v in (2,3,4)
         st["trend_weight"]=v
         await u.message.reply_text(f"OK. Суворість тренду: {v}.")
     except:
-        await u.message.reply_text("Формат: /set_trend 2|3")
+        await u.message.reply_text("Формат: /set_trend 2|3|4")
 
 async def set_rr_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     st=STATE.setdefault(u.effective_chat.id, default_state())
@@ -456,11 +552,7 @@ async def auto_on_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if c.args:
         try: minutes=max(5, min(180, int(c.args[0])))
         except: pass
-    st["every"]=minutes; st["auto_on"]=True
-    name=f"auto_{u.effective_chat.id}"
-    for j in c.application.job_queue.get_jobs_by_name(name):
-        j.schedule_removal()
-    c.application.job_queue.run_repeating(auto_job, interval=minutes*60, first=5, name=name, data={"chat_id":u.effective_chat.id})
+    await _start_autoposting(u.effective_chat.id, c.application, st, minutes)
     await u.message.reply_text(f"✅ Автопостинг ON кожні {minutes} хв.", reply_markup=_kb(st))
 
 async def auto_off_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -471,17 +563,15 @@ async def auto_off_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         j.schedule_removal()
     await u.message.reply_text("⏸ Автопостинг OFF.", reply_markup=_kb(st))
 
-# PnL симулятор: /sim 10
-async def sim_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st=STATE.setdefault(u.effective_chat.id, default_state())
-    try:
-        cap = float(c.args[0]) if c.args else 10.0
-    except:
-        cap = 10.0
-    txt = await build_signals(st)
-    hint = f"\n\n💡 *Симулятор*: якщо входити на `{cap} USDT`, PnL за TP ≈ `cap * RR / (1+RR)` у $, ризик до SL ≈ `cap / (1+RR)` (без комісій/фандингу)."
-    for ch in split_long(txt+hint):
-        await u.message.reply_text(ch, parse_mode=ParseMode.MARKDOWN)
+# Профіль-команди (нове)
+async def scalp_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    await _apply_profile_and_scan(u, c, "scalp")
+
+async def default_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    await _apply_profile_and_scan(u, c, "default")
+
+async def swing_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    await _apply_profile_and_scan(u, c, "swing")
 
 # ========= Main =========
 def main():
@@ -493,6 +583,12 @@ def main():
     app.add_handler(CommandHandler("signals", signals_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
 
+    # профілі
+    app.add_handler(CommandHandler("scalp", scalp_cmd))
+    app.add_handler(CommandHandler("default", default_cmd))
+    app.add_handler(CommandHandler("swing", swing_cmd))
+
+    # сеттери (залишились доступні вручну, але не у меню)
     app.add_handler(CommandHandler("set_noise", set_noise_cmd))
     app.add_handler(CommandHandler("set_trend", set_trend_cmd))
     app.add_handler(CommandHandler("set_rr", set_rr_cmd))
@@ -504,14 +600,12 @@ def main():
     app.add_handler(CommandHandler("set_cooldown", set_cooldown_cmd))
 
     app.add_handler(CommandHandler("wl_add", wl_add_cmd))
-    app.add_handler(CommandHandler("wl_clear", wl_clear_cmd))   # <-- виправлено
+    app.add_handler(CommandHandler("wl_clear", wl_clear_cmd))
     app.add_handler(CommandHandler("bl_add", bl_add_cmd))
-    app.add_handler(CommandHandler("bl_clear", bl_clear_cmd))   # <-- виправлено
+    app.add_handler(CommandHandler("bl_clear", bl_clear_cmd))
 
     app.add_handler(CommandHandler("auto_on", auto_on_cmd))
     app.add_handler(CommandHandler("auto_off", auto_off_cmd))
-
-    app.add_handler(CommandHandler("sim", sim_cmd))
 
     app.run_polling()
 
