@@ -1,52 +1,82 @@
 # -*- coding: utf-8 -*-
-# bot_paid.py — Bybit signals only (no autotrade)
+# bot_paid.py — Bybit signals only (no trading), with scheduler & saved settings
 
-import os, math, asyncio, aiohttp, logging
+import os, math, json, asyncio, aiohttp, logging
 from typing import List, Tuple, Dict, Optional
 from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ================== ENV ==================
-TG_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-BYBIT_PUBLIC = "https://api.bybit.com"
-BYBIT_PROXY = os.getenv("BYBIT_PROXY","").strip()  # напр.: http://user:pass@ip:port
+# ========= ENV =========
+TG_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+BYBIT_PUBLIC  = "https://api.bybit.com"
+BYBIT_PROXY   = os.getenv("BYBIT_PROXY","").strip()  # e.g. http://user:pass@ip:port
+STATE_PATH    = os.getenv("STATE_PATH", "state.json")  # де зберігати налаштування
 
-# ================== LOGS ==================
+# ========= LOGS ========
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("signals-bot")
 
-# ================== STATE (пер-чат) ==================
-# за замовч., але кожен чат може змінити через команди
-DEFAULTS = {
+# ========= DEFAULTS / STATE =========
+DEFAULTS: Dict[str, float | int | str | bool] = {
     "top_n": 3,          # 1..3 — скільки монет показувати
-    "strength": 2,       # 2 або 3 — вимогливість тренду
-    "noise": 1.0,        # 0.5..3.0 — фільтр шуму (мін. волатильність у % за 48 свічок)
-    "sl": 3.0,           # стоп-лосс у %
-    "tp": 5.0,           # тейк-профіт у %
-    "lev_mode": "auto",  # 'auto' або 'manual'
+    "strength": 2,       # 2 або 3 — вимогливість тренду (3 — суворіше)
+    "noise": 1.0,        # 0.2..5.0 — мін. волатильність (%) за ~48 свічок (шум-фільтр)
+    "sl": 3.0,           # SL у %
+    "tp": 5.0,           # TP у %
+    "lev_mode": "auto",  # 'auto' або 'manual' (лише рекомендація)
     "lev_base": 3,       # базове плече, якщо manual
     "use_rsi": True,
     "use_macd": True,
     "use_ema": True,
+    # авто-розсилка
+    "auto_on": False,
+    "every": 15,         # хвилин
 }
+
 STATE: Dict[int, Dict[str, float | int | str | bool]] = {}
 
-# ================== UI ==================
+# ========= PERSIST =========
+def load_state() -> None:
+    global STATE
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        # ключі з файлу — рядки; приводимо до int
+        STATE = {int(k): v for k, v in raw.items()}
+        log.info("State loaded: %d chats", len(STATE))
+    except Exception:
+        STATE = {}
+
+def save_state() -> None:
+    try:
+        with open(STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump({str(k): v for k, v in STATE.items()}, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning("State save failed: %s", e)
+
+def get_st(chat_id: int) -> Dict[str, float | int | str | bool]:
+    st = STATE.get(chat_id)
+    if not st:
+        st = DEFAULTS.copy()
+        STATE[chat_id] = st
+        save_state()
+    return st
+
+# ========= UI =========
 def kb(st: Dict[str, float | int | str | bool]) -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            ["/signals", "/status"],
-            [f"/set_strength {st.get('strength',2)}", f"/set_top {st.get('top_n',3)}"],
-            [f"/set_noise {st.get('noise',1.0)}", f"/set_risk {int(st.get('sl',3))} {int(st.get('tp',5))}"],
-            [f"/set_lev {st.get('lev_mode','auto')}", f"/set_lev_base {st.get('lev_base',3)}"],
-            [f\"/set_rsi {'on' if st.get('use_rsi',True) else 'off'}\",
-             f\"/set_macd {'on' if st.get('use_macd',True) else 'off'}\"],
-            [f\"/set_ema {'on' if st.get('use_ema',True) else 'off'}\"]
-        ],
-        resize_keyboard=True
-    )
+    rows = [
+        ["/signals", "/status"],
+        [f"/set_strength {st.get('strength',2)}", f"/set_top {st.get('top_n',3)}"],
+        [f"/set_noise {st.get('noise',1.0)}", f"/set_risk {int(st.get('sl',3))} {int(st.get('tp',5))}"],
+        [f"/set_lev {st.get('lev_mode','auto')}", f"/set_lev_base {st.get('lev_base',3)}"],
+        [f"/set_rsi {'on' if st.get('use_rsi',True) else 'off'}",
+         f"/set_macd {'on' if st.get('use_macd',True) else 'off'}"],
+        [f"/set_ema {'on' if st.get('use_ema',True) else 'off'}"],
+        [f"/auto_on {st.get('every',15)}", "/auto_off"],
+    ]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 def split_long(text: str, n: int = 3500) -> List[str]:
     out = []
@@ -61,7 +91,7 @@ def utc_now() -> str:
 def _proxy_kwargs() -> dict:
     return {"proxy": BYBIT_PROXY} if BYBIT_PROXY.startswith(("http://","https://")) else {}
 
-# ================== Indicators ==================
+# ========= Indicators =========
 def ema(series: List[float], period: int) -> List[float]:
     if not series or period <= 1: return series[:]
     k = 2.0 / (period + 1.0)
@@ -95,7 +125,6 @@ def macd(series: List[float], fast=12, slow=26, signal=9) -> Tuple[List[float], 
     return macd_line[-L:], sig[-L:]
 
 def votes_from_series(series: List[float], st: Dict) -> Dict[str, float | int]:
-    # Повертає сукупне голосування і деталі
     out = {"vote": 0, "rsi": None, "ema_trend": 0, "macd": None, "sig": None}
     if len(series) < 60: return out
 
@@ -126,11 +155,10 @@ def decide_direction(v15:int, v30:int, v60:int, strength:int) -> Optional[str]:
     total = v15 + v30 + v60
     pos = sum(1 for v in [v15, v30, v60] if v > 0)
     neg = sum(1 for v in [v15, v30, v60] if v < 0)
-
     if strength <= 2:
         if total >= 2 and pos >= 2: return "LONG"
         if total <= -2 and neg >= 2: return "SHORT"
-    else:  # strength 3
+    else:
         if total >= 3 and pos >= 2: return "LONG"
         if total <= -3 and neg >= 2: return "SHORT"
     return None
@@ -143,14 +171,13 @@ def calc_vol_pct(series: List[float], px: float) -> float:
     return (math.sqrt(var)/px)*100.0
 
 def suggest_leverage(ch24_abs: float, vol_pct: float, base: int, mode: str) -> int:
-    if mode != "auto": 
+    if mode != "auto":
         return max(1, int(base))
-    # простий безпечний автопідбір
     if vol_pct < 1.5 and ch24_abs < 2: return 5
     if vol_pct < 3.0 and ch24_abs < 5: return 3
     return 2
 
-# ================== HTTP ==================
+# ========= HTTP =========
 async def http_json(session: aiohttp.ClientSession, url: str, params: dict | None = None) -> dict:
     delay = 0.7
     for i in range(5):
@@ -166,7 +193,7 @@ async def http_json(session: aiohttp.ClientSession, url: str, params: dict | Non
             if i == 4: raise
             await asyncio.sleep(delay); delay *= 1.5
 
-async def bybit_top_symbols(session: aiohttp.ClientSession, top:int=30) -> List[dict]:
+async def bybit_top_symbols(session: aiohttp.ClientSession, top:int=40) -> List[dict]:
     data = await http_json(session, f"{BYBIT_PUBLIC}/v5/market/tickers", {"category":"linear"})
     lst = ((data.get("result") or {}).get("list")) or []
     def _vol(x):
@@ -187,9 +214,9 @@ async def bybit_klines(session: aiohttp.ClientSession, symbol: str, interval: st
         except: pass
     return closes
 
-# ================== Core signals ==================
+# ========= Core signals =========
 async def build_signals(chat_id: int) -> str:
-    st = STATE.setdefault(chat_id, DEFAULTS.copy())
+    st = get_st(chat_id)
     top_n    = int(max(1, min(3, st.get("top_n", 3))))
     strength = int(3 if st.get("strength",2) >= 3 else 2)
     noise    = float(max(0.2, min(5.0, st.get("noise",1.0))))
@@ -198,31 +225,30 @@ async def build_signals(chat_id: int) -> str:
 
     async with aiohttp.ClientSession() as s:
         try:
-            tickers = await bybit_top_symbols(s, 40)  # побільше, щоб було з чого обирати
+            tickers = await bybit_top_symbols(s, 40)
         except Exception as e:
             return f"⚠️ Ринок недоступний: {e}"
 
-        scored = []  # (score, sym, dir, px, note, ch_abs, k15)
+        scored = []  # (score, sym, dir, px, note, ch_abs, k15, vol_pct)
         for t in tickers:
             sym = t.get("symbol","")
             try:
                 px = float(t.get("lastPrice") or 0.0)
                 ch24 = float(t.get("price24hPcnt") or 0.0) * 100.0
-            except: 
+            except:
                 continue
             if px <= 0: 
                 continue
 
             try:
-                k15 = await bybit_klines(s, sym, "15", 300); await asyncio.sleep(0.15)
-                k30 = await bybit_klines(s, sym, "30", 300); await asyncio.sleep(0.15)
+                k15 = await bybit_klines(s, sym, "15", 300); await asyncio.sleep(0.12)
+                k30 = await bybit_klines(s, sym, "30", 300); await asyncio.sleep(0.12)
                 k60 = await bybit_klines(s, sym, "60", 300)
             except:
                 continue
             if not (k15 and k30 and k60):
                 continue
 
-            # шум/волатильність
             vol_pct = calc_vol_pct(k15, px)
             if vol_pct < noise:
                 continue
@@ -234,7 +260,6 @@ async def build_signals(chat_id: int) -> str:
             if not direction:
                 continue
 
-            # зважування: довший ТФ важливіший
             score = v15["vote"]*1 + v30["vote"]*1.5 + v60["vote"]*2
             if v60["ema_trend"] == 1 and direction=="LONG": score += 1
             if v60["ema_trend"] == -1 and direction=="SHORT": score += 1
@@ -249,7 +274,7 @@ async def build_signals(chat_id: int) -> str:
 
             note = f"{mark('15m',v15)} | {mark('30m',v30)} | {mark('1h',v60)}"
             scored.append((float(score), sym, direction, px, note, abs(ch24), k15, vol_pct))
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.2)
 
         if not scored:
             return "⚠️ Узгоджених сильних сигналів не знайдено з поточними фільтрами."
@@ -259,12 +284,10 @@ async def build_signals(chat_id: int) -> str:
 
         lines = ["📈 *Сильні сигнали:*\n"]
         for sc, sym, direction, px, note, ch_abs, k15, vol_pct in picks:
-            # SL/TP
             if direction == "LONG":
                 slp = px*(1-sl_pct/100.0); tpp = px*(1+tp_pct/100.0)
             else:
                 slp = px*(1+sl_pct/100.0); tpp = px*(1-tp_pct/100.0)
-            # Плече
             lev = suggest_leverage(ch_abs, vol_pct, int(st.get("lev_base",3)), str(st.get("lev_mode","auto")))
             lines.append(
                 f"• *{sym}*: *{direction}* @ `{px:.6f}`\n"
@@ -274,19 +297,18 @@ async def build_signals(chat_id: int) -> str:
 
         return "\n".join(lines).strip()
 
-# ================== Commands ==================
+# ========= Commands =========
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    chat_id = u.effective_chat.id
-    st = STATE.setdefault(chat_id, DEFAULTS.copy())
+    st = get_st(u.effective_chat.id)
     await u.message.reply_text(
-        "👋 Привіт! Я надсилаю *аналітичні сигнали* Bybit (без автотрейду).\n"
-        "Натисни /signals, щоб отримати найкращі сетапи прямо зараз.\n"
-        "Налаштування — на клавіатурі нижче.",
-        reply_markup=kb(st), parse_mode=ParseMode.MARKDOWN
+        "👋 Привіт! Я надсилаю *аналітичні сигнали* Bybit (без торгів).\n"
+        "Натисни /signals — отримаєш найкращі сетапи зараз.\n"
+        "Можна ввімкнути автопостинг: /auto_on 15",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=kb(st)
     )
 
 async def status_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = STATE.setdefault(u.effective_chat.id, DEFAULTS.copy())
+    st = get_st(u.effective_chat.id)
     text = (
         f"⚙️ *Налаштування*\n"
         f"Монет: *{st['top_n']}* · Сила тренду: *{st['strength']}* · Шум: *{st['noise']:.2f}%*\n"
@@ -295,6 +317,7 @@ async def status_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"RSI: *{'on' if st['use_rsi'] else 'off'}* · "
         f"MACD: *{'on' if st['use_macd'] else 'off'}* · "
         f"EMA: *{'on' if st['use_ema'] else 'off'}*\n"
+        f"Автопостинг: *{'ON' if st['auto_on'] else 'OFF'}* кожні *{st['every']}* хв\n"
         f"UTC: {utc_now()}"
     )
     await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb(st))
@@ -304,94 +327,134 @@ async def signals_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     for ch in split_long(txt):
         await u.message.reply_text(ch, parse_mode=ParseMode.MARKDOWN)
 
-# ------- setters -------
+# setters
 async def set_top_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = STATE.setdefault(u.effective_chat.id, DEFAULTS.copy())
+    st = get_st(u.effective_chat.id)
     try:
         n = int(c.args[0]); assert 1 <= n <= 3
-        st["top_n"] = n
+        st["top_n"] = n; save_state()
         await u.message.reply_text(f"OK. Кількість монет: {n}", reply_markup=kb(st))
     except:
         await u.message.reply_text("Формат: /set_top 1..3")
 
 async def set_strength_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = STATE.setdefault(u.effective_chat.id, DEFAULTS.copy())
+    st = get_st(u.effective_chat.id)
     try:
         s = int(c.args[0]); assert s in (2,3)
-        st["strength"] = s
+        st["strength"] = s; save_state()
         await u.message.reply_text(f"OK. Сила тренду: {s}", reply_markup=kb(st))
     except:
         await u.message.reply_text("Формат: /set_strength 2|3")
 
 async def set_noise_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = STATE.setdefault(u.effective_chat.id, DEFAULTS.copy())
+    st = get_st(u.effective_chat.id)
     try:
         v = float(c.args[0]); assert 0.2 <= v <= 5.0
-        st["noise"] = v
+        st["noise"] = v; save_state()
         await u.message.reply_text(f"OK. Фільтр шуму: {v:.2f}%", reply_markup=kb(st))
     except:
-        await u.message.reply_text("Формат: /set_noise 0.5..3.0 (у %)")
+        await u.message.reply_text("Формат: /set_noise 0.2..5.0 (у %)")
 
 async def set_risk_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = STATE.setdefault(u.effective_chat.id, DEFAULTS.copy())
+    st = get_st(u.effective_chat.id)
     try:
         sl = float(c.args[0]); tp = float(c.args[1]); assert sl >= 0 and tp >= 0
-        st["sl"], st["tp"] = sl, tp
+        st["sl"], st["tp"] = sl, tp; save_state()
         await u.message.reply_text(f"OK. SL={sl:.1f}% · TP={tp:.1f}%", reply_markup=kb(st))
     except:
         await u.message.reply_text("Формат: /set_risk 3 5")
 
 async def set_lev_mode_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = STATE.setdefault(u.effective_chat.id, DEFAULTS.copy())
+    st = get_st(u.effective_chat.id)
     try:
         mode = str(c.args[0]).lower(); assert mode in ("auto","manual")
-        st["lev_mode"] = mode
+        st["lev_mode"] = mode; save_state()
         await u.message.reply_text(f"OK. Режим плеча: {mode}", reply_markup=kb(st))
     except:
         await u.message.reply_text("Формат: /set_lev auto|manual")
 
 async def set_lev_base_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = STATE.setdefault(u.effective_chat.id, DEFAULTS.copy())
+    st = get_st(u.effective_chat.id)
     try:
         base = int(c.args[0]); assert 1 <= base <= 10
-        st["lev_base"] = base
+        st["lev_base"] = base; save_state()
         await u.message.reply_text(f"OK. Базове плече: {base}", reply_markup=kb(st))
     except:
         await u.message.reply_text("Формат: /set_lev_base 1..10")
 
 async def set_rsi_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = STATE.setdefault(u.effective_chat.id, DEFAULTS.copy())
+    st = get_st(u.effective_chat.id)
     try:
         on = str(c.args[0]).lower() in ("on","true","1")
-        st["use_rsi"] = on
+        st["use_rsi"] = on; save_state()
         await u.message.reply_text(f"OK. RSI: {'on' if on else 'off'}", reply_markup=kb(st))
     except:
         await u.message.reply_text("Формат: /set_rsi on|off")
 
 async def set_macd_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = STATE.setdefault(u.effective_chat.id, DEFAULTS.copy())
+    st = get_st(u.effective_chat.id)
     try:
         on = str(c.args[0]).lower() in ("on","true","1")
-        st["use_macd"] = on
+        st["use_macd"] = on; save_state()
         await u.message.reply_text(f"OK. MACD: {'on' if on else 'off'}", reply_markup=kb(st))
     except:
         await u.message.reply_text("Формат: /set_macd on|off")
 
 async def set_ema_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = STATE.setdefault(u.effective_chat.id, DEFAULTS.copy())
+    st = get_st(u.effective_chat.id)
     try:
         on = str(c.args[0]).lower() in ("on","true","1")
-        st["use_ema"] = on
+        st["use_ema"] = on; save_state()
         await u.message.reply_text(f"OK. EMA: {'on' if on else 'off'}", reply_markup=kb(st))
     except:
         await u.message.reply_text("Формат: /set_ema on|off")
 
-# ================== Main ==================
+# ========= Scheduler =========
+async def auto_job(ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = ctx.job.data["chat_id"]
+    try:
+        text = await build_signals(chat_id)
+        for ch in split_long(text):
+            await ctx.bot.send_message(chat_id=chat_id, text=ch, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        log.error("auto_job error: %s", e)
+
+async def auto_on_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st = get_st(u.effective_chat.id)
+    minutes = st.get("every", 15)
+    if c.args:
+        try:
+            minutes = max(5, min(180, int(c.args[0])))
+        except:
+            pass
+    st["every"] = minutes
+    st["auto_on"] = True
+    save_state()
+    name = f"auto_{u.effective_chat.id}"
+    # очистити попередні
+    for j in c.application.job_queue.get_jobs_by_name(name):
+        j.schedule_removal()
+    c.application.job_queue.run_repeating(
+        auto_job, interval=minutes*60, first=5, name=name, data={"chat_id": u.effective_chat.id}
+    )
+    await u.message.reply_text(f"✅ Автопостинг увімкнено: кожні {minutes} хв.", reply_markup=kb(st))
+
+async def auto_off_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st = get_st(u.effective_chat.id)
+    st["auto_on"] = False
+    save_state()
+    name = f"auto_{u.effective_chat.id}"
+    for j in c.application.job_queue.get_jobs_by_name(name):
+        j.schedule_removal()
+    await u.message.reply_text("⏸ Автопостинг вимкнено.", reply_markup=kb(st))
+
+# ========= Main =========
 def main():
     if not TG_TOKEN:
         print("Set TELEGRAM_BOT_TOKEN"); return
+    load_state()
 
-    print("Signals bot running | Bybit public | TF 15/30/60 | top≤3 | no autotrade")
+    print("Signals bot running | TF 15/30/60 | top≤3 | scheduler | no trading")
     app = Application.builder().token(TG_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_cmd))
@@ -407,6 +470,9 @@ def main():
     app.add_handler(CommandHandler("set_rsi", set_rsi_cmd))
     app.add_handler(CommandHandler("set_macd", set_macd_cmd))
     app.add_handler(CommandHandler("set_ema", set_ema_cmd))
+
+    app.add_handler(CommandHandler("auto_on", auto_on_cmd))
+    app.add_handler(CommandHandler("auto_off", auto_off_cmd))
 
     app.run_polling()
 
