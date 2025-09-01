@@ -9,7 +9,6 @@ from telegram import Update, ReplyKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# точність для Decimal
 getcontext().prec = 28
 
 # ============ ENV ============
@@ -170,22 +169,27 @@ async def get_instrument_info(session: aiohttp.ClientSession, symbol: str) -> di
     data = await http_json(session, f"{BYBIT_PUBLIC}/v5/market/instruments-info",
                            {"category":"linear","symbol":symbol})
     lst = ((data.get("result") or {}).get("list")) or []
-    return lst[0] if lst else {}
+    if not lst:
+        return {}
+    info = lst[0]
+    # відсікаємо все, що не торгується
+    if str(info.get("status","")).lower() not in ("trading", "listed"):
+        return {}
+    if not info.get("lotSizeFilter") or not info.get("priceFilter"):
+        return {}
+    return info
 
 def _round_step(value: Decimal, step: Decimal) -> Decimal:
     if step <= 0: return value
-    # кратність вниз
     return (value // step) * step
 
 def _dec(x: float | str) -> Decimal:
     return Decimal(str(x))
 
 def format_by_step(value: float, step: float) -> str:
-    """Повертає рядок зі строго потрібною точністю по qtyStep."""
     dv = _dec(value)
     ds = _dec(step if step > 0 else 1)
     v = _round_step(dv, ds)
-    # скільки знаків у step
     step_str = format(ds, 'f')
     if '.' in step_str:
         places = len(step_str.split('.')[1].rstrip('0'))
@@ -193,7 +197,6 @@ def format_by_step(value: float, step: float) -> str:
         places = 0
     fmt = f"{{0:.{places}f}}"
     out = fmt.format(v)
-    # при нульових places не додаємо крапку
     return out if places > 0 else out.split('.')[0]
 
 def normalize_qty(symbol_info: dict, qty: float) -> str:
@@ -206,7 +209,6 @@ def normalize_qty(symbol_info: dict, qty: float) -> str:
     q = max(qty, 0.0)
     if min_qty > 0 and q < min_qty:
         q = min_qty
-    # формат чітко під крок
     return format_by_step(q, step if step > 0 else 1)
 
 def calc_vol_pct(series: List[float], px: float) -> float:
@@ -230,7 +232,7 @@ def sign_v5(params: Dict[str, str]) -> Dict[str, str]:
     ts = str(int(time.time()*1000))
     params["api_key"] = BYBIT_KEY
     params["timestamp"] = ts
-    params["recv_window"] = "5000"
+    params["recvWindow"] = "5000"  # <— правильний ключ для v5
     qs = "&".join([f"{k}={params[k]}" for k in sorted(params.keys())])
     sig = hmac.new(BYBIT_SEC.encode(), qs.encode(), hashlib.sha256).hexdigest()
     params["sign"] = sig
@@ -279,7 +281,7 @@ async def ensure_leverage(session: aiohttp.ClientSession, symbol: str, lev: int)
     except Exception as e:
         log.warning("set-leverage fail %s: %s", symbol, e)
 
-# ======= MARKET-ордер БЕЗ SL/TP (з фіксами) =======
+# ======= MARKET-ордер БЕЗ SL/TP =======
 async def place_order_market_no_tp_sl(
     session: aiohttp.ClientSession,
     symbol: str,
@@ -291,9 +293,8 @@ async def place_order_market_no_tp_sl(
 ):
     info = await get_instrument_info(session, symbol)
     if not info:
-        raise RuntimeError(f"instrument info not found for {symbol}")
+        raise RuntimeError(f"instrument info not found or not tradable for {symbol}")
 
-    # Перевіримо статус інструмента
     status = (info.get("status") or "").lower()
     if status and status != "trading":
         raise RuntimeError(f"{symbol} status={status}, not tradable")
@@ -302,7 +303,7 @@ async def place_order_market_no_tp_sl(
     raw_qty = size_usdt / max(px, 1e-12)
     qty_str = normalize_qty(info, raw_qty)
 
-    # авто-плече
+    # автоплече
     lev_to_use = LEVERAGE
     if AUTO_LEVERAGE:
         vol_pct = calc_vol_pct(k15_for_vol or [], px)
@@ -310,46 +311,37 @@ async def place_order_market_no_tp_sl(
     await ensure_leverage(session, symbol, lev_to_use)
 
     # позиційний режим
-    if HEDGE_MODE:
-        pos_idx = "1" if side.upper() in ("BUY","LONG") else "2"
-    else:
-        pos_idx = "0"   # One-way
-
     base_params = {
-        "category": "linear",
-        "symbol": symbol,
-        "side": "Buy" if side.upper() in ("BUY","LONG") else "Sell",
+        "category":  "linear",
+        "symbol":    symbol,
+        "side":      "Buy" if side.upper() in ("BUY","LONG") else "Sell",
         "orderType": "Market",
-        "qty": qty_str,
-        "positionIdx": pos_idx,
-        "reduceOnly": "0",
+        "qty":       qty_str,
     }
+    if HEDGE_MODE:
+        base_params["positionIdx"] = "1" if base_params["side"] == "Buy" else "2"
+    # reduceOnly не відправляємо (за замовч. false)
 
-    # Детальний лог фільтрів
-    log.info("ORDER TRY %s | side=%s | qty=%s | posIdx=%s | lev=%s | filters=%s",
-             symbol, base_params["side"], qty_str, pos_idx, lev_to_use,
+    log.info("ORDER TRY %s | side=%s | qty=%s | lev=%s | posIdx=%s | filters=%s",
+             symbol, base_params["side"], qty_str, lev_to_use, base_params.get("positionIdx","-"),
              json.dumps({"lotSizeFilter": info.get("lotSizeFilter"),
                          "priceFilter": info.get("priceFilter"),
                          "leverageFilter": info.get("leverageFilter")}))
 
-    # 1-а спроба без marketUnit
     data = await private_post(session, "/v5/order/create", base_params)
     if str(data.get("retCode")) == "0":
         return data, lev_to_use
 
-    # Якщо 10001 — пробуємо з marketUnit=baseCoin (де потрібно)
     if str(data.get("retCode")) == "10001":
+        # інколи допомагає явний marketUnit
         params2 = base_params.copy()
         params2["marketUnit"] = "baseCoin"
         log.info("RETRY with marketUnit=baseCoin")
         data2 = await private_post(session, "/v5/order/create", params2)
         if str(data2.get("retCode")) == "0":
             return data2, lev_to_use
-
-        # Кинемо детальнішу причину
         raise RuntimeError(f"Bybit error {data2.get('retCode')}: {data2.get('retMsg')} | resp={data2}")
 
-    # Інша помилка
     raise RuntimeError(f"Bybit error {data.get('retCode')}: {data.get('retMsg')} | resp={data}")
 
 # ============ Signals + Trade ============
@@ -365,7 +357,6 @@ async def build_signals_and_trade(chat_id: int) -> str:
         except Exception as e:
             return f"⚠️ Ринок недоступний: {e}"
 
-        # позиції
         open_pos = []
         if TRADE_ENABLED and BYBIT_KEY and BYBIT_SEC:
             try:
@@ -398,7 +389,7 @@ async def build_signals_and_trade(chat_id: int) -> str:
             direction = decide_direction(v15["vote"], v30["vote"], v60["vote"])
             if not direction: continue
 
-            base_sl, base_tp = (sl_pct, tp_pct) if (sl_pct>0 and tp_pct>0) else (1.0, 1.5)  # тільки для повідомлення
+            base_sl, base_tp = (sl_pct, tp_pct) if (sl_pct>0 and tp_pct>0) else (1.0, 1.5)
 
             score = v15["vote"] + v30["vote"] + v60["vote"]
             if v60["ema_trend"] == 1 and direction == "LONG": score += 1
