@@ -34,7 +34,8 @@ def make_kb(st: dict) -> ReplyKeyboardMarkup:
             ["/signals", "/status"],
             [f"/set_top {st.get('top_n', DEF_TOP_N)}", f"/set_strength {st.get('strength_min', DEF_STRENGTH_MIN)}"],
             [f"/set_weights {st['w']['rsi']} {st['w']['macd']} {st['w']['ema']}"],
-            [f\"/set_risk {st['sl']:.0f} {st['tp']:.0f} {st['lev']}\", f\"/set_noise {int(st['min_turn'])} {st['max_vol']:.0f}\"],
+            [f"/set_risk {st['sl']:.0f} {st['tp']:.0f} {st['lev']}", 
+             f"/set_noise {int(st['min_turn'])} {st['max_vol']:.0f}"],
         ],
         resize_keyboard=True
     )
