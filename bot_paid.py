@@ -4,9 +4,13 @@
 import os, hmac, hashlib, time, math, asyncio, aiohttp, logging, json
 from typing import List, Tuple, Dict, Optional
 from datetime import datetime
+from decimal import Decimal, getcontext
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
+
+# точність для Decimal
+getcontext().prec = 28
 
 # ============ ENV ============
 TG_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -24,20 +28,20 @@ DEFAULT_AUTO_MIN = int(os.getenv("DEFAULT_AUTO_MIN", "15"))
 TOP_N            = int(os.getenv("TOP_N", "2"))
 TRADE_ENABLED    = os.getenv("TRADE_ENABLED", "ON").upper() == "ON"
 AUTO_LEVERAGE    = os.getenv("AUTO_LEVERAGE", "ON").upper() == "ON"
-HEDGE_MODE       = os.getenv("HEDGE_MODE", "OFF").upper() == "ON"   # <-- OFF за замовч.
+HEDGE_MODE       = os.getenv("HEDGE_MODE", "OFF").upper() == "ON"   # OFF = One-way
 
 # Логи
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("bot")
 
-# ============ UI (чистий, компактний) ============
+# ============ UI ============
 KB = ReplyKeyboardMarkup(
     [
         ["/signals", "/status"],
         [f"/auto_on {DEFAULT_AUTO_MIN}", "/auto_off"],
         ["/trade_on", "/trade_off"],
         ["/set_size 5", "/set_lev 3"],
-        [f"/set_risk {SL_PCT:.0f} {TP_PCT:.0f}", f"/set_top {TOP_N}"]
+        [f"/set_risk {int(SL_PCT)} {int(TP_PCT)}", f"/set_top {TOP_N}"]
     ],
     resize_keyboard=True
 )
@@ -121,7 +125,7 @@ def decide_direction(v15:int, v30:int, v60:int) -> Optional[str]:
     return None
 
 # ============ HTTP (public) ============
-BYBIT = "https://api.bybit.com"
+BYBIT_PUBLIC = "https://api.bybit.com"
 
 async def http_json(session: aiohttp.ClientSession, url: str, params: dict | None = None) -> dict:
     delay = 0.7
@@ -140,7 +144,7 @@ async def http_json(session: aiohttp.ClientSession, url: str, params: dict | Non
             await asyncio.sleep(delay); delay *= 1.5
 
 async def bybit_top_symbols(session: aiohttp.ClientSession, top:int=15) -> List[dict]:
-    data = await http_json(session, f"{BYBIT}/v5/market/tickers", {"category":"linear"})
+    data = await http_json(session, f"{BYBIT_PUBLIC}/v5/market/tickers", {"category":"linear"})
     lst = ((data.get("result") or {}).get("list")) or []
     def _volume(x):
         try: return float(x.get("turnover24h") or 0)
@@ -149,10 +153,10 @@ async def bybit_top_symbols(session: aiohttp.ClientSession, top:int=15) -> List[
     return [x for x in lst if str(x.get("symbol","")).endswith("USDT")][:top]
 
 async def bybit_klines(session: aiohttp.ClientSession, symbol: str, interval: str, limit: int = 300) -> List[float]:
-    data = await http_json(session, f"{BYBIT}/v5/market/kline", {
+    data = await http_json(session, f"{BYBIT_PUBLIC}/v5/market/kline", {
         "category":"linear","symbol":symbol,"interval":interval,"limit":str(limit)
     })
-    rows = list(reversed(((data.get("result") or {}).get("list")) or []))
+    rows = list(reversed(((data.get("result") or {}).get("list")) or [])))
     closes = []
     for r in rows:
         try: closes.append(float(r[4]))
@@ -161,28 +165,47 @@ async def bybit_klines(session: aiohttp.ClientSession, symbol: str, interval: st
 
 # --- instruments info & qty normalization ---
 async def get_instrument_info(session: aiohttp.ClientSession, symbol: str) -> dict:
-    data = await http_json(session, f"{BYBIT}/v5/market/instruments-info",
+    data = await http_json(session, f"{BYBIT_PUBLIC}/v5/market/instruments-info",
                            {"category":"linear","symbol":symbol})
     lst = ((data.get("result") or {}).get("list")) or []
     return lst[0] if lst else {}
 
-def _round_step(value: float, step: float) -> float:
+def _round_step(value: Decimal, step: Decimal) -> Decimal:
     if step <= 0: return value
-    return math.floor(value / step) * step
+    # кратність вниз
+    return (value // step) * step
 
-def normalize_qty(symbol_info: dict, qty: float) -> float:
+def _dec(x: float | str) -> Decimal:
+    return Decimal(str(x))
+
+def format_by_step(value: float, step: float) -> str:
+    """Повертає рядок зі строго потрібною точністю по qtyStep."""
+    dv = _dec(value)
+    ds = _dec(step if step > 0 else 1)
+    v = _round_step(dv, ds)
+    # скільки знаків у step
+    step_str = format(ds, 'f')
+    if '.' in step_str:
+        places = len(step_str.split('.')[1].rstrip('0'))
+    else:
+        places = 0
+    fmt = f"{{0:.{places}f}}"
+    out = fmt.format(v)
+    # при нульових places не додаємо крапку
+    return out if places > 0 else out.split('.')[0]
+
+def normalize_qty(symbol_info: dict, qty: float) -> str:
     lot = (symbol_info.get("lotSizeFilter") or {})
     try:
         step = float(lot.get("qtyStep") or 0)
         min_qty = float(lot.get("minOrderQty") or 0)
     except:
         step = 0.0; min_qty = 0.0
-    q = qty
-    if step > 0: q = _round_step(q, step)
+    q = max(qty, 0.0)
     if min_qty > 0 and q < min_qty:
-        q = _round_step(min_qty, step) if step > 0 else min_qty
-    q = max(q, 0.0)
-    return float(f"{q:.10f}")
+        q = min_qty
+    # формат чітко під крок
+    return format_by_step(q, step if step > 0 else 1)
 
 def calc_vol_pct(series: List[float], px: float) -> float:
     tail = series[-48:] if len(series) >= 48 else series
@@ -254,7 +277,7 @@ async def ensure_leverage(session: aiohttp.ClientSession, symbol: str, lev: int)
     except Exception as e:
         log.warning("set-leverage fail %s: %s", symbol, e)
 
-# ======= Чистий MARKET-ордер БЕЗ SL/TP =======
+# ======= MARKET-ордер БЕЗ SL/TP (з фіксами) =======
 async def place_order_market_no_tp_sl(
     session: aiohttp.ClientSession,
     symbol: str,
@@ -268,36 +291,64 @@ async def place_order_market_no_tp_sl(
     if not info:
         raise RuntimeError(f"instrument info not found for {symbol}")
 
-    # qty
+    # Перевіримо статус інструмента
+    status = (info.get("status") or "").lower()
+    if status and status != "trading":
+        raise RuntimeError(f"{symbol} status={status}, not tradable")
+
+    # qty з урахуванням qtyStep/minOrderQty
     raw_qty = size_usdt / max(px, 1e-12)
-    qty = normalize_qty(info, raw_qty)
-    if qty <= 0:
-        raise RuntimeError(f"qty too small for {symbol}")
+    qty_str = normalize_qty(info, raw_qty)
 
-    # формат під qtyStep (прибираємо зайві нулі)
-    qty_str = ("%.6f" % qty).rstrip("0").rstrip(".") or "0"
-
-    # автоплече
+    # авто-плече
     lev_to_use = LEVERAGE
     if AUTO_LEVERAGE:
         vol_pct = calc_vol_pct(k15_for_vol or [], px)
         lev_to_use = choose_auto_leverage(info, abs(ch24_abs), vol_pct)
     await ensure_leverage(session, symbol, lev_to_use)
 
-    params = {
+    # позиційний режим
+    if HEDGE_MODE:
+        pos_idx = "1" if side.upper() in ("BUY","LONG") else "2"
+    else:
+        pos_idx = "0"   # One-way
+
+    base_params = {
         "category": "linear",
         "symbol": symbol,
         "side": "Buy" if side.upper() in ("BUY","LONG") else "Sell",
         "orderType": "Market",
-        "qty": qty_str
+        "qty": qty_str,
+        "positionIdx": pos_idx,
+        "reduceOnly": "0",
     }
-    # Не додаємо positionIdx, бо Hedge Mode = OFF
 
-    log.info("ORDER CREATE (no SL/TP): %s", json.dumps(params))
-    data = await private_post(session, "/v5/order/create", params)
-    if str(data.get("retCode")) != "0":
-        raise RuntimeError(f"Bybit error {data.get('retCode')}: {data.get('retMsg')} | resp={data}")
-    return data, lev_to_use
+    # Детальний лог фільтрів
+    log.info("ORDER TRY %s | side=%s | qty=%s | posIdx=%s | lev=%s | filters=%s",
+             symbol, base_params["side"], qty_str, pos_idx, lev_to_use,
+             json.dumps({"lotSizeFilter": info.get("lotSizeFilter"),
+                         "priceFilter": info.get("priceFilter"),
+                         "leverageFilter": info.get("leverageFilter")}))
+
+    # 1-а спроба без marketUnit
+    data = await private_post(session, "/v5/order/create", base_params)
+    if str(data.get("retCode")) == "0":
+        return data, lev_to_use
+
+    # Якщо 10001 — пробуємо з marketUnit=baseCoin (де потрібно)
+    if str(data.get("retCode")) == "10001":
+        params2 = base_params.copy()
+        params2["marketUnit"] = "baseCoin"
+        log.info("RETRY with marketUnit=baseCoin")
+        data2 = await private_post(session, "/v5/order/create", params2)
+        if str(data2.get("retCode")) == "0":
+            return data2, lev_to_use
+
+        # Кинемо детальнішу причину
+        raise RuntimeError(f"Bybit error {data2.get('retCode')}: {data2.get('retMsg')} | resp={data2}")
+
+    # Інша помилка
+    raise RuntimeError(f"Bybit error {data.get('retCode')}: {data.get('retMsg')} | resp={data}")
 
 # ============ Signals + Trade ============
 async def build_signals_and_trade(chat_id: int) -> str:
@@ -305,7 +356,6 @@ async def build_signals_and_trade(chat_id: int) -> str:
     sl_pct = float(st.get("sl", SL_PCT))
     tp_pct = float(st.get("tp", TP_PCT))
     top_n  = int(st.get("top_n", TOP_N))
-    report_lines = []
 
     async with aiohttp.ClientSession() as s:
         try:
@@ -313,6 +363,7 @@ async def build_signals_and_trade(chat_id: int) -> str:
         except Exception as e:
             return f"⚠️ Ринок недоступний: {e}"
 
+        # позиції
         open_pos = []
         if TRADE_ENABLED and BYBIT_KEY and BYBIT_SEC:
             try:
@@ -321,7 +372,6 @@ async def build_signals_and_trade(chat_id: int) -> str:
                 log.warning("get_open_positions fail: %s", e)
 
         scored: List[Tuple[float, str, str, float, str, float, float, float, List[float]]] = []
-        # (score, symbol, direction, px, note, sl, tp, ch24_abs, k15)
 
         for t in tickers:
             sym = t.get("symbol","")
@@ -333,10 +383,8 @@ async def build_signals_and_trade(chat_id: int) -> str:
             if px <= 0: continue
 
             try:
-                k15 = await bybit_klines(s, sym, "15", 300)
-                await asyncio.sleep(0.3)
-                k30 = await bybit_klines(s, sym, "30", 300)
-                await asyncio.sleep(0.3)
+                k15 = await bybit_klines(s, sym, "15", 300); await asyncio.sleep(0.25)
+                k30 = await bybit_klines(s, sym, "30", 300); await asyncio.sleep(0.25)
                 k60 = await bybit_klines(s, sym, "60", 300)
             except:
                 continue
@@ -348,7 +396,7 @@ async def build_signals_and_trade(chat_id: int) -> str:
             direction = decide_direction(v15["vote"], v30["vote"], v60["vote"])
             if not direction: continue
 
-            base_sl, base_tp = (sl_pct, tp_pct) if (sl_pct>0 and tp_pct>0) else (1.0, 1.5)  # просто для повідомлення
+            base_sl, base_tp = (sl_pct, tp_pct) if (sl_pct>0 and tp_pct>0) else (1.0, 1.5)  # тільки для повідомлення
 
             score = v15["vote"] + v30["vote"] + v60["vote"]
             if v60["ema_trend"] == 1 and direction == "LONG": score += 1
@@ -364,7 +412,7 @@ async def build_signals_and_trade(chat_id: int) -> str:
 
             note = f"{mark(v15)} | 30mRSI:{v30.get('rsi') and int(v30['rsi']) or '-'} MACD:{'↑' if (v30.get('macd') and v30.get('sig') and v30['macd']>v30['sig']) else ('↓' if (v30.get('macd') and v30.get('sig') and v30['macd']<v30['sig']) else '·')} EMA:{'↑' if v30['ema_trend']==1 else ('↓' if v30['ema_trend']==-1 else '·')} | 1hRSI:{v60.get('rsi') and int(v60['rsi']) or '-'} MACD:{'↑' if (v60.get('macd') and v60.get('sig') and v60['macd']>v60['sig']) else ('↓' if (v60.get('macd') and v60.get('sig') and v60['macd']<v60['sig']) else '·')} EMA:{'↑' if v60['ema_trend']==1 else ('↓' if v60['ema_trend']==-1 else '·')}"
             scored.append((float(score), sym, direction, px, note, float(base_sl), float(base_tp), abs(ch24), k15))
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.4)
 
         if not scored:
             return "⚠️ Узгоджених сильних сигналів немає."
@@ -372,7 +420,7 @@ async def build_signals_and_trade(chat_id: int) -> str:
         scored.sort(key=lambda x: x[0], reverse=True)
         picks = scored[:max(1, min(2, top_n))]
 
-        # 1) завжди надсилаємо красивий блок «Сильні сигнали»
+        # Блок «Сильні сигнали»
         body = []
         for sc, sym, direction, px, note, bsl, btp, _c, _k in picks:
             if direction == "LONG":
@@ -386,10 +434,9 @@ async def build_signals_and_trade(chat_id: int) -> str:
             )
         signals_text = "📈 *Сильні сигнали:*\n\n" + "\n\n".join(body)
 
-        # 2) якщо дозволено — відкриваємо маркет-ордери БЕЗ SL/TP
+        # Торгуємо маркетом БЕЗ SL/TP
         trade_lines = []
         if TRADE_ENABLED and BYBIT_KEY and BYBIT_SEC:
-            open_pos = open_pos if 'open_pos' in locals() else []
             open_count = sum(1 for p in open_pos if float(p.get("size") or 0) > 0)
             can_open = max(0, MAX_OPEN_POS - open_count)
             opened = 0
@@ -416,9 +463,7 @@ async def build_signals_and_trade(chat_id: int) -> str:
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     chat_id = u.effective_chat.id
     STATE.setdefault(chat_id, {"auto_on": False, "every": DEFAULT_AUTO_MIN, "sl": SL_PCT, "tp": TP_PCT, "top_n": TOP_N})
-    await u.message.reply_text(
-        "👋 Готовий. Основні команди на клавіатурі нижче.", reply_markup=KB
-    )
+    await u.message.reply_text("👋 Готовий. Основні команди на клавіатурі нижче.", reply_markup=KB)
 
 async def signals_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     txt = await build_signals_and_trade(u.effective_chat.id)
