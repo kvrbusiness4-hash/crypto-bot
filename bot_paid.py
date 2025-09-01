@@ -156,7 +156,9 @@ async def bybit_klines(session: aiohttp.ClientSession, symbol: str, interval: st
     data = await http_json(session, f"{BYBIT_PUBLIC}/v5/market/kline", {
         "category":"linear","symbol":symbol,"interval":interval,"limit":str(limit)
     })
-    rows = list(reversed(((data.get("result") or {}).get("list")) or [])))
+    res = data.get("result") or {}
+    rows = res.get("list") or []
+    rows = list(reversed(rows))
     closes = []
     for r in rows:
         try: closes.append(float(r[4]))
