@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# bot_signals.py — Bybit Signals (NO autotrade)
+# bot_py — Bybit Signals (NO autotrade)
 
 import os, math, asyncio, aiohttp, logging
 from typing import List, Dict, Optional, Tuple
