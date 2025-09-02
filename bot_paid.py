@@ -124,8 +124,7 @@ async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "/swing – середньострокові (суворіші)\n"
     )
     for chunk in split_long(help_text, 3500):
-        await u.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
-
+    await u.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 # ========= Indicators =========
 def ema(xs: List[float], p: int) -> List[float]:
     if not xs: return []
