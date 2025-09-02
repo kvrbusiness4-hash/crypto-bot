@@ -127,7 +127,43 @@ def split_long(text: str, n: int = 3500) -> List[str]:
         out.append(text[:n]); text = text[n:]
     out.append(text)
     return out
-
+# --- HELP: /help
+async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    help_text = (
+        "📘 *Довідка по командам*\n\n"
+        "🔎 *Основні*\n"
+        "/start  – запустити бота і показати меню\n"
+        "/status – показати поточні налаштування\n"
+        "/signals – сканувати ринок зараз\n"
+        "/scan_now – ручний одноразовий скан\n\n"
+        "⚙️ *Параметри*\n"
+        "/set_top N        – скільки монет брати у сигнал (напр. /set_top 5)\n"
+        "/set_noise X      – мін. очікуваний рух у % (фільтр шуму) (напр. /set_noise 1.0)\n"
+        "/set_trend 2|3|4  – суворість тренду: 2 (м’яко), 3 (суворо), 4 (дуже суворо)\n"
+        "/set_atr N        – довжина ATR для стопів/тейків (напр. /set_atr 10)\n"
+        "/set_risk SL TP   – стоп/тейк у ATR (напр. /set_risk 1.2 1.8)\n"
+        "/set_rr X         – мінімальне R:R (напр. /set_rr 1.5)\n"
+        "/set_liq N        – мін. добовий обіг у млн USDT (напр. /set_liq 100)\n"
+        "/set_spread N     – макс. спред у bps (напр. /set_spread 8)\n"
+        "/set_24h N        – макс. денний рух у % (напр. /set_24h 25)\n"
+        "/set_cooldown N   – пауза між сигналами по одній монеті, хв (напр. /set_cooldown 60)\n"
+        "/set_session F T  – торговий час у UTC (напр. /set_session 0 23)\n\n"
+        "🤖 *Автопостинг*\n"
+        "/auto_on N – увімкнути автоскан кожні N хв (напр. /auto_on 15)\n"
+        "/auto_off  – вимкнути автоскан\n\n"
+        "📋 *Списки*\n"
+        "/wl_add XXXYYY – додати монету у whitelist\n"
+        "/wl_clear      – очистити whitelist\n"
+        "/bl_add XXXYYY – додати монету у blacklist\n"
+        "/bl_clear      – очистити blacklist\n\n"
+        "🎛 *Профілі*\n"
+        "/scalp    – агресивні (частіші сигнали)\n"
+        "/default  – стандартні (баланс)\n"
+        "/swing    – середньострокові (суворіші)\n"
+        "/aggressive – твій швидкий набір (TOP=5, noise=1.0, ATR=10, RR≥1.5, тощо)\n"
+    )
+    for chunk in split_long(help_text, 3500):
+        await u.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
 # ========= Indicators =========
 def ema(xs: List[float], p: int) -> List[float]:
     if not xs: return []
@@ -606,7 +642,7 @@ def main():
 
     app.add_handler(CommandHandler("auto_on", auto_on_cmd))
     app.add_handler(CommandHandler("auto_off", auto_off_cmd))
-
+    app.add_handler(CommandHandler("help", help_cmd))
     app.run_polling()
 
 if __name__ == "__main__":
