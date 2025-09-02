@@ -521,7 +521,7 @@ def main():
     app.add_handler(CommandHandler("scalp", scalp_cmd))
     app.add_handler(CommandHandler("default", default_cmd))
     app.add_handler(CommandHandler("swing", swing_cmd))
-
+    app.add_handler(CommandHandler("help", help_cmd))
     # сеттери
     app.add_handler(CommandHandler("set_noise", set_noise_cmd))
     app.add_handler(CommandHandler("set_trend", set_trend_cmd))
