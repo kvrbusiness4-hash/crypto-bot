@@ -1,4 +1,4 @@
-     # -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 # Bybit Signals (NO autotrade) — FULL version (2025-09)
 # Features:
 # • ATR-based SL/TP, правильний R:R
@@ -12,6 +12,7 @@ import os
 import asyncio
 import aiohttp
 import logging
+import html
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timezone, time as dtime
 
@@ -50,7 +51,6 @@ PROFILES = {
         "min_turnover": 150.0, "max_spread_bps": 12, "max_24h_change": 20.0,
         "cooldown_min": 360, "every": 30, "trail_k": 1.5, "min_score": 3
     },
-    # Додаткові варіанти — для експериментів
     "scalp_flexible": {
         "top_n": 5, "noise": 0.9, "trend_weight": 2, "atr_len": 10,
         "sl_k": 1.2, "rr_k": 2.4, "min_adx": 15, "vol_mult": 1.0,
@@ -83,10 +83,10 @@ def default_state() -> Dict[str, object]:
         "max_24h_change": 18.0,
         "whitelist": set(),
         "blacklist": set({"TRUMPUSDT","PUMPFUNUSDT","FARTCOINUSDT","IPUSDT","ENAUSDT"}),
-        "noise": 1.6,          # мін. ATR% від ціни (15m)
-        "trend_weight": 3,     # узгодження 15m/30m/1h
+        "noise": 1.6,
+        "trend_weight": 3,
         "min_adx": 18,
-        "vol_mult": 1.2,       # 15m vol > SMA20×vol_mult
+        "vol_mult": 1.2,
 
         # ATR/ризики
         "atr_len": 14, "sl_k": 1.5, "rr_k": 2.2,
@@ -100,7 +100,7 @@ def default_state() -> Dict[str, object]:
         "leverage": 5, "deposit": 1000.0, "risk_pct": 1.0,
 
         # quality gate (етап B)
-        "min_score": 3,  # поріг проходу quality_score
+        "min_score": 3,
 
         # діагностика
         "diag_filters": True,
@@ -133,6 +133,10 @@ def fmt_usd(x: float) -> str:
     sign = "-" if x < 0 else ""
     x = abs(x)
     return f"{sign}${x:,.2f}"
+
+def h(x: object) -> str:
+    """HTML escape helper (без лапок)."""
+    return html.escape(str(x), quote=False)
 
 # =============== HTTP ===============
 async def http_json(session: aiohttp.ClientSession, url: str, params: dict=None) -> dict:
@@ -272,8 +276,7 @@ def quality_score(direction: str,
     if rr >= 2.4: score += 2
     elif rr >= 2.0: score += 1
     else: score -= 1
-
-    # 2) MTF узгодження тренду EMA (30m/1h)
+    # 2) MTF EMA (30m/1h)
     e30_50, e30_200 = ema(c30,50), ema(c30,200 if len(c30)>=200 else max(100,len(c30)//2))
     e60_50, e60_200 = ema(c60,50), ema(c60,200 if len(c60)>=200 else max(100,len(c60)//2))
     def trend(e50, e200):
@@ -286,27 +289,21 @@ def quality_score(direction: str,
     else:
         if t30==-1: score += 1
         if t60==-1: score += 1
-
-    # 3) Відстань до EMA200(30m) у бік тренду — уникати входу прямо в рівень
+    # 3) Дистанція до EMA200(30m)
     if e30_200:
         ema200 = e30_200[-1]
         dist = (px - ema200) if direction=="LONG" else (ema200 - px)
-        # нормуємо на ATR(15m)
-        # простий ATR по 15хв: візьмемо з 30m приблизно
-        atr_norm = max(1e-9, abs(c15[-1] - c15[-2]))  # проксі, щоб не тягнути ще раз ATR
-        if dist > 0.8 * atr_norm: score += 1  # є запас
-        elif dist < 0.3 * atr_norm: score -= 1  # занадто близько
-
-    # 4) ADX посилюється на 1h відносно 30m
+        atr_norm = max(1e-9, abs(c15[-1] - c15[-2]))  # легка проксі
+        if dist > 0.8 * atr_norm: score += 1
+        elif dist < 0.3 * atr_norm: score -= 1
+    # 4) ADX посилюється на 1h
     if adx60 > adx30: score += 1
-
-    # 5) RSI проти входу — штраф
+    # 5) RSI крайнощі — штраф
     r15 = rsi(c15,14)
     if r15:
         last = r15[-1]
         if direction=="LONG" and last > 82: score -= 1
         if direction=="SHORT" and last < 18: score -= 1
-
     return score
 
 # =============== SIGNALS BUILDER ===============
@@ -317,7 +314,6 @@ async def build_signals(st: Dict[str,object]) -> str:
     last_ts: Dict[str,float] = st["_last_sig_ts"]
     now_ts = datetime.utcnow().timestamp()
 
-    # діагностика
     reasons = {
         "tickers": 0, "turnover": 0, "24h_change": 0, "price0": 0,
         "spread": 0, "no_tf_data": 0, "vol": 0, "trend": 0,
@@ -482,18 +478,27 @@ async def build_signals(st: Dict[str,object]) -> str:
             pnl_tp_pct = rr * risk_pct
 
             body.append(
-                f"• *{sym}*: *{direc}* @ `{px:.6f}`\n"
-                f"  SL:`{sl:.6f}` · TP:`{tp:.6f}` · ATR:`{atr_v:.6f}` · RR:`{rr:.2f}` · Q:{q}\n"
-                f"  spread:{sp_bps:.2f}bps · 24hΔ:{ch24:+.2f}% · ATR%≈{noise_pct:.2f}% · ADX30:{adx30:.0f} ADX1h:{adx60:.0f}\n"
-                f"  15m {mark(v15m)} | 30m {mark(v30m)} | 1h {mark(v60m)}\n"
-                f"  Менеджмент: +0.5R → SL=BE; далі трейл {st['trail_k']}×ATR.\n"
-                f"  📏 Позиція (@ ризик {risk_pct:.2f}% від депозиту ${dep:,.0f}): qty≈`{qty:.4f}` (~{fmt_usd(notional)}), "
-                f"маржа≈{fmt_usd(init_margin)} при ×{int(lev)}\n"
-                f"  💰 PnL vs депозит: -1R {pnl_sl_pct:+.2f}% ({fmt_usd(pnl_sl_usd)}) · "
-                f"+0.5R {pnl_05r_pct:+.2f}% ({fmt_usd(pnl_05r_usd)}) · TP {pnl_tp_pct:+.2f}% ({fmt_usd(pnl_tp_usd)})"
+                "• <b>{sym}</b>: <b>{direc}</b> @ <code>{px:.6f}</code>\n"
+                "  SL:<code>{sl:.6f}</code> · TP:<code>{tp:.6f}</code> · ATR:<code>{atr_v:.6f}</code> · RR:<code>{rr:.2f}</code> · Q:{q}\n"
+                "  spread:{sp_bps:.2f}bps · 24hΔ:{ch24:+.2f}% · ATR%≈{noise_pct:.2f}% · ADX30:{adx30:.0f} ADX1h:{adx60:.0f}\n"
+                "  15m {m15} | 30m {m30} | 1h {m60}\n"
+                "  Менеджмент: +0.5R → SL=BE; далі трейл {trail}×ATR.\n"
+                "  📏 Позиція (@ ризик {risk_pct:.2f}% від депозиту ${dep:,.0f}): qty≈<code>{qty:.4f}</code> (~{notional}), "
+                "маржа≈{margin} при ×{lev}\n"
+                "  💰 PnL vs депозит: -1R {p_sl:+.2f}% ({usd_sl}) · +0.5R {p_05:+.2f}% ({usd_05}) · TP {p_tp:+.2f}% ({usd_tp})"
+                .format(
+                    sym=h(sym), direc=h(direc), px=px, sl=sl, tp=tp, atr_v=atr_v, rr=rr, q=q,
+                    sp_bps=sp_bps, ch24=ch24, noise_pct=noise_pct, adx30=adx30, adx60=adx60,
+                    m15=mark(v15m), m30=mark(v30m), m60=mark(v60m),
+                    trail=st['trail_k'], risk_pct=risk_pct, dep=dep,
+                    qty=qty, notional=fmt_usd(notional), margin=fmt_usd(init_margin), lev=int(lev),
+                    p_sl=pnl_sl_pct, usd_sl=fmt_usd(pnl_sl_usd),
+                    p_05=pnl_05r_pct, usd_05=fmt_usd(pnl_05r_usd),
+                    p_tp=pnl_tp_pct, usd_tp=fmt_usd(pnl_tp_usd)
+                )
             )
 
-        return "📈 *Сильні сигнали:*\n\n" + "\n\n".join(body) + f"\n\nUTC: {utc_now_str()}"
+        return "📈 <b>Сильні сигнали:</b>\n\n" + "\n\n".join(body) + f"\n\nUTC: {utc_now_str()}"
 
 # =============== AUTO HELPERS ===============
 async def _start_autoposting(chat_id: int, app, st: Dict[str, object], minutes: int):
@@ -506,7 +511,7 @@ async def _scan_now_and_send(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     st = STATE.setdefault(chat_id, default_state())
     txt = await build_signals(st)
     for ch in split_long(txt):
-        await context.bot.send_message(chat_id=chat_id, text=ch, parse_mode=ParseMode.MARKDOWN)
+        await context.bot.send_message(chat_id=chat_id, text=ch, parse_mode=ParseMode.HTML)
 
 async def _apply_profile_and_scan(u: Update, c: ContextTypes.DEFAULT_TYPE, key: str):
     st = STATE.setdefault(u.effective_chat.id, default_state())
@@ -521,8 +526,8 @@ async def _apply_profile_and_scan(u: Update, c: ContextTypes.DEFAULT_TYPE, key: 
     })
     await _start_autoposting(u.effective_chat.id, c.application, st, p["every"])
     await u.message.reply_text(
-        f"✅ Профіль *{key}* застосовано. Автоскан кожні {p['every']} хв.",
-        parse_mode=ParseMode.MARKDOWN, reply_markup=_kb(st)
+        f"✅ Профіль <b>{h(key)}</b> застосовано. Автоскан кожні {p['every']} хв.",
+        parse_mode=ParseMode.HTML, reply_markup=_kb(st)
     )
     await _scan_now_and_send(u.effective_chat.id, c)
 
@@ -541,8 +546,8 @@ async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     await u.message.reply_text(
-        "👋 Готово. Бот видає *сигнали без автотрейду*. Обери режим нижче.",
-        parse_mode=ParseMode.MARKDOWN, reply_markup=_kb({})
+        "👋 Готово. Бот видає <b>сигнали без автотрейду</b>. Обери режим нижче.",
+        parse_mode=ParseMode.HTML, reply_markup=_kb({})
     )
 
 async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -724,7 +729,7 @@ async def auto_job(ctx: ContextTypes.DEFAULT_TYPE):
     try:
         txt = await build_signals(st)
         for ch in split_long(txt):
-            await ctx.bot.send_message(chat_id=chat_id, text=ch, parse_mode=ParseMode.MARKDOWN)
+            await ctx.bot.send_message(chat_id=chat_id, text=ch, parse_mode=ParseMode.HTML)
     except Exception as e:
         log.error("auto job err: %s", e)
 
