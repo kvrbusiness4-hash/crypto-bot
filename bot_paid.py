@@ -1,18 +1,20 @@
 # -*- coding: utf-8 -*-
 # Bybit Signals (NO autotrade) — FULL version (2025-09)
 # Features:
-# • ATR-based SL/TP, правильний R:R
+# • ATR-based SL/TP, коректний R:R
 # • ADX & Volume фільтри, MTF-узгодження (15m/30m/1h)
 # • Дворівневий відбір: базові фільтри → quality_score()
-# • Діагностика відсіву (/diag)
+# • Діагностика відсіву (/diag) з HTML-safe екрануванням
 # • /set_lev /set_deposit /set_riskpct, позиція (qty/notional/margin), PnL
 # • Менеджмент (інформативно): +0.5R → SL=BE; далі трейл X×ATR
+# • Логування кожного сигналу у CSV (SIGLOG_PATH або signals_log.csv)
 
 import os
+import csv
+import html
 import asyncio
 import aiohttp
 import logging
-import html
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timezone, time as dtime
 
@@ -26,6 +28,7 @@ BYBIT_PROXY = os.getenv("BYBIT_PROXY", "").strip()  # http://user:pass@host:port
 
 DEFAULT_AUTO_MIN = int(os.getenv("DEFAULT_AUTO_MIN", "15"))
 TOP_N = int(os.getenv("TOP_N", "3"))
+LOG_PATH = os.getenv("SIGLOG_PATH", "signals_log.csv")
 
 # =============== LOGS ===============
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -33,7 +36,15 @@ log = logging.getLogger("signals")
 
 # =============== PROFILES ===============
 PROFILES = {
+    "aggressive": {
+        # м’якші фільтри → більше сигналів
+        "top_n": 6, "noise": 0.9, "trend_weight": 2, "atr_len": 10,
+        "sl_k": 1.2, "rr_k": 2.4, "min_adx": 15, "vol_mult": 1.0,
+        "min_turnover": 70.0, "max_spread_bps": 12, "max_24h_change": 35.0,
+        "cooldown_min": 30, "every": 15, "trail_k": 1.0, "min_score": 2
+    },
     "scalp": {
+        # баланс частота/якість (був твоїм базовим)
         "top_n": 5, "noise": 1.0, "trend_weight": 3, "atr_len": 10,
         "sl_k": 1.2, "rr_k": 2.6, "min_adx": 20, "vol_mult": 1.0,
         "min_turnover": 100.0, "max_spread_bps": 8, "max_24h_change": 25.0,
@@ -51,24 +62,23 @@ PROFILES = {
         "min_turnover": 150.0, "max_spread_bps": 12, "max_24h_change": 20.0,
         "cooldown_min": 360, "every": 30, "trail_k": 1.5, "min_score": 3
     },
-    "scalp_flexible": {
-        "top_n": 5, "noise": 0.9, "trend_weight": 2, "atr_len": 10,
-        "sl_k": 1.2, "rr_k": 2.4, "min_adx": 15, "vol_mult": 1.0,
-        "min_turnover": 70.0, "max_spread_bps": 12, "max_24h_change": 35.0,
-        "cooldown_min": 30, "every": 15, "trail_k": 1.0, "min_score": 3
-    },
-    "scalp_strict": {
-        "top_n": 3, "noise": 1.2, "trend_weight": 3, "atr_len": 12,
-        "sl_k": 1.5, "rr_k": 2.6, "min_adx": 20, "vol_mult": 1.1,
-        "min_turnover": 120.0, "max_spread_bps": 10, "max_24h_change": 25.0,
-        "cooldown_min": 60, "every": 15, "trail_k": 1.0, "min_score": 4
+    "safe": {
+        # суворіші фільтри → менше, але «чистіше»
+        "top_n": 3, "noise": 1.3, "trend_weight": 4, "atr_len": 16,
+        "sl_k": 1.4, "rr_k": 2.8, "min_adx": 22, "vol_mult": 1.2,
+        "min_turnover": 200.0, "max_spread_bps": 6, "max_24h_change": 15.0,
+        "cooldown_min": 180, "every": 20, "trail_k": 1.2, "min_score": 4
     },
 }
 
 # =============== UI ===============
 def _kb(_: Dict[str, object]) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [["/scalp", "/default", "/swing"], ["/signals", "/status", "/help"]],
+        [
+            ["/aggressive", "/scalp", "/default"],
+            ["/swing", "/safe", "/help"],
+            ["/signals", "/status"]
+        ],
         resize_keyboard=True
     )
 
@@ -83,10 +93,10 @@ def default_state() -> Dict[str, object]:
         "max_24h_change": 18.0,
         "whitelist": set(),
         "blacklist": set({"TRUMPUSDT","PUMPFUNUSDT","FARTCOINUSDT","IPUSDT","ENAUSDT"}),
-        "noise": 1.6,
-        "trend_weight": 3,
+        "noise": 1.6,          # мін. ATR% від ціни (15m)
+        "trend_weight": 3,     # узгодження 15m/30m/1h
         "min_adx": 18,
-        "vol_mult": 1.2,
+        "vol_mult": 1.2,       # 15m vol > SMA20×vol_mult
 
         # ATR/ризики
         "atr_len": 14, "sl_k": 1.5, "rr_k": 2.2,
@@ -100,10 +110,13 @@ def default_state() -> Dict[str, object]:
         "leverage": 5, "deposit": 1000.0, "risk_pct": 1.0,
 
         # quality gate (етап B)
-        "min_score": 3,
+        "min_score": 3,  # поріг проходу quality_score
 
         # діагностика
         "diag_filters": True,
+
+        # активний профіль (для логів)
+        "active_profile": "",
     }
 
 # =============== HELPERS ===============
@@ -134,9 +147,19 @@ def fmt_usd(x: float) -> str:
     x = abs(x)
     return f"{sign}${x:,.2f}"
 
-def h(x: object) -> str:
-    """HTML escape helper (без лапок)."""
-    return html.escape(str(x), quote=False)
+# =============== CSV LOGGING ===============
+def log_signal_row(row: dict):
+    try:
+        new_file = not os.path.exists(LOG_PATH)
+        with open(LOG_PATH, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=[
+                "utc","profile","symbol","dir","px","sl","tp","rr","q","atrpct","adx30","adx60","spread_bps","ch24"
+            ])
+            if new_file:
+                w.writeheader()
+            w.writerow(row)
+    except Exception as e:
+        log.error("log_signal_row error: %s", e)
 
 # =============== HTTP ===============
 async def http_json(session: aiohttp.ClientSession, url: str, params: dict=None) -> dict:
@@ -276,7 +299,8 @@ def quality_score(direction: str,
     if rr >= 2.4: score += 2
     elif rr >= 2.0: score += 1
     else: score -= 1
-    # 2) MTF EMA (30m/1h)
+
+    # 2) MTF узгодження тренду EMA (30m/1h)
     e30_50, e30_200 = ema(c30,50), ema(c30,200 if len(c30)>=200 else max(100,len(c30)//2))
     e60_50, e60_200 = ema(c60,50), ema(c60,200 if len(c60)>=200 else max(100,len(c60)//2))
     def trend(e50, e200):
@@ -289,21 +313,25 @@ def quality_score(direction: str,
     else:
         if t30==-1: score += 1
         if t60==-1: score += 1
-    # 3) Дистанція до EMA200(30m)
+
+    # 3) Відстань до EMA200(30m) у бік тренду — уникати входу прямо в рівень
     if e30_200:
         ema200 = e30_200[-1]
         dist = (px - ema200) if direction=="LONG" else (ema200 - px)
-        atr_norm = max(1e-9, abs(c15[-1] - c15[-2]))  # легка проксі
+        atr_norm = max(1e-9, abs(c15[-1] - c15[-2]))  # проксі ATR для нормалізації
         if dist > 0.8 * atr_norm: score += 1
         elif dist < 0.3 * atr_norm: score -= 1
-    # 4) ADX посилюється на 1h
+
+    # 4) ADX посилюється на 1h відносно 30m
     if adx60 > adx30: score += 1
-    # 5) RSI крайнощі — штраф
+
+    # 5) RSI проти входу — штраф
     r15 = rsi(c15,14)
     if r15:
         last = r15[-1]
         if direction=="LONG" and last > 82: score -= 1
         if direction=="SHORT" and last < 18: score -= 1
+
     return score
 
 # =============== SIGNALS BUILDER ===============
@@ -314,6 +342,7 @@ async def build_signals(st: Dict[str,object]) -> str:
     last_ts: Dict[str,float] = st["_last_sig_ts"]
     now_ts = datetime.utcnow().timestamp()
 
+    # діагностика
     reasons = {
         "tickers": 0, "turnover": 0, "24h_change": 0, "price0": 0,
         "spread": 0, "no_tf_data": 0, "vol": 0, "trend": 0,
@@ -441,7 +470,7 @@ async def build_signals(st: Dict[str,object]) -> str:
                 f"• cooldown: {reasons['cooldown']}",
                 f"• quality_score < {st['min_score']}: {reasons['qscore']}",
             ]
-            # ⬇️ ВАЖЛИВО: екрануємо, бо parse_mode=HTML
+            # HTML-safe / Markdown-safe (у нас далі parse_mode=MARKDOWN)
             return html.escape("\n".join(msg), quote=False)
 
         # топ-рейтинги
@@ -479,27 +508,39 @@ async def build_signals(st: Dict[str,object]) -> str:
             pnl_tp_pct = rr * risk_pct
 
             body.append(
-                "• <b>{sym}</b>: <b>{direc}</b> @ <code>{px:.6f}</code>\n"
-                "  SL:<code>{sl:.6f}</code> · TP:<code>{tp:.6f}</code> · ATR:<code>{atr_v:.6f}</code> · RR:<code>{rr:.2f}</code> · Q:{q}\n"
-                "  spread:{sp_bps:.2f}bps · 24hΔ:{ch24:+.2f}% · ATR%≈{noise_pct:.2f}% · ADX30:{adx30:.0f} ADX1h:{adx60:.0f}\n"
-                "  15m {m15} | 30m {m30} | 1h {m60}\n"
-                "  Менеджмент: +0.5R → SL=BE; далі трейл {trail}×ATR.\n"
-                "  📏 Позиція (@ ризик {risk_pct:.2f}% від депозиту ${dep:,.0f}): qty≈<code>{qty:.4f}</code> (~{notional}), "
-                "маржа≈{margin} при ×{lev}\n"
-                "  💰 PnL vs депозит: -1R {p_sl:+.2f}% ({usd_sl}) · +0.5R {p_05:+.2f}% ({usd_05}) · TP {p_tp:+.2f}% ({usd_tp})"
-                .format(
-                    sym=h(sym), direc=h(direc), px=px, sl=sl, tp=tp, atr_v=atr_v, rr=rr, q=q,
-                    sp_bps=sp_bps, ch24=ch24, noise_pct=noise_pct, adx30=adx30, adx60=adx60,
-                    m15=mark(v15m), m30=mark(v30m), m60=mark(v60m),
-                    trail=st['trail_k'], risk_pct=risk_pct, dep=dep,
-                    qty=qty, notional=fmt_usd(notional), margin=fmt_usd(init_margin), lev=int(lev),
-                    p_sl=pnl_sl_pct, usd_sl=fmt_usd(pnl_sl_usd),
-                    p_05=pnl_05r_pct, usd_05=fmt_usd(pnl_05r_usd),
-                    p_tp=pnl_tp_pct, usd_tp=fmt_usd(pnl_tp_usd)
-                )
+                f"• *{sym}*: *{direc}* @ `{px:.6f}`\n"
+                f"  SL:`{sl:.6f}` · TP:`{tp:.6f}` · ATR:`{atr_v:.6f}` · RR:`{rr:.2f}` · Q:{q}\n"
+                f"  spread:{sp_bps:.2f}bps · 24hΔ:{ch24:+.2f}% · ATR%≈{noise_pct:.2f}% · ADX30:{adx30:.0f} ADX1h:{adx60:.0f}\n"
+                f"  15m {mark(v15m)} | 30m {mark(v30m)} | 1h {mark(v60m)}\n"
+                f"  Менеджмент: +0.5R → SL=BE; далі трейл {st['trail_k']}×ATR.\n"
+                f"  📏 Позиція (@ ризик {risk_pct:.2f}% від депозиту ${dep:,.0f}): qty≈`{qty:.4f}` (~{fmt_usd(notional)}), "
+                f"маржа≈{fmt_usd(init_margin)} при ×{int(lev)}\n"
+                f"  💰 PnL vs депозит: -1R {pnl_sl_pct:+.2f}% ({fmt_usd(pnl_sl_usd)}) · "
+                f"+0.5R {pnl_05r_pct:+.2f}% ({fmt_usd(pnl_05r_usd)}) · TP {pnl_tp_pct:+.2f}% ({fmt_usd(pnl_tp_usd)})"
             )
 
-        return "📈 <b>Сильні сигнали:</b>\n\n" + "\n\n".join(body) + f"\n\nUTC: {utc_now_str()}"
+            # === CSV LOG ===
+            try:
+                log_signal_row({
+                    "utc": utc_now_str(),
+                    "profile": st.get("active_profile",""),
+                    "symbol": sym,
+                    "dir": direc,
+                    "px": f"{px:.6f}",
+                    "sl": f"{sl:.6f}",
+                    "tp": f"{tp:.6f}",
+                    "rr": f"{rr:.2f}",
+                    "q": q,
+                    "atrpct": f"{noise_pct:.2f}",
+                    "adx30": f"{adx30:.1f}",
+                    "adx60": f"{adx60:.1f}",
+                    "spread_bps": f"{sp_bps:.2f}",
+                    "ch24": f"{ch24:.2f}",
+                })
+            except Exception as e:
+                log.error("CSV log error: %s", e)
+
+        return "📈 *Сильні сигнали:*\n\n" + "\n\n".join(body) + f"\n\nUTC: {utc_now_str()}"
 
 # =============== AUTO HELPERS ===============
 async def _start_autoposting(chat_id: int, app, st: Dict[str, object], minutes: int):
@@ -512,7 +553,7 @@ async def _scan_now_and_send(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     st = STATE.setdefault(chat_id, default_state())
     txt = await build_signals(st)
     for ch in split_long(txt):
-        await context.bot.send_message(chat_id=chat_id, text=ch, parse_mode=ParseMode.HTML)
+        await context.bot.send_message(chat_id=chat_id, text=ch, parse_mode=ParseMode.MARKDOWN)
 
 async def _apply_profile_and_scan(u: Update, c: ContextTypes.DEFAULT_TYPE, key: str):
     st = STATE.setdefault(u.effective_chat.id, default_state())
@@ -525,10 +566,11 @@ async def _apply_profile_and_scan(u: Update, c: ContextTypes.DEFAULT_TYPE, key: 
         "min_adx": p["min_adx"], "vol_mult": p["vol_mult"], "trail_k": p["trail_k"],
         "min_score": p["min_score"],
     })
+    st["active_profile"] = key
     await _start_autoposting(u.effective_chat.id, c.application, st, p["every"])
     await u.message.reply_text(
-        f"✅ Профіль <b>{h(key)}</b> застосовано. Автоскан кожні {p['every']} хв.",
-        parse_mode=ParseMode.HTML, reply_markup=_kb(st)
+        f"✅ Профіль *{key}* застосовано. Автоскан кожні {p['every']} хв.",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=_kb(st)
     )
     await _scan_now_and_send(u.effective_chat.id, c)
 
@@ -538,17 +580,19 @@ async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     try:
         await c.bot.set_my_commands([
             BotCommand("help", "Довідка по командам"),
-            BotCommand("scalp", "Агресивний режим (скальпінг)"),
-            BotCommand("default", "Стандартний режим"),
-            BotCommand("swing", "Середньостроковий режим"),
+            BotCommand("aggressive", "Агресивний (м’які фільтри)"),
+            BotCommand("scalp", "Скальпінг"),
+            BotCommand("default", "Стандартний"),
+            BotCommand("swing", "Свінг"),
+            BotCommand("safe", "Безпечний (суворі фільтри)"),
             BotCommand("signals", "Сканувати зараз"),
             BotCommand("status", "Поточні налаштування"),
         ])
     except Exception:
         pass
     await u.message.reply_text(
-        "👋 Готово. Бот видає <b>сигнали без автотрейду</b>. Обери режим нижче.",
-        parse_mode=ParseMode.HTML, reply_markup=_kb({})
+        "👋 Готово. Бот видає *сигнали без автотрейду*. Обери режим нижче.",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=_kb({})
     )
 
 async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -577,7 +621,7 @@ async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "/set_riskpct % — ризик на угоду (0.1..5)\n"
         "/set_minscore N — поріг якості (2..6)\n"
         "/diag — увімк/вимк детальний звіт фільтрів\n\n"
-        "🎛 Профілі: /scalp /default /swing (ще: /scalp_flexible /scalp_strict)\n"
+        "🎛 Профілі: /aggressive /scalp /default /swing /safe\n"
         "🧭 Менеджмент: +0.5R → SL=BE; далі трейл X×ATR."
     )
     for ch in split_long(help_text, 3500):
@@ -593,7 +637,8 @@ async def status_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"turnover≥{st['min_turnover']}M · spread≤{st['max_spread_bps']}bps · 24hΔ≤{st['max_24h_change']}%\n"
         f"session UTC {st['sess_from']:02.0f}-{st['sess_to']:02.0f} · cooldown={st['cooldown_min']}м\n"
         f"leverage=×{st['leverage']} · deposit=${st['deposit']:.2f} · risk={st['risk_pct']:.2f}%\n"
-        f"diag={'ON' if st.get('diag_filters', True) else 'OFF'} · whitelist: {', '.join(sorted(st['whitelist'])) or '—'}\n"
+        f"profile: {st.get('active_profile','')} · diag={'ON' if st.get('diag_filters', True) else 'OFF'}\n"
+        f"whitelist: {', '.join(sorted(st['whitelist'])) or '—'}\n"
         f"blacklist: {', '.join(sorted(st['blacklist'])) or '—'}\n"
         f"UTC: {utc_now_str()}"
     )
@@ -639,7 +684,7 @@ async def set_rrk_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
 async def set_adx_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     st=STATE.setdefault(u.effective_chat.id, default_state())
     try: v=int(c.args[0]); assert 5<=v<=50; st["min_adx"]=v; await _setter(u, True, f"OK. Мін. ADX = {v}.", "")
-    except: await _setter(u, False, "", "Формат: /set_adx 15")
+    except: await _setter(u, False, "", "Формат: /set_adx 20")
 
 async def set_vol_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     st=STATE.setdefault(u.effective_chat.id, default_state())
@@ -649,17 +694,17 @@ async def set_vol_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
 async def set_liq_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     st=STATE.setdefault(u.effective_chat.id, default_state())
     try: v=float(c.args[0]); assert 20<=v<=2000; st["min_turnover"]=v; await _setter(u, True, f"OK. Мін. обіг 24h = {v:.0f}M.", "")
-    except: await _setter(u, False, "", "Формат: /set_liq 70")
+    except: await _setter(u, False, "", "Формат: /set_liq 150")
 
 async def set_spread_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     st=STATE.setdefault(u.effective_chat.id, default_state())
     try: v=int(c.args[0]); assert 1<=v<=50; st["max_spread_bps"]=v; await _setter(u, True, f"OK. Макс. спред = {v} bps.", "")
-    except: await _setter(u, False, "", "Формат: /set_spread 12")
+    except: await _setter(u, False, "", "Формат: /set_spread 8")
 
 async def set_24h_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     st=STATE.setdefault(u.effective_chat.id, default_state())
     try: v=float(c.args[0]); assert 5<=v<=80; st["max_24h_change"]=v; await _setter(u, True, f"OK. 24hΔ ≤ {v:.1f}%.", "")
-    except: await _setter(u, False, "", "Формат: /set_24h 35")
+    except: await _setter(u, False, "", "Формат: /set_24h 25")
 
 async def set_session_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     st=STATE.setdefault(u.effective_chat.id, default_state())
@@ -671,7 +716,7 @@ async def set_session_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
 async def set_cooldown_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     st=STATE.setdefault(u.effective_chat.id, default_state())
     try: v=int(c.args[0]); assert 10<=v<=1440; st["cooldown_min"]=v; await _setter(u, True, f"OK. Кулдаун: {v} хв.", "")
-    except: await _setter(u, False, "", "Формат: /set_cooldown 30")
+    except: await _setter(u, False, "", "Формат: /set_cooldown 60")
 
 async def set_lev_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     st=STATE.setdefault(u.effective_chat.id, default_state())
@@ -730,7 +775,7 @@ async def auto_job(ctx: ContextTypes.DEFAULT_TYPE):
     try:
         txt = await build_signals(st)
         for ch in split_long(txt):
-            await ctx.bot.send_message(chat_id=chat_id, text=ch, parse_mode=ParseMode.HTML)
+            await ctx.bot.send_message(chat_id=chat_id, text=ch, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         log.error("auto job err: %s", e)
 
@@ -751,11 +796,11 @@ async def auto_off_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text("⏸ Автопостинг OFF.", reply_markup=_kb(st))
 
 # профілі
-async def scalp_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):        await _apply_profile_and_scan(u, c, "scalp")
-async def default_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):      await _apply_profile_and_scan(u, c, "default")
-async def swing_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):        await _apply_profile_and_scan(u, c, "swing")
-async def scalp_flex_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):   await _apply_profile_and_scan(u, c, "scalp_flexible")
-async def scalp_strict_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE): await _apply_profile_and_scan(u, c, "scalp_strict")
+async def aggressive_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):  await _apply_profile_and_scan(u, c, "aggressive")
+async def scalp_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):       await _apply_profile_and_scan(u, c, "scalp")
+async def default_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):     await _apply_profile_and_scan(u, c, "default")
+async def swing_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):       await _apply_profile_and_scan(u, c, "swing")
+async def safe_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):        await _apply_profile_and_scan(u, c, "safe")
 
 # =============== MAIN ===============
 def main():
@@ -769,11 +814,11 @@ def main():
     app.add_handler(CommandHandler("status", status_cmd))
 
     # профілі
+    app.add_handler(CommandHandler("aggressive", aggressive_cmd))
     app.add_handler(CommandHandler("scalp", scalp_cmd))
     app.add_handler(CommandHandler("default", default_cmd))
     app.add_handler(CommandHandler("swing", swing_cmd))
-    app.add_handler(CommandHandler("scalp_flexible", scalp_flex_cmd))
-    app.add_handler(CommandHandler("scalp_strict", scalp_strict_cmd))
+    app.add_handler(CommandHandler("safe", safe_cmd))
 
     # сеттери
     app.add_handler(CommandHandler("set_top", set_top_cmd))
