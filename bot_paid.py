@@ -1,5 +1,13 @@
 # -*- coding: utf-8 -*-
 # Bybit Signals (NO autotrade) — FULL version (2025-09)
+# Features:
+# • ATR-based SL/TP, коректний R:R
+# • ADX & Volume фільтри, MTF-узгодження (15m/30m/1h)
+# • Дворівневий відбір: базові фільтри → quality_score()
+# • Діагностика відсіву (/diag) з HTML-safe екрануванням
+# • /set_lev /set_deposit /set_riskpct /set_riskusd, позиція (qty/notional/margin), PnL
+# • Менеджмент (інформативно): +0.5R → SL=BE; далі трейл X×ATR
+# • Логування кожного сигналу у CSV (SIGLOG_PATH або signals_log.csv)
 
 import os
 import csv
@@ -29,12 +37,14 @@ log = logging.getLogger("signals")
 # =============== PROFILES ===============
 PROFILES = {
     "aggressive": {
+        # м’якші фільтри → більше сигналів
         "top_n": 6, "noise": 0.9, "trend_weight": 2, "atr_len": 10,
         "sl_k": 1.2, "rr_k": 2.4, "min_adx": 15, "vol_mult": 1.0,
         "min_turnover": 70.0, "max_spread_bps": 12, "max_24h_change": 35.0,
         "cooldown_min": 30, "every": 15, "trail_k": 1.0, "min_score": 2
     },
     "scalp": {
+        # баланс частота/якість
         "top_n": 5, "noise": 1.0, "trend_weight": 3, "atr_len": 10,
         "sl_k": 1.2, "rr_k": 2.6, "min_adx": 20, "vol_mult": 1.0,
         "min_turnover": 100.0, "max_spread_bps": 8, "max_24h_change": 25.0,
@@ -53,6 +63,7 @@ PROFILES = {
         "cooldown_min": 360, "every": 30, "trail_k": 1.5, "min_score": 3
     },
     "safe": {
+        # суворіші фільтри → менше, але «чистіше»
         "top_n": 3, "noise": 1.3, "trend_weight": 4, "atr_len": 16,
         "sl_k": 1.4, "rr_k": 2.8, "min_adx": 22, "vol_mult": 1.2,
         "min_turnover": 200.0, "max_spread_bps": 6, "max_24h_change": 15.0,
@@ -82,10 +93,10 @@ def default_state() -> Dict[str, object]:
         "max_24h_change": 18.0,
         "whitelist": set(),
         "blacklist": set({"TRUMPUSDT","PUMPFUNUSDT","FARTCOINUSDT","IPUSDT","ENAUSDT"}),
-        "noise": 1.6,
-        "trend_weight": 3,
+        "noise": 1.6,          # мін. ATR% від ціни (15m)
+        "trend_weight": 3,     # узгодження 15m/30m/1h
         "min_adx": 18,
-        "vol_mult": 1.2,
+        "vol_mult": 1.2,       # 15m vol > SMA20×vol_mult
 
         # ATR/ризики
         "atr_len": 14, "sl_k": 1.5, "rr_k": 2.2,
@@ -96,13 +107,16 @@ def default_state() -> Dict[str, object]:
         "_last_sig_ts": {}, "trail_k": 1.2,
 
         # користувач: плече/депозит/ризик
-        "leverage": 5, "deposit": 1000.0, "risk_pct": 1.0, "risk_usd": None,
+        "leverage": 5, "deposit": 1000.0, "risk_pct": 1.0,
+        "risk_usd_fixed": None,   # якщо задано — ігноруємо risk_pct
 
-        # quality gate
-        "min_score": 3,
+        # quality gate (етап B)
+        "min_score": 3,  # поріг проходу quality_score
 
-        # діагностика і профіль
+        # діагностика
         "diag_filters": True,
+
+        # активний профіль (для логів)
         "active_profile": "",
     }
 
@@ -122,12 +136,31 @@ def in_session(st) -> bool:
 def _proxy_kwargs() -> dict:
     return {"proxy": BYBIT_PROXY} if BYBIT_PROXY.startswith(("http://","https://")) else {}
 
+# ---- Безпечний спліт Markdown-повідомлень ----
 def split_long(text: str, n: int = 3500) -> List[str]:
-    out=[]
-    while len(text)>n:
-        out.append(text[:n]); text=text[n:]
-    out.append(text)
-    return out
+    chunks: List[str] = []
+    i, L = 0, len(text)
+    while i < L:
+        j = min(L, i + n)
+        cut = text.rfind("\n\n", i, j)
+        if cut == -1:
+            cut = text.rfind("\n", i, j)
+        if cut == -1 or cut <= i + 200:
+            cut = j
+        chunk = text[i:cut]
+
+        # якщо непарна кількість бектиків — не ламаємо Markdown
+        if chunk.count("`") % 2 == 1:
+            nxt = text.find("`", cut)
+            if 0 <= nxt < i + n + 500:
+                chunk = text[i:nxt + 1]
+                cut = nxt + 1
+            else:
+                chunk += "`"  # закриваємо вручну
+
+        chunks.append(chunk)
+        i = cut
+    return chunks
 
 def fmt_usd(x: float) -> str:
     sign = "-" if x < 0 else ""
@@ -285,10 +318,13 @@ def quality_score(direction: str,
     if rr >= 2.4: score += 2
     elif rr >= 2.0: score += 1
     else: score -= 1
-    # 2) EMA тренд (30m/1h)
+
+    # 2) MTF EMA (30m/1h)
     e30_50, e30_200 = ema(c30,50), ema(c30,200 if len(c30)>=200 else max(100,len(c30)//2))
     e60_50, e60_200 = ema(c60,50), ema(c60,200 if len(c60)>=200 else max(100,len(c60)//2))
-    def trend(e50, e200): return 0 if (not e50 or not e200) else (1 if e50[-1]>e200[-1] else -1)
+    def trend(e50, e200):
+        if not e50 or not e200: return 0
+        return 1 if e50[-1] > e200[-1] else -1
     t30 = trend(e30_50, e30_200); t60 = trend(e60_50, e60_200)
     if direction=="LONG":
         if t30==1: score += 1
@@ -296,21 +332,25 @@ def quality_score(direction: str,
     else:
         if t30==-1: score += 1
         if t60==-1: score += 1
-    # 3) Відстань до EMA200(30m) (уникаємо входів в рівень)
+
+    # 3) Відстань до EMA200(30m) норм. по ATR-проксі
     if e30_200:
         ema200 = e30_200[-1]
         dist = (px - ema200) if direction=="LONG" else (ema200 - px)
-        atr_norm = max(1e-9, abs(c15[-1] - c15[-2]))  # проксі ATR
+        atr_norm = max(1e-9, abs(c15[-1] - c15[-2]))
         if dist > 0.8 * atr_norm: score += 1
         elif dist < 0.3 * atr_norm: score -= 1
+
     # 4) ADX посилюється на 1h
     if adx60 > adx30: score += 1
-    # 5) RSI крайнощі — штраф
+
+    # 5) RSI крайність проти входу — штраф
     r15 = rsi(c15,14)
     if r15:
         last = r15[-1]
         if direction=="LONG" and last > 82: score -= 1
         if direction=="SHORT" and last < 18: score -= 1
+
     return score
 
 # =============== SIGNALS BUILDER ===============
@@ -321,13 +361,17 @@ async def build_signals(st: Dict[str,object]) -> str:
     last_ts: Dict[str,float] = st["_last_sig_ts"]
     now_ts = datetime.utcnow().timestamp()
 
-    reasons = {k:0 for k in ["tickers","turnover","24h_change","price0","spread","no_tf_data",
-                             "vol","trend","atr0","adx","atrpct","cooldown","qscore","ok"]}
+    reasons = {
+        "tickers": 0, "turnover": 0, "24h_change": 0, "price0": 0,
+        "spread": 0, "no_tf_data": 0, "vol": 0, "trend": 0,
+        "atr0": 0, "adx": 0, "atrpct": 0, "cooldown": 0, "qscore": 0,
+        "ok": 0
+    }
 
     async with aiohttp.ClientSession() as s:
         tickers = await get_tickers(s)
 
-        # первинний відбір
+        # Етап A — базові фільтри
         cands=[]
         for t in tickers:
             reasons["tickers"] += 1
@@ -343,51 +387,81 @@ async def build_signals(st: Dict[str,object]) -> str:
             except:
                 reasons["price0"] += 1
                 continue
-            if vol < float(st["min_turnover"]): reasons["turnover"] += 1; continue
-            if abs(ch24) > float(st["max_24h_change"]): reasons["24h_change"] += 1; continue
-            if px<=0: reasons["price0"] += 1; continue
+            if vol < float(st["min_turnover"]):
+                reasons["turnover"] += 1; continue
+            if abs(ch24) > float(st["max_24h_change"]):
+                reasons["24h_change"] += 1; continue
+            if px<=0:
+                reasons["price0"] += 1; continue
             cands.append((sym, px, ch24))
 
+        # Деталізація по кандидатах
         scored=[]
         for sym, px, ch24 in cands:
             sp_bps = await get_orderbook_spread_bps(s, sym)
-            if sp_bps > float(st["max_spread_bps"]): reasons["spread"] += 1; continue
+            if sp_bps > float(st["max_spread_bps"]):
+                reasons["spread"] += 1
+                continue
 
             o15,h15,l15,c15,v15 = await get_klines(s, sym, "15", 300); await asyncio.sleep(0.10)
             o30,h30,l30,c30,v30 = await get_klines(s, sym, "30", 300); await asyncio.sleep(0.10)
             o60,h60,l60,c60,v60 = await get_klines(s, sym, "60", 300)
-            if not (c15 and c30 and c60): reasons["no_tf_data"] += 1; continue
+            if not (c15 and c30 and c60):
+                reasons["no_tf_data"] += 1
+                continue
 
+            # vol: 15m > SMA20×vol_mult
             vol_sma20 = sma_series(v15, 20)
             if vol_sma20 and vol_sma20[-1] is not None:
                 if v15[-1] <= float(st["vol_mult"]) * float(vol_sma20[-1]):
-                    reasons["vol"] += 1; continue
+                    reasons["vol"] += 1
+                    continue
 
             v15x=votes_from_series(c15); v30x=votes_from_series(c30); v60x=votes_from_series(c60)
             direction = decide_direction(v15x["vote"], v30x["vote"], v60x["vote"], int(st["trend_weight"]))
-            if not direction: reasons["trend"] += 1; continue
+            if not direction:
+                reasons["trend"] += 1
+                continue
 
             atr_val = atr(h15,l15,c15,int(st["atr_len"]))
-            if atr_val<=0: reasons["atr0"] += 1; continue
+            if atr_val<=0:
+                reasons["atr0"] += 1
+                continue
 
             adx30 = adx_last(h30,l30,c30,14); adx60 = adx_last(h60,l60,c60,14)
-            if min(adx30, adx60) < float(st["min_adx"]): reasons["adx"] += 1; continue
+            if min(adx30, adx60) < float(st["min_adx"]):
+                reasons["adx"] += 1
+                continue
 
+            # мін. ATR% від ціни
             noise_pct = 100.0 * (atr_val / px)
-            if noise_pct < float(st["noise"]): reasons["atrpct"] += 1; continue
+            if noise_pct < float(st["noise"]):
+                reasons["atrpct"] += 1
+                continue
 
+            # SL/TP від ATR і rr_k
             sl_k, rr_k = float(st["sl_k"]), float(st["rr_k"])
             if direction=="LONG":
-                sl = px - sl_k*atr_val; risk_abs = px - sl; tp = px + rr_k*risk_abs
+                sl = px - sl_k*atr_val
+                risk_abs = px - sl
+                tp = px + rr_k*risk_abs
             else:
-                sl = px + sl_k*atr_val; risk_abs = sl - px; tp = px - rr_k*risk_abs
+                sl = px + sl_k*atr_val
+                risk_abs = sl - px
+                tp = px - rr_k*risk_abs
 
+            # кулдаун
             if now_ts - last_ts.get(sym, 0.0) < float(st["cooldown_min"])*60.0:
-                reasons["cooldown"] += 1; continue
+                reasons["cooldown"] += 1
+                continue
 
+            # Етап B — quality gate
             q = quality_score(direction, px, sl, tp, c15, c30, c60, adx30, adx60)
-            if q < int(st.get("min_score", 3)): reasons["qscore"] += 1; continue
+            if q < int(st.get("min_score", 3)):
+                reasons["qscore"] += 1
+                continue
 
+            # базовий рейтинг
             score = (v15x["vote"]+v30x["vote"]+v60x["vote"])
             if v60x["ema_trend"]==1 and direction=="LONG": score += 1
             if v60x["ema_trend"]==-1 and direction=="SHORT": score += 1
@@ -416,6 +490,7 @@ async def build_signals(st: Dict[str,object]) -> str:
             ]
             return html.escape("\n".join(msg), quote=False)
 
+        # топ-рейтинги
         scored.sort(key=lambda x: x[0], reverse=True)
         top = scored[:max(1, int(st["top_n"]))]
 
@@ -429,16 +504,31 @@ async def build_signals(st: Dict[str,object]) -> str:
             et=v["ema_trend"]; etxt="↑" if et==1 else ("↓" if et==-1 else "·")
             return f"RSI:{rtxt} MACD:{mtxt} EMA:{etxt}"
 
+        # позиція/PnL
         lev = float(st.get("leverage", 1))
         dep = float(st.get("deposit", 0.0))
         risk_pct = float(st.get("risk_pct", 1.0))
-        risk_usd_cfg = st.get("risk_usd", None)
+        risk_fixed = st.get("risk_usd_fixed", None)
 
         body=[]
         for sc, sym, direc, px, sl, tp, sp_bps, ch24, atr_v, noise_pct, adx30, adx60, q, (v15m,v30m,v60m) in top:
             rr = abs(tp-px)/max(1e-9,abs(px-sl))
             pct_to_sl = abs(px - sl) / max(1e-9, px)
-            risk_usd = float(risk_usd_cfg) if (risk_usd_cfg is not None and risk_usd_cfg > 0) else (dep * risk_pct / 100.0)
+
+            # ризик у $
+            if isinstance(risk_fixed, (int, float)) and risk_fixed is not None:
+                risk_usd = float(risk_fixed)
+                risk_caption = f"${risk_usd:,.2f} (fixed)"
+                pnl_sl_pct = -100.0 * risk_usd / max(1e-9, dep)
+                pnl_05r_pct = +0.5 * pnl_sl_pct * -1
+                pnl_tp_pct = rr * (-pnl_sl_pct)
+            else:
+                risk_usd = dep * risk_pct / 100.0
+                risk_caption = f"{risk_pct:.2f}% від депозиту ${dep:,.0f}"
+                pnl_sl_pct = -risk_pct
+                pnl_05r_pct = +0.5 * risk_pct
+                pnl_tp_pct = rr * risk_pct
+
             notional = (risk_usd / max(1e-9, pct_to_sl))
             qty = notional / max(1e-9, px)
             init_margin = notional / max(1e-9, lev)
@@ -447,22 +537,19 @@ async def build_signals(st: Dict[str,object]) -> str:
             pnl_05r_usd = +0.5 * risk_usd
             pnl_tp_usd = rr * risk_usd
 
-            pos_hdr = (f"(@ ризик {risk_pct:.2f}% від депозиту ${dep:,.0f})"
-                       if risk_usd_cfg in (None, 0) else
-                       f"(@ ризик ${risk_usd:,.2f} фіксовано)")
-
             body.append(
                 f"• *{sym}*: *{direc}* @ `{px:.6f}`\n"
                 f"  SL:`{sl:.6f}` · TP:`{tp:.6f}` · ATR:`{atr_v:.6f}` · RR:`{rr:.2f}` · Q:{q}\n"
                 f"  spread:{sp_bps:.2f}bps · 24hΔ:{ch24:+.2f}% · ATR%≈{noise_pct:.2f}% · ADX30:{adx30:.0f} ADX1h:{adx60:.0f}\n"
                 f"  15m {mark(v15m)} | 30m {mark(v30m)} | 1h {mark(v60m)}\n"
                 f"  Менеджмент: +0.5R → SL=BE; далі трейл {st['trail_k']}×ATR.\n"
-                f"  📏 Позиція {pos_hdr}: qty≈`{qty:.4f}` (~{fmt_usd(notional)}), маржа≈{fmt_usd(init_margin)} при ×{int(lev)}\n"
-                f"  💰 PnL vs депозит: -1R {-risk_usd/dep*100:+.2f}% ({fmt_usd(pnl_sl_usd)}) · "
-                f"+0.5R {0.5*risk_usd/dep*100:+.2f}% ({fmt_usd(pnl_05r_usd)}) · TP {rr*risk_usd/dep*100:+.2f}% ({fmt_usd(pnl_tp_usd)})"
+                f"  📏 Позиція (@ ризик {risk_caption}): qty≈`{qty:.4f}` (~{fmt_usd(notional)}), "
+                f"маржа≈{fmt_usd(init_margin)} при ×{int(lev)}\n"
+                f"  💰 PnL vs депозит: -1R {pnl_sl_pct:+.2f}% ({fmt_usd(pnl_sl_usd)}) · "
+                f"+0.5R {pnl_05r_pct:+.2f}% ({fmt_usd(pnl_05r_usd)}) · TP {pnl_tp_pct:+.2f}% ({fmt_usd(pnl_tp_usd)})"
             )
 
-            # CSV LOG
+            # === CSV LOG ===
             try:
                 log_signal_row({
                     "utc": utc_now_str(),
@@ -562,7 +649,7 @@ async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "/set_lev X — плече (1..25)\n"
         "/set_deposit $ — депозит (100..1e7)\n"
         "/set_riskpct % — ризик на угоду (0.1..5)\n"
-        "/set_riskusd $ — фіксований ризик у $ (ігнорує %)\n"
+        "/set_riskusd $ — фіксований ризик у $ (ігнорує %) | /clr_riskusd — вимкнути\n"
         "/set_minscore N — поріг якості (2..6)\n"
         "/diag — увімк/вимк детальний звіт фільтрів\n\n"
         "🎛 Профілі: /aggressive /scalp /default /swing /safe\n"
@@ -574,14 +661,15 @@ async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
 async def status_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     st = STATE.setdefault(u.effective_chat.id, default_state())
     risk_line = (
-        f"risk=${st['risk_usd']:,.2f} (fixed)"
-        if st.get("risk_usd") not in (None, 0)
+        f"risk=${st['risk_usd_fixed']:,.2f} (fixed)"
+        if st.get("risk_usd_fixed") is not None
         else f"risk={st['risk_pct']:.2f}%"
     )
     text = (
         f"Автопостинг: {'ON' if st['auto_on'] else 'OFF'} кожні {st['every']} хв\n"
         f"TOP_N={st['top_n']} · noise≈{st['noise']}% · trend_weight={st['trend_weight']} · min_score={st['min_score']}\n"
-        f"ATR(len={st['atr_len']}) · SL_k={st['sl_k']} · RR_k={st['rr_k']} · minADX={st['min_adx']} · volMult={st['vol_mult']}\n"
+        f"ATR(len={st['atr_len']}) · SL_k={st['sl_k']} · RR_k={st['rr_k']} · "
+        f"minADX={st['min_adx']} · volMult={st['vol_mult']}\n"
         f"turnover≥{st['min_turnover']}M · spread≤{st['max_spread_bps']}bps · 24hΔ≤{st['max_24h_change']}%\n"
         f"session UTC {st['sess_from']:02.0f}-{st['sess_to']:02.0f} · cooldown={st['cooldown_min']}м\n"
         f"leverage=×{st['leverage']} · deposit=${st['deposit']:.2f} · {risk_line}\n"
@@ -656,10 +744,8 @@ async def set_24h_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 async def set_session_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     st=STATE.setdefault(u.effective_chat.id, default_state())
-    try:
-        f=int(c.args[0]); t=int(c.args[1]); assert 0<=f<=23 and 0<=t<=23
-    except:
-        return await _setter(u, False, "", "Формат: /set_session 0 23")
+    try: f=int(c.args[0]); t=int(c.args[1]); assert 0<=f<=23 and 0<=t<=23
+    except: return await _setter(u, False, "", "Формат: /set_session 0 23")
     st["sess_from"]=f; st["sess_to"]=t
     await _setter(u, True, f"OK. Сесія UTC {f:02d}-{t:02d}.", "")
 
@@ -680,22 +766,26 @@ async def set_deposit_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 async def set_riskpct_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     st=STATE.setdefault(u.effective_chat.id, default_state())
-    try: v=float(c.args[0]); assert 0.1<=v<=5.0; st["risk_pct"]=v; await _setter(u, True, f"OK. Ризик на угоду = {v:.2f}%.", "")
-    except: await _setter(u, False, "", "Формат: /set_riskpct 1.0 (0.1..5)")
+    try:
+        v=float(c.args[0]); assert 0.1<=v<=5.0
+        st["risk_pct"]=v; st["risk_usd_fixed"]=None
+        await _setter(u, True, f"OK. Ризик на угоду = {v:.2f}% (fixed $ вимкнено).", "")
+    except:
+        await _setter(u, False, "", "Формат: /set_riskpct 1.0 (0.1..5)")
 
 async def set_riskusd_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = STATE.setdefault(u.effective_chat.id, default_state())
+    st=STATE.setdefault(u.effective_chat.id, default_state())
     try:
-        if not c.args: raise ValueError
-        arg = c.args[0].lower()
-        if arg in ("off", "none", "0"):
-            st["risk_usd"] = None
-            return await u.message.reply_text("OK. Фіксований ризик вимкнено (використовуємо відсоток).")
-        v = float(arg); assert 1 <= v <= 1e7
-        st["risk_usd"] = v
-        await u.message.reply_text(f"OK. Фіксований ризик = ${v:,.2f} на угоду (ігнорує %).")
+        v=float(c.args[0]); assert 1<=v<=1e7
+        st["risk_usd_fixed"]=v
+        await _setter(u, True, f"OK. Фіксований ризик = ${v:,.2f} на угоду (ігнорує %).", "")
     except:
-        await u.message.reply_text("Формат: /set_riskusd 250  або  /set_riskusd off")
+        await _setter(u, False, "", "Формат: /set_riskusd 25")
+
+async def clr_riskusd_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st=STATE.setdefault(u.effective_chat.id, default_state())
+    st["risk_usd_fixed"]=None
+    await _setter(u, True, "OK. Фіксований ризик вимкнено (знову використовується %).", "")
 
 async def set_minscore_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     st=STATE.setdefault(u.effective_chat.id, default_state())
@@ -802,6 +892,7 @@ def main():
     app.add_handler(CommandHandler("set_deposit", set_deposit_cmd))
     app.add_handler(CommandHandler("set_riskpct", set_riskpct_cmd))
     app.add_handler(CommandHandler("set_riskusd", set_riskusd_cmd))
+    app.add_handler(CommandHandler("clr_riskusd", clr_riskusd_cmd))
     app.add_handler(CommandHandler("set_minscore", set_minscore_cmd))
 
     # діагностика
