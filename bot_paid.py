@@ -441,7 +441,8 @@ async def build_signals(st: Dict[str,object]) -> str:
                 f"• cooldown: {reasons['cooldown']}",
                 f"• quality_score < {st['min_score']}: {reasons['qscore']}",
             ]
-            return "\n".join(msg)
+            # ⬇️ ВАЖЛИВО: екрануємо, бо parse_mode=HTML
+            return html.escape("\n".join(msg), quote=False)
 
         # топ-рейтинги
         scored.sort(key=lambda x: x[0], reverse=True)
