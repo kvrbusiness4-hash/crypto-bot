@@ -30,7 +30,7 @@ LOG_PATH = os.getenv("SIGLOG_PATH", "signals_log.csv")
 # === Alpaca ===
 ALP_KEY = os.getenv("ALPACA_API_KEY", "").strip()
 ALP_SECRET = os.getenv("ALPACA_API_SECRET", "").strip()
-ALP_BASE = (os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets/v2") or "").rstrip("/")
+ALP_BASE = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").strip()
 ALP_ON_AT_START = os.getenv("ALPACA_ENABLE", "0").strip() == "1"
 ALP_NOTIONAL = float(os.getenv("ALPACA_NOTIONAL", "25"))
 
