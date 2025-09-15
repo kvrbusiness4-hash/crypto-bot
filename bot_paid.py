@@ -15,7 +15,7 @@ import html
 import asyncio
 import aiohttp
 import logging
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Union
 from datetime import datetime, timezone, time as dtime
 
 from telegram import Update, ReplyKeyboardMarkup, BotCommand
@@ -29,6 +29,11 @@ BYBIT_PROXY = os.getenv("BYBIT_PROXY", "").strip()  # http://user:pass@host:port
 DEFAULT_AUTO_MIN = int(os.getenv("DEFAULT_AUTO_MIN", "15"))
 TOP_N = int(os.getenv("TOP_N", "3"))
 LOG_PATH = os.getenv("SIGLOG_PATH", "signals_log.csv")
+
+# ----- Alpaca (ENV: додай у Railway Variables) -----
+ALPACA_KEY    = os.getenv("APCA_API_KEY_ID", "").strip()
+ALPACA_SECRET = os.getenv("APCA_API_SECRET_KEY", "").strip()
+ALPACA_BASE   = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
 
 # =============== LOGS ===============
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -118,6 +123,14 @@ def default_state() -> Dict[str, object]:
 
         # активний профіль (для логів)
         "active_profile": "",
+
+        # ---- Alpaca ----
+        "alp_autotrade": False,        # /alp_on /alp_off
+        "alp_qty_mode": "notional",    # "qty" або "notional"
+        "alp_notional": 25.0,          # $ на угоду, якщо notional
+        "alp_time_in_force": "gtc",    # gtc/day/ioc/fok
+        "alp_side_long": "buy",        # LONG → buy
+        "alp_side_short": "sell",      # SHORT → sell
     }
 
 # =============== HELPERS ===============
@@ -216,6 +229,62 @@ async def get_klines(session, symbol: str, interval: str, limit: int=300):
             closes.append(float(r[4])); volumes.append(float(r[5]))
         except: pass
     return opens, highs, lows, closes, volumes
+
+# =============== ALPACA HELPERS ===============
+def _alp_headers():
+    if not (ALPACA_KEY and ALPACA_SECRET):
+        raise RuntimeError("Set APCA_API_KEY_ID / APCA_API_SECRET_KEY in ENV")
+    return {
+        "APCA-API-KEY-ID": ALPACA_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+def _alp_url(path: str) -> str:
+    path = path if path.startswith("/") else f"/{path}"
+    return f"{ALPACA_BASE}{path}"
+
+async def alp_get(session: aiohttp.ClientSession, path: str, params: dict=None):
+    async with session.get(_alp_url(path), params=params, headers=_alp_headers(), timeout=25, **_proxy_kwargs()) as r:
+        r.raise_for_status()
+        return await r.json()
+
+async def alp_post(session: aiohttp.ClientSession, path: str, payload: dict):
+    async with session.post(_alp_url(path), json=payload, headers=_alp_headers(), timeout=25, **_proxy_kwargs()) as r:
+        txt = await r.text()
+        try:
+            r.raise_for_status()
+        except Exception as e:
+            raise RuntimeError(f"Alpaca POST {path} failed: {txt}") from e
+        try:
+            return await r.json()
+        except:
+            return {"ok": True, "raw": txt}
+
+def map_symbol_to_alpaca(sym: str) -> str:
+    s = sym.upper().replace("PERP","")
+    # Bybit "BTCUSDT" -> Alpaca "BTC/USD"
+    if s.endswith("USDT"):
+        return f"{s[:-4]}/USD"
+    return s
+
+async def alp_place_market(symbol: str, side: str, qty_mode: str, qty_or_notional: float, tif: str):
+    payload = {"symbol": symbol, "side": side, "type": "market", "time_in_force": tif}
+    if qty_mode == "qty":
+        payload["qty"] = str(qty_or_notional)
+    else:
+        payload["notional"] = str(qty_or_notional)
+    async with aiohttp.ClientSession() as s:
+        return await alp_post(s, "/v2/orders", payload)
+
+async def alp_account_text() -> str:
+    async with aiohttp.ClientSession() as s:
+        acc = await alp_get(s, "/v2/account")
+        cash = float(acc.get("cash", 0)); bp = float(acc.get("buying_power", 0))
+        eq = float(acc.get("portfolio_value") or acc.get("equity") or 0)
+        st = acc.get("status", "-")
+        return f"💼 Alpaca: status={st} · cash={fmt_usd(cash)} · buying_power={fmt_usd(bp)} · equity={fmt_usd(eq)}"
 
 # =============== INDICATORS ===============
 def ema(xs: List[float], p: int) -> List[float]:
@@ -354,9 +423,10 @@ def quality_score(direction: str,
     return score
 
 # =============== SIGNALS BUILDER ===============
-async def build_signals(st: Dict[str,object]) -> str:
+async def build_signals(st: Dict[str,object], return_struct: bool=False) -> Union[str, Tuple[str, List[dict]]]:
     if not in_session(st):
-        return f"⏳ Поза торговою сесією (UTC {st['sess_from']:02.0f}:00–{st['sess_to']:02.0f}:00)."
+        msg = f"⏳ Поза торговою сесією (UTC {st['sess_from']:02.0f}:00–{st['sess_to']:02.0f}:00)."
+        return (msg, []) if return_struct else msg
 
     last_ts: Dict[str,float] = st["_last_sig_ts"]
     now_ts = datetime.utcnow().timestamp()
@@ -471,24 +541,26 @@ async def build_signals(st: Dict[str,object]) -> str:
             scored.append((score, sym, direction, px, sl, tp, sp_bps, ch24, atr_val, noise_pct, adx30, adx60, q, (v15x,v30x,v60x)))
 
         if not scored:
+            msg = None
             if not st.get("diag_filters", True):
-                return "⚠️ Якісних сигналів не знайдено (фільтри відсіяли все)."
-            msg = [
-                "⚠️ Сигналів немає. Деталі відсіву:",
-                f"• тикерів розглянуто: {reasons['tickers']}",
-                f"• turnover < {st['min_turnover']:.0f}M: {reasons['turnover']}",
-                f"• |24hΔ| > {st['max_24h_change']:.0f}%: {reasons['24h_change']}",
-                f"• ціна/дані некоректні: {reasons['price0']}",
-                f"• spread > {st['max_spread_bps']}bps: {reasons['spread']}",
-                f"• брак даних (TF): {reasons['no_tf_data']}",
-                f"• vol ≤ SMA20×{st['vol_mult']:.2f}: {reasons['vol']}",
-                f"• тренд неузгоджений: {reasons['trend']}",
-                f"• ADX < {st['min_adx']}: {reasons['adx']}",
-                f"• ATR% < {st['noise']:.2f}%: {reasons['atrpct']}",
-                f"• cooldown: {reasons['cooldown']}",
-                f"• quality_score < {st['min_score']}: {reasons['qscore']}",
-            ]
-            return html.escape("\n".join(msg), quote=False)
+                msg = "⚠️ Якісних сигналів не знайдено (фільтри відсіяли все)."
+            else:
+                msg = html.escape("\n".join([
+                    "⚠️ Сигналів немає. Деталі відсіву:",
+                    f"• тикерів розглянуто: {reasons['tickers']}",
+                    f"• turnover < {st['min_turnover']:.0f}M: {reasons['turnover']}",
+                    f"• |24hΔ| > {st['max_24h_change']:.0f}%: {reasons['24h_change']}",
+                    f"• ціна/дані некоректні: {reasons['price0']}",
+                    f"• spread > {st['max_spread_bps']}bps: {reasons['spread']}",
+                    f"• брак даних (TF): {reasons['no_tf_data']}",
+                    f"• vol ≤ SMA20×{st['vol_mult']:.2f}: {reasons['vol']}",
+                    f"• тренд неузгоджений: {reasons['trend']}",
+                    f"• ADX < {st['min_adx']}: {reasons['adx']}",
+                    f"• ATR% < {st['noise']:.2f}%: {reasons['atrpct']}",
+                    f"• cooldown: {reasons['cooldown']}",
+                    f"• quality_score < {st['min_score']}: {reasons['qscore']}",
+                ]), quote=False)
+            return (msg, []) if return_struct else msg
 
         # топ-рейтинги
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -511,6 +583,7 @@ async def build_signals(st: Dict[str,object]) -> str:
         risk_fixed = st.get("risk_usd_fixed", None)
 
         body=[]
+        top_struct=[]
         for sc, sym, direc, px, sl, tp, sp_bps, ch24, atr_v, noise_pct, adx30, adx60, q, (v15m,v30m,v60m) in top:
             rr = abs(tp-px)/max(1e-9,abs(px-sl))
             pct_to_sl = abs(px - sl) / max(1e-9, px)
@@ -549,6 +622,16 @@ async def build_signals(st: Dict[str,object]) -> str:
                 f"+0.5R {pnl_05r_pct:+.2f}% ({fmt_usd(pnl_05r_usd)}) · TP {pnl_tp_pct:+.2f}% ({fmt_usd(pnl_tp_usd)})"
             )
 
+            # структура для автотрейду
+            top_struct.append({
+                "symbol": sym,
+                "direction": direc,
+                "px": px,
+                "sl": sl,
+                "tp": tp,
+                "rr": rr
+            })
+
             # === CSV LOG ===
             try:
                 log_signal_row({
@@ -570,7 +653,8 @@ async def build_signals(st: Dict[str,object]) -> str:
             except Exception as e:
                 log.error("CSV log error: %s", e)
 
-        return "📈 *Сильні сигнали:*\n\n" + "\n\n".join(body) + f"\n\nUTC: {utc_now_str()}"
+        text_out = "📈 *Сильні сигнали:*\n\n" + "\n\n".join(body) + f"\n\nUTC: {utc_now_str()}"
+        return (text_out, top_struct) if return_struct else text_out
 
 # =============== AUTO HELPERS ===============
 async def _start_autoposting(chat_id: int, app, st: Dict[str, object], minutes: int):
@@ -617,11 +701,14 @@ async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
             BotCommand("safe", "Безпечний (суворі фільтри)"),
             BotCommand("signals", "Сканувати зараз"),
             BotCommand("status", "Поточні налаштування"),
+            BotCommand("alp_on", "Alpaca автотрейд: ON"),
+            BotCommand("alp_off", "Alpaca автотрейд: OFF"),
+            BotCommand("alp_status", "Alpaca баланс/стан"),
         ])
     except Exception:
         pass
     await u.message.reply_text(
-        "👋 Готово. Бот видає *сигнали без автотрейду*. Обери режим нижче.",
+        "👋 Готово. Бот видає *сигнали*. Для автотрейду Alpaca: /alp_on (і /alp_off).",
         parse_mode=ParseMode.MARKDOWN, reply_markup=_kb({})
     )
 
@@ -653,6 +740,7 @@ async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "/set_minscore N — поріг якості (2..6)\n"
         "/diag — увімк/вимк детальний звіт фільтрів\n\n"
         "🎛 Профілі: /aggressive /scalp /default /swing /safe\n"
+        "🤖 Alpaca: /alp_on /alp_off · /alp_status\n"
         "🧭 Менеджмент: +0.5R → SL=BE; далі трейл X×ATR."
     )
     for ch in split_long(help_text, 3500):
@@ -676,6 +764,7 @@ async def status_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"profile: {st.get('active_profile','')} · diag={'ON' if st.get('diag_filters', True) else 'OFF'}\n"
         f"whitelist: {', '.join(sorted(st['whitelist'])) or '—'}\n"
         f"blacklist: {', '.join(sorted(st['blacklist'])) or '—'}\n"
+        f"Alpaca AUTOTRADE: {'ON' if st.get('alp_autotrade') else 'OFF'} · mode={st.get('alp_qty_mode')} · notional=${st.get('alp_notional')}\n"
         f"UTC: {utc_now_str()}"
     )
     await u.message.reply_text(text, reply_markup=_kb(st))
@@ -827,9 +916,28 @@ async def auto_job(ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = ctx.job.data["chat_id"]
     st = STATE.setdefault(chat_id, default_state())
     try:
-        txt = await build_signals(st)
+        txt, top = await build_signals(st, return_struct=True)
         for ch in split_long(txt):
             await ctx.bot.send_message(chat_id=chat_id, text=ch, parse_mode=ParseMode.MARKDOWN)
+
+        # === Alpaca autotrade (market) ===
+        if st.get("alp_autotrade", False) and top:
+            placed = []
+            for t in top:
+                try:
+                    alp_sym = map_symbol_to_alpaca(t["symbol"])
+                    side = st.get("alp_side_long","buy") if t["direction"]=="LONG" else st.get("alp_side_short","sell")
+                    res = await alp_place_market(
+                        alp_sym, side,
+                        st.get("alp_qty_mode","notional"),
+                        float(st.get("alp_notional",25.0)),
+                        st.get("alp_time_in_force","gtc")
+                    )
+                    placed.append(f"{alp_sym}:{side} → {res.get('id','-')}")
+                except Exception as e:
+                    log.error("alp autotrade err: %s", e)
+            if placed:
+                await ctx.bot.send_message(chat_id=chat_id, text="🤖 Alpaca AUTOTRADE\n" + "\n".join(placed))
     except Exception as e:
         log.error("auto job err: %s", e)
 
@@ -848,6 +956,24 @@ async def auto_off_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     name=f"auto_{u.effective_chat.id}"
     for j in c.application.job_queue.get_jobs_by_name(name): j.schedule_removal()
     await u.message.reply_text("⏸ Автопостинг OFF.", reply_markup=_kb(st))
+
+# Alpaca control
+async def alp_on_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st=STATE.setdefault(u.effective_chat.id, default_state())
+    st["alp_autotrade"]=True
+    await u.message.reply_text("✅ Alpaca AUTOTRADE: ON")
+
+async def alp_off_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st=STATE.setdefault(u.effective_chat.id, default_state())
+    st["alp_autotrade"]=False
+    await u.message.reply_text("⏸ Alpaca AUTOTRADE: OFF")
+
+async def alp_status_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    try:
+        txt = await alp_account_text()
+    except Exception as e:
+        txt = f"❌ Alpaca error: {e}"
+    await u.message.reply_text(txt)
 
 # профілі
 async def aggressive_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):  await _apply_profile_and_scan(u, c, "aggressive")
@@ -905,6 +1031,11 @@ def main():
     app.add_handler(CommandHandler("bl_clear", bl_clear_cmd))
     app.add_handler(CommandHandler("auto_on", auto_on_cmd))
     app.add_handler(CommandHandler("auto_off", auto_off_cmd))
+
+    # Alpaca
+    app.add_handler(CommandHandler("alp_on", alp_on_cmd))
+    app.add_handler(CommandHandler("alp_off", alp_off_cmd))
+    app.add_handler(CommandHandler("alp_status", alp_status_cmd))
 
     app.run_polling()
 
