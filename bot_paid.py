@@ -28,11 +28,23 @@ TOP_N = int(os.getenv("TOP_N", "3"))
 LOG_PATH = os.getenv("SIGLOG_PATH", "signals_log.csv")
 
 # === Alpaca ===
-ALP_KEY = os.getenv("ALPACA_API_KEY", "").strip()
+ALP_KEY    = os.getenv("ALPACA_API_KEY", "").strip()
 ALP_SECRET = os.getenv("ALPACA_API_SECRET", "").strip()
-ALP_BASE = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").strip()
+
+# базовий URL з підтримкою /v2
+ALP_BASE = os.getenv("ALPACA_BASE_URL", "").strip()
+if not ALP_BASE:
+    # fallback — якщо в ENV нічого не задано
+    ALP_BASE = "https://paper-api.alpaca.markets/v2"
+elif not ALP_BASE.endswith("/v2"):
+    # якщо користувач забув /v2 — автоматично додаємо
+    if ALP_BASE.endswith("/"):
+        ALP_BASE = ALP_BASE + "v2"
+    else:
+        ALP_BASE = ALP_BASE + "/v2"
+
 ALP_ON_AT_START = os.getenv("ALPACA_ENABLE", "0").strip() == "1"
-ALP_NOTIONAL = float(os.getenv("ALPACA_NOTIONAL", "25"))
+ALP_NOTIONAL    = float(os.getenv("ALPACA_NOTIONAL", "25"))
 
 # =============== LOGS ===============
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
