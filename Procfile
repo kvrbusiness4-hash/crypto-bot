@@ -1,5 +1,2 @@
-# Bybit бот
 worker: python bot_paid.py
-
-# Alpaca бот
-alpaca: python bot_alpaca.py
+worker_alpaca: python bot_alpaca.py
