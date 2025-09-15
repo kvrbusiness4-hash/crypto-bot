@@ -711,6 +711,26 @@ async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "👋 Готово. Бот видає *сигнали*. Для автотрейду Alpaca: /alp_on (і /alp_off).",
         parse_mode=ParseMode.MARKDOWN, reply_markup=_kb({})
     )
+async def alp_orders_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    import aiohttp
+    url = f"{ALPACA_BASE}/v2/orders"
+    headers = {
+        "APCA-API-KEY-ID": ALPACA_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET
+    }
+    async with aiohttp.ClientSession() as s:
+        try:
+            async with s.get(url, headers=headers, timeout=15) as r:
+                data = await r.json()
+            if not data:
+                await u.message.reply_text("ℹ️ Ордерів немає.")
+                return
+            msg = ["📋 <b>Alpaca Orders</b>"]
+            for o in data:
+                msg.append(f"{o['symbol']} {o['side']} {o['qty']} @ {o['limit_price'] or o['avg_fill_price']} · {o['status']}")
+            await u.message.reply_text("\n".join(msg), parse_mode=ParseMode.HTML)
+        except Exception as e:
+            await u.message.reply_text(f"❌ Alpaca error: {e}")
 
 async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     help_text = (
@@ -1036,7 +1056,7 @@ def main():
     app.add_handler(CommandHandler("alp_on", alp_on_cmd))
     app.add_handler(CommandHandler("alp_off", alp_off_cmd))
     app.add_handler(CommandHandler("alp_status", alp_status_cmd))
-
+    app.add_handler(CommandHandler("alp_orders", alp_orders_cmd))
     app.run_polling()
 
 if __name__ == "__main__":
