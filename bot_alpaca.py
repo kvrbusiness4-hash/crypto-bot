@@ -205,17 +205,25 @@ def rank_score(c15: List[float], c30: List[float], c60: List[float],
     return bias*100 + trend*50 - abs(50.0 - r1)
 
 async def scan_rank_crypto(st: Dict[str, Any]) -> Tuple[str, List[Tuple[float, str, List[Dict[str, Any]]]]]:
-    conf = mode_conf(st)
-    tf15, tf30, tf60 = conf["bars"]
+    """
+    Сканер крипти: ранжує whitelist USD-пар за комбінацією RSI+EMA.
+    Повертає (report_text, ranked), де ranked = [(score, symbol, bars15), ...]
+    """
+    conf = mode_conf(st)                       # rsi_buy/rsi_sell, ema_fast/ema_slow, bars, top_n
+    tf15, tf30, tf60 = conf["bars"]            # напр., ("15Min","30Min","1H")
 
     # беремо фіксований whitelist активних USD-пар
     pairs = CRYPTO_USD_PAIRS[:]
+    if not pairs:
+        return "Немає активних USD-пар", []
 
+    # тягнемо свічки по трьох таймфреймах
     bars15 = await get_bars_crypto(pairs, tf15, limit=120)
     bars30 = await get_bars_crypto(pairs, tf30, limit=120)
     bars60 = await get_bars_crypto(pairs, tf60, limit=120)
 
     ranked: List[Tuple[float, str, List[Dict[str, Any]]]] = []
+
     for sym in pairs:
         raw15 = (bars15.get("bars") or {}).get(sym, [])
         raw30 = (bars30.get("bars") or {}).get(sym, [])
@@ -223,24 +231,28 @@ async def scan_rank_crypto(st: Dict[str, Any]) -> Tuple[str, List[Tuple[float, s
         if not raw15 or not raw30 or not raw60:
             continue
 
+        # масиви close для 15/30/60
         c15 = [float(x["c"]) for x in raw15]
         c30 = [float(x["c"]) for x in raw30]
         c60 = [float(x["c"]) for x in raw60]
 
+        # інтегральний скор (через уже оголошений вище rank_score)
         score = rank_score(
             c15, c30, c60,
             conf["rsi_buy"], conf["rsi_sell"],
-            conf["ema_fast"], conf["ema_slow"]
+            conf["ema_fast"], conf["ema_slow"],
         )
         ranked.append((score, sym, raw15))
 
     ranked.sort(reverse=True)
+
     rep = (
         "🛰️ Сканер (крипта):\n"
         f"• Активних USD-пар: {len(pairs)}\n"
         f"• Використаємо для торгівлі (лімітом): {min(conf['top_n'], len(ranked))}\n"
         f"• Перші 25: " + ", ".join([s for _, s, _ in ranked[:25]]) if ranked else "Немає сигналів"
     )
+
     return rep, ranked
 
 # ========= Orders =========
