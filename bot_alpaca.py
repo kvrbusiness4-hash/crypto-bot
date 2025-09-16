@@ -12,7 +12,58 @@ from telegram.constants import ParseMode
 from telegram.ext import (
     Application, CommandHandler, ContextTypes
 )
+# ---- MODE PROFILES (таймфрейми, фільтри, ризик) ----
+MODE_PARAMS = {
+    "aggressive": {   # багато сигналів, більше ризику
+        "bars": ("5Min", "15Min", "1Hour"),
+        "rsi_buy": 55.0,      # long: понад
+        "rsi_sell": 45.0,     # short: нижче
+        "ema_fast": 15, "ema_slow": 30,
+        "top_n": 10,          # скільки інструментів взяти
+        "tp_pct": 0.015,      # 1.5%
+        "sl_pct": 0.008,      # 0.8%
+    },
+    "scalp": {        # короткі рухи, вузькі SL/TP
+        "bars": ("5Min", "15Min", "1Hour"),
+        "rsi_buy": 58.0,
+        "rsi_sell": 42.0,
+        "ema_fast": 15, "ema_slow": 30,
+        "top_n": 6,
+        "tp_pct": 0.012,
+        "sl_pct": 0.007,
+    },
+    "default": {      # баланс
+        "bars": ("15Min", "30Min", "1Hour"),
+        "rsi_buy": 60.0,
+        "rsi_sell": 40.0,
+        "ema_fast": 30, "ema_slow": 60,
+        "top_n": 5,
+        "tp_pct": 0.02,
+        "sl_pct": 0.01,
+    },
+    "swing": {        # менше угод, довші рухи
+        "bars": ("30Min", "1Hour", "1Day"),
+        "rsi_buy": 62.0,
+        "rsi_sell": 38.0,
+        "ema_fast": 30, "ema_slow": 60,
+        "top_n": 3,
+        "tp_pct": 0.035,
+        "sl_pct": 0.015,
+    },
+    "safe": {         # лише найсильніші
+        "bars": ("15Min", "1Hour", "1Day"),
+        "rsi_buy": 65.0,
+        "rsi_sell": 35.0,
+        "ema_fast": 30, "ema_slow": 60,
+        "top_n": 3,
+        "tp_pct": 0.03,
+        "sl_pct": 0.012,
+    },
+}
+DEFAULT_MODE = "default"
 
+def _mode_conf(st: dict) -> dict:
+    return MODE_PARAMS.get(st.get("mode", DEFAULT_MODE), MODE_PARAMS[DEFAULT_MODE])
 # =========================
 # ENV
 # =========================
@@ -224,73 +275,115 @@ async def alp_status_cmd(u, c):
 # =========================
 # СКАН/ТРЕЙД КРИПТИ (15/30/60)
 # =========================
-def _rank_by_rsi_ema(c15: List[float], c30: List[float], c60: List[float]) -> float:
-    r = [rsi(c15,14) or 50.0, rsi(c30,14) or 50.0, rsi(c60,14) or 50.0]
-    e = [ema(c15,15), ema(c30,30), ema(c60,60)]
-    e_spread = 0.0
-    if all(e):
-        e_spread = abs(e[0]-e[2]) / max(1e-9, e[2])
-    # більше => «сильніше» відхилення + тренд
-    return (sum(abs(x-50.0) for x in r)/3.0) + e_spread*50.0
+def _rank_by_rsi_ema(
+    c15: List[float], c30: List[float], c60: List[float],
+    rsi_buy: float, rsi_sell: float, ema_fast: int, ema_slow: int
+) -> float:
+    def rsi(arr, n=14):
+        import math
+        if len(arr) < n+1: return 50.0
+        gains = [max(0, arr[i]-arr[i-1]) for i in range(1, len(arr))]
+        losses = [max(0, arr[i-1]-arr[i]) for i in range(1, len(arr))]
+        avg_gain = sum(gains[-n:]) / n
+        avg_loss = sum(losses[-n:]) / n
+        if avg_loss == 0: return 100.0
+        rs = avg_gain / avg_loss
+        return 100 - (100 / (1 + rs))
 
-async def _scan_rank_crypto() -> Tuple[str, List[Tuple[float,str,List[Dict[str,Any]]]]]:
+    def ema(arr, n):
+        if len(arr) < n: return arr[-1]
+        k = 2/(n+1)
+        e = arr[0]
+        for x in arr[1:]:
+            e = x*k + e*(1-k)
+        return e
+
+    r = [rsi(c15,14), rsi(c30,14), rsi(c60,14)]
+    e_fast = [ema(c15, ema_fast), ema(c30, ema_fast), ema(c60, ema_fast)]
+    e_slow = [ema(c15, ema_slow), ema(c30, ema_slow), ema(c60, ema_slow)]
+    e_spread = abs(e_fast[0]-e_slow[0]) / max(1e-9, e_slow[0])
+
+    # “сильніше”, якщо RSI підтверджує тренд на кількох ТФ
+    bias_long = sum(1 for x in r if x >= rsi_buy)
+    bias_short = sum(1 for x in r if x <= rsi_sell)
+    bias = max(bias_long, bias_short)
+
+    # базовий скор
+    return bias*100 + e_spread*50 - abs(50.0 - r[0])  # легкий пріоритет на 1-му ТФ
+
+async def _scan_rank_crypto(st: dict) -> Tuple[str, List[Tuple[float, str, List[dict]]]]:
+    conf = _mode_conf(st)
     pairs = await get_active_crypto_usd_pairs()
     if not pairs:
         return "Немає активних USD-пар", []
 
-    bars15 = await get_bars_crypto(pairs, "15Min", limit=120)
-    bars30 = await get_bars_crypto(pairs, "30Min", limit=120)
-    bars60 = await get_bars_crypto(pairs, "1Hour", limit=120)  # 🔥 заміна
+    tf15, tf30, tf60 = conf["bars"]  # напр., ("15Min","30Min","1Hour")
+    bars15 = await get_bars_crypto(pairs, tf15, limit=120)
+    bars30 = await get_bars_crypto(pairs, tf30, limit=120)
+    bars60 = await get_bars_crypto(pairs, tf60, limit=120)
 
-    ranked = []
+    ranked: List[Tuple[float, str, List[dict]]] = []
     for sym in pairs:
-        raw = sym.replace("/", "")
-        a15 = (bars15.get("bars") or {}).get(raw, [])
-        a30 = (bars30.get("bars") or {}).get(raw, [])
-        a60 = (bars60.get("bars") or {}).get(raw, [])
-        if not a15 or not a30 or not a60: continue
-        c15 = [float(x["c"]) for x in a15]
-        c30 = [float(x["c"]) for x in a30]
-        c60 = [float(x["c"]) for x in a60]
-        score = _rank_by_rsi_ema(c15, c30, c60)
-        ranked.append((score, sym, a15))
+        raw15 = (bars15.get("bars") or {}).get(sym, [])
+        raw30 = (bars30.get("bars") or {}).get(sym, [])
+        raw60 = (bars60.get("bars") or {}).get(sym, [])
+        if not raw15 or not raw30 or not raw60:
+            continue
+
+        c15 = [float(x["c"]) for x in raw15]
+        c30 = [float(x["c"]) for x in raw30]
+        c60 = [float(x["c"]) for x in raw60]
+
+        score = _rank_by_rsi_ema(
+            c15, c30, c60,
+            rsi_buy=conf["rsi_buy"], rsi_sell=conf["rsi_sell"],
+            ema_fast=conf["ema_fast"], ema_slow=conf["ema_slow"],
+        )
+        ranked.append((score, sym, raw15))
 
     ranked.sort(reverse=True)
     report = (
         f"🛰 Сканер (крипта):\n"
         f"• Активних USD-пар: {len(pairs)}\n"
-        f"• Використаємо для торгівлі (лімітом): {min(ALPACA_TOP_N, len(ranked))}\n"
+        f"• Використаємо для торгівлі (лімітом): {min(conf['top_n'], len(ranked))}\n"
         f"• Перші 25: " + ", ".join([s for _, s, _ in ranked[:25]]) if ranked else "Немає сигналів"
     )
     return report, ranked
 
 async def signals_crypto(u: Update, c: ContextTypes.DEFAULT_TYPE):
     st = stedef(u.effective_chat.id)
-    try:
-        report, ranked = await _scan_rank_crypto()
-        await u.message.reply_text(report)
+    report, ranked = await _scan_rank_crypto(st)
+    await u.message.reply_text(report)
 
-        if st.get("autotrade") and ranked:
-            picks = ranked[:ALPACA_TOP_N]
-            for _, sym, arr in picks:
-                h = [float(x["h"]) for x in arr]
-                l = [float(x["l"]) for x in arr]
-                cc= [float(x["c"]) for x in arr]
-                px = cc[-1]
-                mode = st.get("side_mode", DEFAULT_SIDE_MODE)
-                side = "buy" if mode=="long" else "sell" if mode=="short" else side_by_trend(cc)
-                sl, tp = calc_sl_tp(side, px, h, l, cc)
+    if st.get("autotrade") and ranked:
+        conf = _mode_conf(st)
+        mode = st.get("side_mode", "long")  # long / short / both (у тебе вже є)
+        picks = ranked[:conf["top_n"]]
+
+        for _, sym, arr in picks:
+            h = [float(x["h"]) for x in arr]
+            l = [float(x["l"]) for x in arr]
+            cc = [float(x["c"]) for x in arr]
+            px = cc[-1]
+
+            # визначаємо сторону згідно side_mode:
+            sides = ["buy"] if mode == "long" else (["sell"] if mode == "short" else ["buy","sell"])
+
+            for side in sides:
+                tp = px * (1 + conf["tp_pct"]) if side == "buy" else px * (1 - conf["tp_pct"])
+                sl = px * (1 - conf["sl_pct"]) if side == "buy" else px * (1 + conf["sl_pct"])
+
                 try:
-                    await place_bracket_notional_order(sym, side, ALPACA_NOTIONAL, tp, sl)
+                    r = await place_bracket_notional_order(
+                        sym, side, ALPACA_NOTIONAL,
+                        take_profit=tp, stop_loss=sl
+                    )
                     await u.message.reply_text(
-                        f"🟢 ORDER OK: {sym} {('LONG' if side=='buy' else 'SHORT')} @~{px:.6f}\n"
-                        f"TP:{tp:.6f} • SL:{sl:.6f} • ${ALPACA_NOTIONAL:.2f}"
+                        f"🟢 ORDER OK: {sym} {('LONG' if side=='buy' else 'SHORT')} "
+                        f"TP:{tp:.6f} · SL:{sl:.6f} · ${ALPACA_NOTIONAL:.2f}"
                     )
                 except Exception as e:
-                    await u.message.reply_text(f"🔴 ORDER FAIL {sym}: {e}")
-
-    except Exception as e:
-        await u.message.reply_text(f"🔴 crypto scan error: {e}")
+                    await u.message.reply_text(f"🔴 ORDER FAIL {sym} {side.upper()}: {e}")
 
 async def trade_crypto(u: Update, c: ContextTypes.DEFAULT_TYPE):
     # миттєва торгівля за топ-N, без окремого звіту
