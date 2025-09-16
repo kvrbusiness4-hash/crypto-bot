@@ -268,12 +268,11 @@ async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         reply_markup=main_keyboard()
     )
 
-# =========================
-# MAIN
-# =========================
-async def main():
+# ===== MAIN =====
+
+def main():
     if not TG_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN не задано в ENV")
+        raise RuntimeError("TELEGRAM_BOT_TOKEN не задано")
 
     app = Application.builder().token(TG_TOKEN).build()
 
@@ -288,15 +287,14 @@ async def main():
 
     app.add_handler(CommandHandler("alp_on", alp_on_cmd))
     app.add_handler(CommandHandler("alp_off", alp_off_cmd))
-    app.add_handler(CommandHandler("alp_status", alp_status_cmd))
+    app.add_handler(CommandHandler("alp_status", status_cmd))
+    app.add_handler(CommandHandler("signals_alpaca", signals_cmd))
 
-    app.add_handler(CommandHandler("signals_alpaca", signals_alpaca_cmd))
+    # Фоновий сканер запускаємо лише через JobQueue
+    app.job_queue.run_repeating(periodic_scan_job, interval=120, first=5)
 
-    # Стартуємо фоновий сканер через JobQueue — НІЯКИХ проблем із event loop
-    app.job_queue.run_repeating(periodic_scan_job, interval=SCAN_EVERY_SEC, first=10)
-
-    await app.run_polling()
+    # Блокуючий запуск БЕЗ await і БЕЗ asyncio.run
+    app.run_polling()
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
