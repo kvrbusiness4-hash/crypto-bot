@@ -182,8 +182,13 @@ def _alp_headers() -> Dict[str, str]:
         "Content-Type": "application/json",
     }
 
+# Роутер: куди слати — trading API чи data API
+DATA_PREFIXES = ("/v1beta", "/v2/stocks", "/v2/crypto")
+
 async def alp_get_json(path: str, params: Dict[str, Any] | None = None) -> Any:
-    url = f"{ALPACA_BASE_URL}{path}" if path.startswith("/v") else f"{ALPACA_DATA_URL}{path}"
+    # Все, що починається з /v1beta* або /v2/stocks|/v2/crypto — це DATA API
+    use_data = path.startswith(DATA_PREFIXES)
+    url = (ALPACA_DATA_URL if use_data else ALPACA_BASE_URL) + path
     async with ClientSession(timeout=ClientTimeout(total=30)) as s:
         async with s.get(url, headers=_alp_headers(), params=params) as r:
             txt = await r.text()
@@ -192,6 +197,7 @@ async def alp_get_json(path: str, params: Dict[str, Any] | None = None) -> Any:
             return json.loads(txt) if txt else {}
 
 async def alp_post_json(path: str, payload: Dict[str, Any]) -> Any:
+    # POST ми використовуємо лише для торгових операцій (trading API)
     url = f"{ALPACA_BASE_URL}{path}"
     async with ClientSession(timeout=ClientTimeout(total=30)) as s:
         async with s.post(url, headers=_alp_headers(), data=json.dumps(payload)) as r:
