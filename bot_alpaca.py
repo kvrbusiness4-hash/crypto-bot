@@ -32,6 +32,9 @@ ALPACA_TOP_N = int(os.getenv("ALPACA_TOP_N") or 3)
 ALPACA_MAX_CRYPTO = int(os.getenv("ALPACA_MAX_CRYPTO") or 25)
 ALPACA_MAX_STOCKS = int(os.getenv("ALPACA_MAX_STOCKS") or 50)
 
+# інтервал фонового автоскану в секундах
+SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC") or 300)  # 5 хв за замовчуванням
+
 # ====== GLOBAL STATE (per chat) ======
 STATE: Dict[int, Dict[str, Any]] = {}
 
@@ -137,6 +140,7 @@ def stdef(chat_id: int) -> Dict[str, Any]:
     st = STATE.setdefault(chat_id, {})
     st.setdefault("mode", "aggressive")
     st.setdefault("autotrade", False)
+    st.setdefault("auto_scan", False)  # нове: фоновий автоскан
     st.setdefault("side_mode", "long")
     return st
 
@@ -144,11 +148,11 @@ def kb() -> ReplyKeyboardMarkup:
     rows = [
         ["/aggressive", "/scalp", "/default"],
         ["/swing", "/safe", "/help"],
-        ["/signals"],                     # <— додали загальну кнопку
         ["/signals_crypto", "/trade_crypto"],
         ["/signals_stocks", "/trade_stocks"],
-        ["/long_mode", "/short_mode", "/both_mode"],
         ["/alp_on", "/alp_status", "/alp_off"],
+        ["/auto_on", "/auto_status", "/auto_off"],  # нові кнопки автоскану
+        ["/long_mode", "/short_mode", "/both_mode"],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
@@ -175,6 +179,10 @@ async def alp_post_json(path: str, payload: Dict[str, Any]) -> Any:
             if r.status >= 400:
                 raise RuntimeError(f"POST {path} {r.status}: {txt}")
             return json.loads(txt) if txt else {}
+
+# ===== helper: clock & stocks data =====
+async def alp_clock() -> Dict[str, Any]:
+    return await alp_get_json("/v2/clock")
 
 # -------- DATA: /bars ----------
 async def get_bars_crypto(pairs: List[str], timeframe: str, limit: int = 120) -> Dict[str, Any]:
@@ -313,88 +321,7 @@ async def scan_rank_stocks(st: Dict[str, Any]) -> Tuple[str, List[Tuple[float, s
            if ranked else "• Немає сигналів")
     )
     return rep, ranked
-# ===== helper: clock =====
-async def alp_clock() -> Dict[str, Any]:
-    # показує відкритий/закритий ринок акцій (крипта 24/7)
-    return await alp_get_json("/v2/clock")
 
-# ===== /signals: комбінований запуск (крипта + акції) =====
-async def signals_all(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = stdef(u.effective_chat.id)
-    conf = _mode_conf(st)
-    top_n = int(conf.get("top_n", max(1, ALPACA_TOP_N)))
-
-    # 1) Час/ринок
-    try:
-        clk = await alp_clock()
-        market_open = bool(clk.get("is_open"))
-    except Exception:
-        market_open = True  # якщо clock не дістався — не блокуємо
-
-    # 2) Паралельний скан
-    try:
-        crypto_report, crypto_ranked = await scan_rank_crypto(st)
-    except Exception as e:
-        crypto_report, crypto_ranked = (f"🔴 Крипто-скан помилка: {e}", [])
-
-    try:
-        stocks_report, stocks_ranked = await scan_rank_stocks(st)
-    except Exception as e:
-        stocks_report, stocks_ranked = (f"🔴 Скан акцій помилка: {e}", [])
-
-    # 3) Об’єднання і ранжування
-    combined: List[Tuple[float, str, str, List[Dict[str, Any]]]] = []
-    for sc, sym, arr in crypto_ranked:
-        combined.append((sc, sym, "crypto", arr))
-    for sc, sym, arr in stocks_ranked:
-        combined.append((sc, sym, "stock", arr))
-    combined.sort(reverse=True)
-    picks = combined[:top_n]
-
-    # 4) Звіт
-    header = "📊 Об'єднаний скан (крипта + акції)\n" \
-             f"• Ринок акцій відкритий: {'YES' if market_open else 'NO'}\n" \
-             f"• Топ-N={top_n}\n"
-    await u.message.reply_text(header + "\n" + crypto_report)
-    await u.message.reply_text(stocks_report)
-
-    # 5) Ордери (тільки якщо увімкнений автотрейд)
-    if not st.get("autotrade") or not picks:
-        return
-
-    for score, sym, kind, arr in picks:
-        if kind == "stock" and not market_open:
-            await u.message.reply_text(f"⏸ Пропуск {sym} (ринок закритий).")
-            continue
-
-        side = "buy"
-        px = float(arr[-1]["c"])
-        sl, tp = calc_sl_tp(side, px, conf)
-
-        # антидубль (розділяємо CRYPTO/STOCK для ключа)
-        market_key = "CRYPTO" if kind == "crypto" else "STOCK"
-        if skip_as_duplicate(market_key, sym, side):
-            await u.message.reply_text(f"⚪ SKIP (дубль): {sym}")
-            continue
-
-        if kind == "crypto":
-            try:
-                await place_bracket_notional_order_crypto(sym, side, ALPACA_NOTIONAL, tp, sl)
-                await u.message.reply_text(
-                    f"🟢 ORDER OK: {sym} BUY ${ALPACA_NOTIONAL:.2f}\n"
-                    f"TP:{(tp or 0):.6f} SL:{(sl or 0):.6f}"
-                )
-            except Exception as e:
-                await u.message.reply_text(f"🔴 ORDER FAIL {sym}: {e}")
-        else:
-            try:
-                await place_bracket_notional_order_stock(sym, side, ALPACA_NOTIONAL, tp, sl)
-                await u.message.reply_text(
-                    f"🟢 ORDER OK: {sym} BUY ${ALPACA_NOTIONAL:.2f}\n"
-                    f"TP:{(tp or 0):.6f} SL:{(sl or 0):.6f}"
-                )
-            except Exception as e:
-                await u.message.reply_text(f"🔴 ORDER FAIL {sym}: {e}")
 # -------- ORDERS --------
 async def place_bracket_notional_order_crypto(sym: str, side: str, notional: float, tp: float | None, sl: float | None) -> Any:
     """Crypto: дозволяє notional + GTC."""
@@ -444,9 +371,10 @@ def calc_sl_tp(side: str, price: float, conf: Dict[str, Any]) -> Tuple[float | N
 async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     stdef(u.effective_chat.id)
     await u.message.reply_text(
-        "👋 Алпаса-бот готовий.\n"
-        "Крипта торгується 24/7; акції — коли ринок відкритий, але сканер працює завжди.\n"
-        "Увімкнути автотрейд: /alp_on  ·  Зупинити: /alp_off  ·  Стан: /alp_status",
+        "👋 Алпака-бот готовий.\n"
+        "Крипта торгується 24/7; акції — коли ринок відкритий. Сканер/автотрейд може працювати у фоні.\n"
+        "Увімкнути автотрейд: /alp_on  ·  Зупинити: /alp_off  ·  Стан: /alp_status\n"
+        "Фоновий автоскан: /auto_on  ·  /auto_off  ·  /auto_status",
         reply_markup=kb()
     )
 
@@ -456,7 +384,8 @@ async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "/trade_crypto — миттєво торгувати топ-N без додаткового звіту\n"
         "/signals_stocks — показати топ-N для акцій\n"
         "/trade_stocks — миттєво торгувати топ-N акцій\n"
-        "/alp_on /alp_off /alp_status — автотрейд\n"
+        "/alp_on /alp_off /alp_status — автотрейд (дозвіл виставляти ордери)\n"
+        "/auto_on /auto_off /auto_status — фоновий автоскан ринку\n"
         "/long_mode /short_mode /both_mode — напрям (short ігнорується для крипти)\n"
         "/aggressive /scalp /default /swing /safe — профілі ризику",
         reply_markup=kb()
@@ -503,6 +432,7 @@ async def alp_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"• buying_power=${float(acc.get('buying_power',0)):.2f}\n"
             f"• equity=${float(acc.get('equity',0)):.2f}\n"
             f"Mode={st.get('mode','default')} · Autotrade={'ON' if st.get('autotrade') else 'OFF'} · "
+            f"AutoScan={'ON' if st.get('auto_scan') else 'OFF'} · "
             f"Side={st.get('side_mode','long')}"
         )
         await u.message.reply_text(txt)
@@ -581,6 +511,17 @@ async def signals_stocks(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if not st.get("autotrade") or not ranked:
             return
 
+        # Перевіряємо, чи ринок відкритий
+        try:
+            clk = await alp_clock()
+            market_open = bool(clk.get("is_open"))
+        except Exception:
+            market_open = True
+
+        if not market_open:
+            await u.message.reply_text("⏸ Ринок акцій закритий — ордери не виставляю.")
+            return
+
         picks = ranked[: _mode_conf(st)["top_n"]]
         for _, sym, arr in picks:
             side = "buy"
@@ -612,6 +553,16 @@ async def trade_stocks(u: Update, c: ContextTypes.DEFAULT_TYPE):
             await u.message.reply_text("⚠️ Немає сигналів")
             return
 
+        try:
+            clk = await alp_clock()
+            market_open = bool(clk.get("is_open"))
+        except Exception:
+            market_open = True
+
+        if not market_open:
+            await u.message.reply_text("⏸ Ринок акцій закритий — ордери не виставляю.")
+            return
+
         picks = ranked[: _mode_conf(st)["top_n"]]
         for _, sym, arr in picks:
             side = "buy"
@@ -634,6 +585,100 @@ async def trade_stocks(u: Update, c: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await u.message.reply_text(f"🔴 trade_stocks error: {e}")
 
+# ======= AUTOSCAN (background) =======
+async def _auto_scan_once_for_chat(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
+    st = stdef(chat_id)
+    # якщо автоскан або автотрейд вимкнені — не робимо нічого
+    if not st.get("auto_scan") or not st.get("autotrade"):
+        return
+
+    conf = _mode_conf(st)
+    top_n = int(conf.get("top_n", max(1, ALPACA_TOP_N)))
+
+    # clock для акцій
+    try:
+        clk = await alp_clock()
+        market_open = bool(clk.get("is_open"))
+    except Exception:
+        market_open = True
+
+    # скани
+    try:
+        crypto_report, crypto_ranked = await scan_rank_crypto(st)
+    except Exception as e:
+        crypto_report, crypto_ranked = (f"🔴 Крипто-скан помилка: {e}", [])
+
+    try:
+        stocks_report, stocks_ranked = await scan_rank_stocks(st)
+    except Exception as e:
+        stocks_report, stocks_ranked = (f"🔴 Скан акцій помилка: {e}", [])
+
+    # комбінуємо та беремо найкращі
+    combined: List[Tuple[float, str, str, List[Dict[str, Any]]]] = []
+    for sc, sym, arr in crypto_ranked:
+        combined.append((sc, sym, "crypto", arr))
+    for sc, sym, arr in stocks_ranked:
+        combined.append((sc, sym, "stock", arr))
+    combined.sort(reverse=True)
+    picks = combined[:top_n]
+
+    # виставляємо ордери
+    for score, sym, kind, arr in picks:
+        if kind == "stock" and not market_open:
+            # ринок закритий — пропускаємо акцію
+            continue
+
+        side = "buy"
+        px = float(arr[-1]["c"])
+        sl, tp = calc_sl_tp(side, px, conf)
+
+        # антидубль
+        if skip_as_duplicate("STOCK" if kind == "stock" else "CRYPTO", sym, side):
+            continue
+
+        try:
+            if kind == "stock":
+                await place_bracket_notional_order_stock(sym, side, ALPACA_NOTIONAL, tp, sl)
+            else:
+                await place_bracket_notional_order_crypto(sym, side, ALPACA_NOTIONAL, tp, sl)
+            await ctx.bot.send_message(
+                chat_id,
+                f"🟢 AUTO ORDER: {to_order_sym(sym)} BUY ${ALPACA_NOTIONAL:.2f} · TP:{(tp or 0):.6f} SL:{(sl or 0):.6f}"
+            )
+        except Exception as e:
+            await ctx.bot.send_message(chat_id, f"🔴 AUTO ORDER FAIL {sym}: {e}")
+
+async def periodic_auto_scan(ctx: ContextTypes.DEFAULT_TYPE):
+    # проходимо по всіх чатах, де бот стартували
+    for chat_id in list(STATE.keys()):
+        try:
+            await _auto_scan_once_for_chat(chat_id, ctx)
+        except Exception as e:
+            try:
+                await ctx.bot.send_message(chat_id, f"🔴 periodic autoscan error: {e}")
+            except Exception:
+                pass
+
+# ------- AUTOSCAN commands -------
+async def auto_on(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st = stdef(u.effective_chat.id)
+    st["auto_scan"] = True
+    await u.message.reply_text(f"✅ AUTO-SCAN: ON (кожні {SCAN_INTERVAL_SEC}s)")
+
+async def auto_off(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st = stdef(u.effective_chat.id)
+    st["auto_scan"] = False
+    await u.message.reply_text("⛔ AUTO-SCAN: OFF")
+
+async def auto_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st = stdef(u.effective_chat.id)
+    await u.message.reply_text(
+        f"AutoScan={'ON' if st.get('auto_scan') else 'OFF'}; "
+        f"Autotrade={'ON' if st.get('autotrade') else 'OFF'}; "
+        f"Mode={st.get('mode','default')} · Side={st.get('side_mode','long')} · "
+        f"Interval={SCAN_INTERVAL_SEC}s"
+    )
+
 # ======= MODE SHORTCUTS =======
 async def aggressive(u, c): await set_mode(u, c, "aggressive")
 async def scalp(u, c): await set_mode(u, c, "scalp")
@@ -647,7 +692,7 @@ def main() -> None:
         raise SystemExit("No TELEGRAM_BOT_TOKEN provided")
 
     app = Application.builder().token(TG_TOKEN).build()
-    app.add_handler(CommandHandler("signals", signals_all))
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
 
@@ -671,6 +716,14 @@ def main() -> None:
     # Акції
     app.add_handler(CommandHandler("signals_stocks", signals_stocks))
     app.add_handler(CommandHandler("trade_stocks", trade_stocks))
+
+    # Автоскан
+    app.add_handler(CommandHandler("auto_on", auto_on))
+    app.add_handler(CommandHandler("auto_off", auto_off))
+    app.add_handler(CommandHandler("auto_status", auto_status))
+
+    # фоновий job раз у SCAN_INTERVAL_SEC
+    app.job_queue.run_repeating(periodic_auto_scan, interval=SCAN_INTERVAL_SEC, first=10)
 
     print("Bot started.")
     app.run_polling(close_loop=False)
