@@ -188,7 +188,7 @@ async def get_bars_crypto(pairs: List[str], timeframe: str, limit: int = 120) ->
 # -------- DATA: stocks bars (v2) --------
 async def get_bars_stocks(symbols: List[str], timeframe: str, limit: int = 120) -> Dict[str, Any]:
     tf = map_tf(timeframe)
-    syms = ","".join(symbols)
+    syms = ",".join(symbols)
     path = "/v2/stocks/bars"
     params = {"symbols": syms, "timeframe": tf, "limit": str(limit), "sort": "asc"}
     async with ClientSession(timeout=ClientTimeout(total=30)) as s:
