@@ -277,7 +277,7 @@ def main():
     app = Application.builder().token(TG_TOKEN).build()
 
     # handlers
-    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("alp_status", alp_status_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("aggressive", aggressive_cmd))
     app.add_handler(CommandHandler("scalp", scalp_cmd))
