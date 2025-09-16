@@ -304,7 +304,6 @@ def main():
 
     app.add_handler(CommandHandler("alp_on", alp_on_cmd))
     app.add_handler(CommandHandler("alp_off", alp_off_cmd))
-    app.add_handler(CommandHandler("alp_status", status_cmd))
     app.add_handler(CommandHandler("signals_alpaca", signals_cmd))
 
     # Фоновий сканер запускаємо лише через JobQueue
