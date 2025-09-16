@@ -144,6 +144,7 @@ def kb() -> ReplyKeyboardMarkup:
     rows = [
         ["/aggressive", "/scalp", "/default"],
         ["/swing", "/safe", "/help"],
+        ["/signals"],                     # <— додали загальну кнопку
         ["/signals_crypto", "/trade_crypto"],
         ["/signals_stocks", "/trade_stocks"],
         ["/long_mode", "/short_mode", "/both_mode"],
@@ -312,7 +313,88 @@ async def scan_rank_stocks(st: Dict[str, Any]) -> Tuple[str, List[Tuple[float, s
            if ranked else "• Немає сигналів")
     )
     return rep, ranked
+# ===== helper: clock =====
+async def alp_clock() -> Dict[str, Any]:
+    # показує відкритий/закритий ринок акцій (крипта 24/7)
+    return await alp_get_json("/v2/clock")
 
+# ===== /signals: комбінований запуск (крипта + акції) =====
+async def signals_all(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st = stdef(u.effective_chat.id)
+    conf = _mode_conf(st)
+    top_n = int(conf.get("top_n", max(1, ALPACA_TOP_N)))
+
+    # 1) Час/ринок
+    try:
+        clk = await alp_clock()
+        market_open = bool(clk.get("is_open"))
+    except Exception:
+        market_open = True  # якщо clock не дістався — не блокуємо
+
+    # 2) Паралельний скан
+    try:
+        crypto_report, crypto_ranked = await scan_rank_crypto(st)
+    except Exception as e:
+        crypto_report, crypto_ranked = (f"🔴 Крипто-скан помилка: {e}", [])
+
+    try:
+        stocks_report, stocks_ranked = await scan_rank_stocks(st)
+    except Exception as e:
+        stocks_report, stocks_ranked = (f"🔴 Скан акцій помилка: {e}", [])
+
+    # 3) Об’єднання і ранжування
+    combined: List[Tuple[float, str, str, List[Dict[str, Any]]]] = []
+    for sc, sym, arr in crypto_ranked:
+        combined.append((sc, sym, "crypto", arr))
+    for sc, sym, arr in stocks_ranked:
+        combined.append((sc, sym, "stock", arr))
+    combined.sort(reverse=True)
+    picks = combined[:top_n]
+
+    # 4) Звіт
+    header = "📊 Об'єднаний скан (крипта + акції)\n" \
+             f"• Ринок акцій відкритий: {'YES' if market_open else 'NO'}\n" \
+             f"• Топ-N={top_n}\n"
+    await u.message.reply_text(header + "\n" + crypto_report)
+    await u.message.reply_text(stocks_report)
+
+    # 5) Ордери (тільки якщо увімкнений автотрейд)
+    if not st.get("autotrade") or not picks:
+        return
+
+    for score, sym, kind, arr in picks:
+        if kind == "stock" and not market_open:
+            await u.message.reply_text(f"⏸ Пропуск {sym} (ринок закритий).")
+            continue
+
+        side = "buy"
+        px = float(arr[-1]["c"])
+        sl, tp = calc_sl_tp(side, px, conf)
+
+        # антидубль (розділяємо CRYPTO/STOCK для ключа)
+        market_key = "CRYPTO" if kind == "crypto" else "STOCK"
+        if skip_as_duplicate(market_key, sym, side):
+            await u.message.reply_text(f"⚪ SKIP (дубль): {sym}")
+            continue
+
+        if kind == "crypto":
+            try:
+                await place_bracket_notional_order_crypto(sym, side, ALPACA_NOTIONAL, tp, sl)
+                await u.message.reply_text(
+                    f"🟢 ORDER OK: {sym} BUY ${ALPACA_NOTIONAL:.2f}\n"
+                    f"TP:{(tp or 0):.6f} SL:{(sl or 0):.6f}"
+                )
+            except Exception as e:
+                await u.message.reply_text(f"🔴 ORDER FAIL {sym}: {e}")
+        else:
+            try:
+                await place_bracket_notional_order_stock(sym, side, ALPACA_NOTIONAL, tp, sl)
+                await u.message.reply_text(
+                    f"🟢 ORDER OK: {sym} BUY ${ALPACA_NOTIONAL:.2f}\n"
+                    f"TP:{(tp or 0):.6f} SL:{(sl or 0):.6f}"
+                )
+            except Exception as e:
+                await u.message.reply_text(f"🔴 ORDER FAIL {sym}: {e}")
 # -------- ORDERS --------
 async def place_bracket_notional_order_crypto(sym: str, side: str, notional: float, tp: float | None, sl: float | None) -> Any:
     """Crypto: дозволяє notional + GTC."""
@@ -565,7 +647,7 @@ def main() -> None:
         raise SystemExit("No TELEGRAM_BOT_TOKEN provided")
 
     app = Application.builder().token(TG_TOKEN).build()
-
+    app.add_handler(CommandHandler("signals", signals_all))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
 
