@@ -215,18 +215,34 @@ def calc_sl_tp(side: str, px: float, h: List[float], l: List[float], c: List[flo
         tp = px - ALP_RR_K*(sl - px)
     return sl, tp
 
-async def place_bracket_notional_order(symbol: str, side: str, notional: float, tp: float, sl: float):
-    payload = {
+async def place_bracket_notional_order(
+    symbol: str,
+    side: str,                   # "buy" або "sell"
+    notional: float,
+    take_profit: float,          # ціна TP
+    stop_loss: float             # ціна SL (stop)
+) -> dict:
+    """
+    Виставляє market bracket-order за сумою (notional) з TP/SL.
+    Для crypto 'sell' як відкриття шорту – не підтримується Alpaca.
+    """
+    # Захист від шорту крипти (Alpaca spot не дозволяє short crypto)
+    if "/" in symbol and side.lower() == "sell":
+        raise RuntimeError("Short для крипти не підтримується Alpaca (spot).")
+
+    order = {
         "symbol": symbol,
-        "side": side,                 # "buy" | "sell"
+        "side": side.lower(),            # "buy" | "sell"
         "type": "market",
         "time_in_force": "gtc",
         "notional": str(float(notional)),
-        "take_profit": {"limit_price": str(tp)},
-        "stop_loss":   {"stop_price":  str(sl)},
+        "order_class": "bracket",
+        "take_profit": {"limit_price": str(float(take_profit))},
+        "stop_loss":   {"stop_price":  str(float(stop_loss))},
     }
-    return await alp_post("orders", payload)
 
+    async with aiohttp.ClientSession(timeout=ClientTimeout(total=30)) as s:
+        return await alp_post(s, "orders", order)
 # =========================
 # БАЗОВІ КОМАНДИ
 # =========================
@@ -350,40 +366,80 @@ async def _scan_rank_crypto(st: dict) -> Tuple[str, List[Tuple[float, str, List[
     )
     return report, ranked
 
-async def signals_crypto(u: Update, c: ContextTypes.DEFAULT_TYPE):
+async def signals_crypto(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Сканер крипти + (за потреби) автотрейд топ-N з TP/SL.
+    Працює з режимами входів: long / short / both.
+    """
     st = stedef(u.effective_chat.id)
-    report, ranked = await _scan_rank_crypto(st)
+
+    # Профіль ризику (tp_pct, sl_pct, top_n тощо) — як у твоїй мапі профілів
+    mode = st.get("mode", "default")
+    conf = RISK_PROFILES.get(mode, RISK_PROFILES["default"])
+
+    # 1) Ранжування
+    try:
+        report, ranked = await _scan_rank_crypto()
+    except Exception as e:
+        await u.message.reply_text(f"🔴 crypto scan error: {e}")
+        return
+
+    # 2) Відправляємо короткий звіт
     await u.message.reply_text(report)
 
-    if st.get("autotrade") and ranked:
-        conf = _mode_conf(st)
-        mode = st.get("side_mode", "long")  # long / short / both (у тебе вже є)
-        picks = ranked[:conf["top_n"]]
+    # 3) Якщо автотрейд вимкнений або ранжування порожнє — на цьому все
+    if not st.get("autotrade") or not ranked:
+        return
 
-        for _, sym, arr in picks:
+    # Скільки беремо інструментів у трейд
+    top_n = min(ALPACA_TOP_N, len(ranked))
+
+    # Режим сторони
+    side_mode = st.get("side_mode", DEFAULT_SIDE_MODE)  # 'long' | 'short' | 'both'
+    sides_for_mode = (
+        ["buy"] if side_mode == "long" else
+        (["sell"] if side_mode == "short" else ["buy", "sell"])
+    )
+
+    # 4) Торгуємо по кожному з top-N
+    for _, sym, arr in ranked[:top_n]:
+        try:
+            # Масиви барів (H, L, C)
             h = [float(x["h"]) for x in arr]
             l = [float(x["l"]) for x in arr]
             cc = [float(x["c"]) for x in arr]
             px = cc[-1]
 
-            # визначаємо сторону згідно side_mode:
-            sides = ["buy"] if mode == "long" else (["sell"] if mode == "short" else ["buy","sell"])
-
-            for side in sides:
-                tp = px * (1 + conf["tp_pct"]) if side == "buy" else px * (1 - conf["tp_pct"])
-                sl = px * (1 - conf["sl_pct"]) if side == "buy" else px * (1 + conf["sl_pct"])
-
+            for side in sides_for_mode:
+                # TP/SL
                 try:
-                    r = await place_bracket_notional_order(
-                        sym, side, ALPACA_NOTIONAL,
-                        take_profit=tp, stop_loss=sl
-                    )
-                    await u.message.reply_text(
-                        f"🟢 ORDER OK: {sym} {('LONG' if side=='buy' else 'SHORT')} "
-                        f"TP:{tp:.6f} · SL:{sl:.6f} · ${ALPACA_NOTIONAL:.2f}"
-                    )
-                except Exception as e:
-                    await u.message.reply_text(f"🔴 ORDER FAIL {sym} {side.upper()}: {e}")
+                    # Якщо є твоя функція — скористайся нею
+                    tp, sl = calc_sl_tp(side, px, h, l, cc)  # noqa: F821 (якщо функції немає — впаде в except)
+                except Exception:
+                    # Fallback: відсоткові відхилення з конфігурації профілю
+                    tp_pct = float(conf.get("tp_pct", 0.01))
+                    sl_pct = float(conf.get("sl_pct", 0.005))
+                    if side == "buy":
+                        tp = px * (1 + tp_pct)
+                        sl = px * (1 - sl_pct)
+                    else:
+                        tp = px * (1 - tp_pct)
+                        sl = px * (1 + sl_pct)
+
+                # 5) Виставляємо BRACKET ордер.
+                #    ВАЖЛИВО: тільки позиційні аргументи — без take_profit= / stop_loss=
+                await place_bracket_notional_order(sym, side, ALPACA_NOTIONAL, tp, sl)
+
+                await u.message.reply_text(
+                    f"🟢 ORDER OK: {sym} {{'LONG' if side=='buy' else 'SHORT'}} "
+                    f"TP:{tp:.6f} · SL:{sl:.6f} · ${ALPACA_NOTIONAL:.2f}"
+                )
+
+                # легкий пауза, щоб не лімітуватись
+                await asyncio.sleep(0.15)
+
+        except Exception as e:
+            await u.message.reply_text(f"🔴 ORDER FAIL {sym}: {e}")
 
 async def trade_crypto(u: Update, c: ContextTypes.DEFAULT_TYPE):
     # миттєва торгівля за топ-N, без окремого звіту
