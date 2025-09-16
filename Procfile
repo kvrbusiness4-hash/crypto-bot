@@ -1,1 +1,1 @@
-worker: python bot_alpaca.py
+worker: python crypto-bot/bot_alpaca.py
