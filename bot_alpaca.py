@@ -223,14 +223,39 @@ async def list_assets(asset_class: str) -> List[str]:
         syms.append(s)
     return syms
 
-# -------- DATA: crypto & stocks bars --------
-async def get_bars_crypto(pairs: List[str], timeframe: str, limit: int = 120) -> Dict[str, Any]:
+# ===== Helpers for symbols & timeframe =====
+def map_tf(tf: str) -> str:
+    """Alpaca Data API не приймає 60Min — треба 1Hour."""
+    t = (tf or "").strip()
+    return "1Hour" if t.lower() in ("60min", "60", "1h", "60мин", "60мін") else t
+
+def to_order_sym(sym: str) -> str:
+    """У формат символу для торгів: AAVE/USD -> AAVEUSD, 'aapl' -> AAPL."""
+    return sym.replace("/", "").upper()
+
+def to_data_sym(sym: str) -> str:
+    """У формат символу для Data API:
+       - 'BTC/USD', 'ETH/USD' залишаємо як є;
+       - 'AAVEUSD' -> 'AAVE/USD';
+       - 'AAVE' або інше без суфікса не чіпаємо.
     """
-    v1beta3 /crypto/us/bars — ОБОВʼЯЗКОВО з symbols у форматі 'BTC/USD,ETH/USD,...'
-    timeframe: '1Min','5Min','15Min','30Min','1Hour','1Day' (60Min -> 1Hour через map_tf)
-    """
+    s = sym.replace(" ", "").upper()
+    if "/" in s:
+        return s
+    if s.endswith("USD"):
+        return s[:-3] + "/USD"
+    return s
+
+def is_crypto_sym(sym: str) -> bool:
+    """Грубо: криптопара має вигляд 'XXX/USD'."""
+    return "/" in (sym or "")
+
+# ===== Data fetchers (AIOHTTP) =====
+async def get_bars_crypto(pairs: list[str], timeframe: str, limit: int = 120) -> dict:
+    """/v1beta3/crypto/us/bars  symbols: 'BTC/USD,ETH/USD,...'"""
     tf = map_tf(timeframe)
-    syms = ",".join([to_data_sym(p) for p in pairs])  # 'BTC/USD,ETH/USD,...'
+    symbols = [to_data_sym(p) for p in pairs]           # BTC/USD формат
+    syms = ",".join(symbols)
     path = "/v1beta3/crypto/us/bars"
     params = {"symbols": syms, "timeframe": tf, "limit": str(limit), "sort": "asc"}
 
@@ -242,14 +267,12 @@ async def get_bars_crypto(pairs: List[str], timeframe: str, limit: int = 120) ->
                 raise RuntimeError(f"GET {url} {r.status}: {txt}")
             return json.loads(txt) if txt else {}
 
-
-async def get_bars_stocks(symbols: List[str], timeframe: str, limit: int = 120) -> Dict[str, Any]:
-    """
-    v2 /stocks/bars — ОБОВʼЯЗКОВО з symbols у форматі 'AAPL,MSFT,...'
-    timeframe: '1Min','5Min','15Min','30Min','1Hour','1Day' (60Min -> 1Hour через map_tf)
-    """
+async def get_bars_stocks(symbols: list[str], timeframe: str, limit: int = 120) -> dict:
+    """/v2/stocks/bars  symbols: 'AAPL,MSFT,...'"""
     tf = map_tf(timeframe)
-    syms = ",".join([to_order_sym(s) for s in symbols])  # 'AAPL,MSFT,...'
+    syms = ",".join([to_order_sym(s) for s in symbols]) # без слеша
+    if not syms:
+        raise ValueError("symbols list is empty for get_bars_stocks()")
     path = "/v2/stocks/bars"
     params = {"symbols": syms, "timeframe": tf, "limit": str(limit), "sort": "asc"}
 
