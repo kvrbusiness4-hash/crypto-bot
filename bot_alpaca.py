@@ -295,7 +295,8 @@ async def main():
     # Стартуємо фоновий сканер через JobQueue — НІЯКИХ проблем із event loop
     app.job_queue.run_repeating(periodic_scan_job, interval=SCAN_EVERY_SEC, first=10)
 
-    await app.run_polling(close_loop=False)
+    await app.run_polling()
 
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
