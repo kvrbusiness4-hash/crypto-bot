@@ -3,6 +3,7 @@
 
 import os
 import json
+import aiohttp
 from typing import Dict, Any, Tuple, List
 
 from aiohttp import ClientSession, ClientTimeout
