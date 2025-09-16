@@ -2,39 +2,45 @@
 # -*- coding: utf-8 -*-
 
 import os
+import time
 import json
-from typing import Dict, Any, Tuple, List, Optional
+from typing import Dict, Any, Tuple, List
 
 from aiohttp import ClientSession, ClientTimeout
 
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
+    CallbackQueryHandler,
     ContextTypes,
 )
 
 # =========================
 # ENV
 # =========================
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or os.getenv("TELEGRAM_TOKEN", "").strip()
+TG_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN", "") or os.getenv("TELEGRAM_TOKEN", "")).strip()
 
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "").strip()
 ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET", "").strip()
 
-# базові URL (без зайвих слешів у кінці)
+# Базові url (БЕЗ /v2 в кінці)
 ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
-ALPACA_DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
+# v1beta3 crypto також іде через paper-api (на paper)
+CRYPTO_EXCHANGE = "us"  # роут для v1beta3 крипти
 
-# налаштування
-ALPACA_NOTIONAL = float(os.getenv("ALPACA_NOTIONAL", "50") or 50.0)     # $ на ордер
-ALPACA_MAX_STOCKS = int(os.getenv("ALPACA_MAX_STOCKS", "0") or 0)       # скільки акцій купувати (0 = не купуємо)
-ALPACA_MAX_CRYPTO = int(os.getenv("ALPACA_MAX_CRYPTO", "50") or 50)     # скільки crypto купувати
-SCAN_EVERY_SEC = int(os.getenv("SCAN_EVERY_SEC", "120") or 120)
+ALPACA_NOTIONAL = float(os.getenv("ALPACA_NOTIONAL", "25") or 25.0)
+
+# Налаштування сканера/відбору
+MAX_PAIRS = int(os.getenv("MAX_PAIRS", "12") or 12)               # скільки показати в дайджесті
+SYMBOL_BLACKLIST = {s.strip().upper() for s in (os.getenv("SYMBOL_BLACKLIST", "USDT,USDC").split(","))}
+TIMEOUT = ClientTimeout(total=30)
 
 # =========================
 # СТАН НА ЧАТ
@@ -44,10 +50,13 @@ def default_state() -> Dict[str, Any]:
         "autotrade": False,
         "mode": "default",
         "last_scan_txt": "",
+        "last_posted_at": {},
+        "pending_side": "buy",       # напрямок для підтвердження
+        "pending_syms": [],          # підготовлені символи (ТОП-5)
+        "pending_kind": "crypto",    # "crypto" або "stocks"
     }
 
 STATE: Dict[int, Dict[str, Any]] = {}
-
 def stedef(chat_id: int) -> Dict[str, Any]:
     return STATE.setdefault(chat_id, default_state())
 
@@ -56,15 +65,22 @@ def stedef(chat_id: int) -> Dict[str, Any]:
 # =========================
 def main_keyboard() -> ReplyKeyboardMarkup:
     rows = [
+        ["/signals_crypto", "/signals_stocks"],   # окремо крипта / акції
         ["/aggressive", "/scalp", "/default"],
         ["/swing", "/safe", "/help"],
-        ["/signals_alpaca"],
         ["/alp_on", "/alp_status", "/alp_off"],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
+def confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Торгувати 3", callback_data="trade:3"),
+         InlineKeyboardButton("✅ Торгувати 5", callback_data="trade:5")],
+        [InlineKeyboardButton("❌ Скасувати", callback_data="trade:0")]
+    ])
+
 # =========================
-# HTTP helpers
+# Alpaca helpers
 # =========================
 def alp_headers() -> Dict[str, str]:
     return {
@@ -73,136 +89,156 @@ def alp_headers() -> Dict[str, str]:
         "Content-Type": "application/json",
     }
 
-def trade_url(path: str) -> str:
+def alp_url_v2(path: str) -> str:
     path = path.lstrip("/")
     return f"{ALPACA_BASE_URL}/v2/{path}"
 
-def data_url(path: str) -> str:
-    path = path.lstrip("/")
-    return f"{ALPACA_DATA_URL}/{path}"
-
-async def http_get_json(session: ClientSession, url: str, params: Optional[Dict[str, Any]] = None) -> Any:
-    async with session.get(url, headers=alp_headers(), params=params, timeout=ClientTimeout(total=30)) as r:
+async def alp_get_v2(session: ClientSession, path: str):
+    async with session.get(alp_url_v2(path), headers=alp_headers(), timeout=TIMEOUT) as r:
         if r.status >= 400:
-            txt = await r.text()
-            raise RuntimeError(f"GET {r.url} {r.status}: {txt}")
+            raise RuntimeError(f"Alpaca GET {r.url} {r.status}: {await r.text()}")
         return await r.json()
 
-async def http_post_json(session: ClientSession, url: str, payload: Dict[str, Any]) -> Any:
-    async with session.post(url, headers=alp_headers(), data=json.dumps(payload), timeout=ClientTimeout(total=30)) as r:
+async def alp_post_v2(session: ClientSession, path: str, payload: Dict[str, Any]):
+    async with session.post(alp_url_v2(path), headers=alp_headers(),
+                            data=json.dumps(payload), timeout=TIMEOUT) as r:
         if r.status >= 400:
-            txt = await r.text()
-            raise RuntimeError(f"POST {r.url} {r.status}: {txt}")
+            raise RuntimeError(f"Alpaca POST {r.url} {r.status}: {await r.text()}")
         return await r.json()
 
-# =========================
-# Alpaca trading API
-# =========================
 async def alp_account() -> Dict[str, Any]:
-    async with ClientSession() as s:
-        return await http_get_json(s, trade_url("account"))
+    async with ClientSession(timeout=TIMEOUT) as s:
+        return await alp_get_v2(s, "account")
 
 async def place_notional_order(symbol: str, side: str, notional: float) -> Dict[str, Any]:
     payload = {
         "symbol": symbol,
-        "side": side,                 # "buy" | "sell"
+        "side": side,                   # "buy" | "sell"
         "type": "market",
         "time_in_force": "gtc",
         "notional": str(float(notional)),
     }
-    async with ClientSession() as s:
-        return await http_post_json(s, trade_url("orders"), payload)
+    async with ClientSession(timeout=TIMEOUT) as s:
+        return await alp_post_v2(s, "orders", payload)
+
+async def fetch_json_full(url: str) -> Any:
+    async with ClientSession(timeout=TIMEOUT) as s:
+        async with s.get(url, headers=alp_headers(), timeout=TIMEOUT) as r:
+            if r.status >= 400:
+                raise RuntimeError(f"GET {url} {r.status}: {await r.text()}")
+            return await r.json()
 
 # =========================
-# DATA: список усіх активних crypto
+# СКАНЕРИ (ранжування)
 # =========================
-async def fetch_active_crypto_symbols(limit: int = 2000) -> List[str]:
+async def scan_crypto_top() -> List[Tuple[str, float]]:
     """
-    Тягнемо всі активні крипто-символи через ОФІЦІЙНИЙ endpoint:
-      GET https://data.alpaca.markets/v2/assets?asset_class=crypto&status=active
+    Повертає список (symbol, strength), де strength — |% зміна за добу| з dailyBar snapshot’у.
+    Беремо тільки USD-коти, ігноруємо стейбли з чорного списку.
     """
-    out: List[str] = []
-    async with ClientSession() as s:
-        resp = await http_get_json(s, data_url("v2/assets"), params={"asset_class": "crypto", "status": "active"})
-        # віддає масив активів; беремо поле symbol
-        for a in resp:
-            sym = a.get("symbol")
-            if sym:
-                out.append(sym)
-                if len(out) >= limit:
-                    break
+    out: List[Tuple[str, float]] = []
+
+    # 1) активні крипто-асети
+    assets_url = f"{ALPACA_BASE_URL}/v1beta3/crypto/{CRYPTO_EXCHANGE}/assets?status=active"
+    assets = await fetch_json_full(assets_url)
+    symbols: List[str] = []
+    for a in assets.get("assets", []):
+        sym = a.get("symbol", "").upper()
+        if not sym or "/USD" not in sym:
+            continue
+        if any(b in sym for b in SYMBOL_BLACKLIST):
+            continue
+        symbols.append(sym)
+
+    symbols = sorted(set(symbols))[:300]  # safety cap
+
+    # 2) поштучні snapshots (простий і сумісний варіант)
+    for sym in symbols:
+        try:
+            snaps_url = f"{ALPACA_BASE_URL}/v1beta3/crypto/{CRYPTO_EXCHANGE}/snapshots?symbols={sym}"
+            js = await fetch_json_full(snaps_url)
+            # ключ у відповіді — URL-encoded символ, але у більшості розгортань доступний і plain
+            snap = (js.get("snapshots") or {}).get(sym) or next(iter((js.get("snapshots") or {}).values()), None)
+            chg = 0.0
+            if snap and snap.get("dailyBar"):
+                o = float(snap["dailyBar"].get("o", 0) or 0)
+                c = float(snap["dailyBar"].get("c", 0) or 0)
+                if o > 0:
+                    chg = abs((c - o) / o * 100.0)
+            out.append((sym, chg))
+        except Exception:
+            out.append((sym, 0.0))
+
+    out.sort(key=lambda x: x[1], reverse=True)
+    return out
+
+async def scan_stocks_top() -> List[Tuple[str, float]]:
+    """
+    Базове ранжування акцій: активні US-equity, tradable.
+    strength = 2 якщо marginable & shortable, інакше 1. Сортуємо за strength.
+    """
+    out: List[Tuple[str, float]] = []
+    async with ClientSession(timeout=TIMEOUT) as s:
+        data = await alp_get_v2(s, "assets?status=active&asset_class=us_equity")
+        for a in data:
+            if not a.get("tradable"):
+                continue
+            sym = a.get("symbol", "").upper()
+            strength = 2.0 if (a.get("marginable") and a.get("shortable")) else 1.0
+            out.append((sym, strength))
+    out.sort(key=lambda x: (x[1], x[0]), reverse=True)
     return out
 
 # =========================
-# СКАНЕР (демо-логіка: просто тягнемо весь список crypto)
-# =========================
-async def scan_all(st: Dict[str, Any]) -> Tuple[str, List[str], List[str]]:
-    crypto = await fetch_active_crypto_symbols()
-    crypto_sorted = sorted(set(crypto))
-    # picks: просто перші N (щоб не палити депозит без твоїх фільтрів)
-    picks_c = crypto_sorted[:ALPACA_MAX_CRYPTO] if ALPACA_MAX_CRYPTO > 0 else []
-    # акції наразі не скануємо
-    picks_s: List[str] = []
-
-    rep_lines = [
-        "🛰 Сканер Alpaca:",
-        f"• Усього активних crypto: {len(crypto_sorted)}",
-        f"• Буде використано для торгівлі (за лімітом): {len(picks_c)}",
-    ]
-    if picks_c:
-        sample = ", ".join(picks_c[:25])
-        rep_lines.append(f"• Перші {min(25, len(picks_c))}: {sample}")
-    report = "\n".join(rep_lines)
-    return report, picks_s, picks_c
-
-# =========================
-# КОМАНДИ
+# КОМАНДИ: режими/статус/он-оф
 # =========================
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     stedef(u.effective_chat.id)
-    txt = (
-        "👋 Готово. Бот видає сигнали та (за бажанням) ставить ордери в **Alpaca**.\n"
-        "• /alp_on — увімкнути автотрейд\n"
-        "• /alp_off — вимкнути автотрейд\n"
-        "• /alp_status — стан акаунту\n"
-        "• /signals_alpaca — ручний скан зараз\n\n"
-        "Крипта торгується 24/7."
+    await u.message.reply_text(
+        "👋 Готово. Вибери скан:\n"
+        "• /signals_crypto — крипто (USD-коти)\n"
+        "• /signals_stocks — акції US\n\n"
+        "Після скану підтвердь кнопку «Торгувати 3/5».",
+        reply_markup=main_keyboard(),
     )
-    await u.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=main_keyboard())
+
+async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    await u.message.reply_text(
+        "Команди:\n"
+        "• /signals_crypto — скан крипти\n"
+        "• /signals_stocks — скан акцій\n"
+        "• /alp_on /alp_off — автотрейд прапорець (для майбутнього)\n"
+        "• /alp_status — стан акаунту\n"
+        "• /aggressive /scalp /default /swing /safe — режим профілю (інформ.)",
+        reply_markup=main_keyboard(),
+    )
 
 async def aggressive_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    st = stedef(u.effective_chat.id)
-    st["mode"] = "aggressive"
+    stedef(u.effective_chat.id)["mode"] = "aggressive"
     await u.message.reply_text("✅ Mode: AGGRESSIVE", reply_markup=main_keyboard())
 
 async def scalp_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    st = stedef(u.effective_chat.id)
-    st["mode"] = "scalp"
+    stedef(u.effective_chat.id)["mode"] = "scalp"
     await u.message.reply_text("✅ Mode: SCALP", reply_markup=main_keyboard())
 
 async def default_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    st = stedef(u.effective_chat.id)
-    st["mode"] = "default"
+    stedef(u.effective_chat.id)["mode"] = "default"
     await u.message.reply_text("✅ Mode: DEFAULT", reply_markup=main_keyboard())
 
 async def swing_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    st = stedef(u.effective_chat.id)
-    st["mode"] = "swing"
+    stedef(u.effective_chat.id)["mode"] = "swing"
     await u.message.reply_text("✅ Mode: SWING", reply_markup=main_keyboard())
 
 async def safe_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    st = stedef(u.effective_chat.id)
-    st["mode"] = "safe"
+    stedef(u.effective_chat.id)["mode"] = "safe"
     await u.message.reply_text("✅ Mode: SAFE", reply_markup=main_keyboard())
 
 async def alp_on_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    st = stedef(u.effective_chat.id)
-    st["autotrade"] = True
+    stedef(u.effective_chat.id)["autotrade"] = True
     await u.message.reply_text("✅ Alpaca AUTOTRADE: ON", reply_markup=main_keyboard())
 
 async def alp_off_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    st = stedef(u.effective_chat.id)
-    st["autotrade"] = False
+    stedef(u.effective_chat.id)["autotrade"] = False
     await u.message.reply_text("⏹ Alpaca AUTOTRADE: OFF", reply_markup=main_keyboard())
 
 async def alp_status_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
@@ -219,65 +255,70 @@ async def alp_status_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         txt = f"❌ Alpaca error: {e}"
     await u.message.reply_text(txt, reply_markup=main_keyboard())
 
-async def signals_alpaca_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    st = stedef(u.effective_chat.id)
-    try:
-        rep, picks_s, picks_c = await scan_all(st)
-        st["last_scan_txt"] = rep
-
-        # надсилаємо звіт (порціями, щоб не впертися в ліміт)
-        chunks = [rep[i:i+3500] for i in range(0, len(rep), 3500)] or [rep]
-        for ch in chunks:
-            await u.message.reply_text(ch, parse_mode=ParseMode.MARKDOWN)
-
-        # автотрейд
-        if st.get("autotrade"):
-            bought = 0
-            for sym in picks_c:
-                try:
-                    await place_notional_order(sym, "buy", ALPACA_NOTIONAL)
-                    bought += 1
-                    await u.message.reply_text(f"🟢 ORDER OK: {sym} ${ALPACA_NOTIONAL:.2f}")
-                except Exception as e:
-                    await u.message.reply_text(f"🔴 ORDER FAIL {sym}: {e}")
-            if bought == 0:
-                await u.message.reply_text("ℹ️ Немає обраних символів для купівлі (перевір ліміти).")
-    except Exception as e:
-        await u.message.reply_text(f"🔴 scan error: {e}")
-
 # =========================
-# ФОНОВИЙ СКАНЕР (через JobQueue)
+# СКАН + ПІДТВЕРДЖЕННЯ
 # =========================
-async def periodic_scan_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    for chat_id, st in list(STATE.items()):
-        try:
-            rep, picks_s, picks_c = await scan_all(st)
-            st["last_scan_txt"] = rep
-            if st.get("autotrade") and picks_c:
-                for sym in picks_c:
-                    try:
-                        await place_notional_order(sym, "buy", ALPACA_NOTIONAL)
-                        await ctx.bot.send_message(chat_id, f"🟢 ORDER OK: {sym} ${ALPACA_NOTIONAL:.2f}")
-                    except Exception as e:
-                        await ctx.bot.send_message(chat_id, f"🔴 ORDER FAIL {sym}: {e}")
-        except Exception as e:
-            try:
-                await ctx.bot.send_message(chat_id, f"🔴 periodic_scan error: {e}")
-            except Exception:
-                pass
-
-# =========================
-# HELP
-# =========================
-async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+async def send_digest(u: Update, title: str, ranked: List[Tuple[str, float]]):
+    preview = "\n".join([f"{i+1:>2}. {sym}  (★ {strength:.2f})"
+                         for i, (sym, strength) in enumerate(ranked[:MAX_PAIRS])]) or "—"
     await u.message.reply_text(
-        "Команди:\n"
-        "• /alp_on, /alp_off, /alp_status\n"
-        "• /signals_alpaca — ручний скан\n"
-        "• /aggressive /scalp /default /swing /safe — режим профілю\n"
-        "Сканер крипти працює 24/7.",
-        reply_markup=main_keyboard()
+        f"🛰 {title}\nТОП {min(MAX_PAIRS, len(ranked))}:\n{preview}\n\n"
+        f"Натисни, щоб підтвердити угоди.",
+        reply_markup=confirm_kb()
     )
+
+async def signals_crypto(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st = stedef(u.effective_chat.id)
+    ranked = await scan_crypto_top()
+    st["pending_kind"] = "crypto"
+    st["pending_syms"] = [sym for sym, _ in ranked[:5]]  # запас до 5
+    st["pending_side"] = "buy"
+    await send_digest(u, "Крипто (USD-коти): сила за добовою волатильністю", ranked)
+
+async def signals_stocks(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st = stedef(u.effective_chat.id)
+    ranked = await scan_stocks_top()
+    st["pending_kind"] = "stocks"
+    st["pending_syms"] = [sym for sym, _ in ranked[:5]]
+    st["pending_side"] = "buy"
+    await send_digest(u, "Акції US-equity: базовий рейтинг", ranked)
+
+async def on_trade_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    st = stedef(q.message.chat_id)
+
+    try:
+        _, n_str = q.data.split(":")
+        take = int(n_str)
+    except Exception:
+        take = 0
+
+    if take <= 0:
+        await q.edit_message_text("Скасовано.")
+        st["pending_syms"] = []
+        return
+
+    syms = st.get("pending_syms", [])[:take]
+    if not syms:
+        await q.edit_message_text("Немає підготовлених символів.")
+        return
+
+    side = st.get("pending_side", "buy")
+    ok = 0
+    fail = 0
+    for sym in syms:
+        try:
+            await place_notional_order(sym, side, ALPACA_NOTIONAL)
+            ok += 1
+            st["last_posted_at"][sym] = int(time.time())
+            await context.bot.send_message(q.message.chat_id, f"🟢 ORDER OK: {sym} ${ALPACA_NOTIONAL:.2f}")
+        except Exception as e:
+            fail += 1
+            await context.bot.send_message(q.message.chat_id, f"🔴 ORDER FAIL {sym}: {e}")
+
+    await q.edit_message_text(f"Готово. Успішно: {ok}, помилок: {fail}.")
+    st["pending_syms"] = []
 
 # =========================
 # MAIN
@@ -288,7 +329,7 @@ def main():
 
     app = Application.builder().token(TG_TOKEN).build()
 
-    # handlers
+    # базові команди
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
 
@@ -301,12 +342,15 @@ def main():
     app.add_handler(CommandHandler("alp_on", alp_on_cmd))
     app.add_handler(CommandHandler("alp_off", alp_off_cmd))
     app.add_handler(CommandHandler("alp_status", alp_status_cmd))
-    app.add_handler(CommandHandler("signals_alpaca", signals_alpaca_cmd))
 
-    # фонова задача
-    app.job_queue.run_repeating(periodic_scan_job, interval=SCAN_EVERY_SEC, first=5)
+    # скани
+    app.add_handler(CommandHandler("signals_crypto", signals_crypto))
+    app.add_handler(CommandHandler("signals_stocks", signals_stocks))
 
-    # запуск
+    # підтвердження
+    app.add_handler(CallbackQueryHandler(on_trade_confirm, pattern=r"^trade:\d+$"))
+
+    # запуск (без asyncio.run/await)
     app.run_polling()
 
 if __name__ == "__main__":
