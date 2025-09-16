@@ -11,7 +11,143 @@ from aiohttp import ClientSession, ClientTimeout
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
+# ==== GLOBAL STATE (встав під імпортами) ====
+OPEN_TRADES: Dict[str, Dict[str, Any]] = {}  # активні угоди по символу
 
+
+# ==== SL/TP розрахунок (встав поруч з іншими хелперами) ====
+def calc_sl_tp(px: float, hi: float, lo: float, conf: Dict[str, Any]) -> Tuple[float, float]:
+    """
+    Розрахунок TP/SL на основі режиму:
+      - tp_pct / sl_pct з MODE_PARAMS
+      - додатково врахуємо локальний діапазон (hi/lo) як підстраховку
+    Повертає: (tp_price, sl_price)
+    """
+    tp_pct = float(conf.get("tp_pct", 0.015))  # 1.5% за замовчуванням
+    sl_pct = float(conf.get("sl_pct", 0.008))  # 0.8% за замовчуванням
+
+    tp_price = round(px * (1.0 + tp_pct), 6)
+    sl_price = round(px * (1.0 - sl_pct), 6)
+
+    # підстрахуємося від «занадто близько»: SL нижче локального low щонайменше на тик
+    if lo is not None:
+        sl_price = min(sl_price, round(lo * 0.999, 6))
+    # TP вище локального high трохи
+    if hi is not None:
+        tp_price = max(tp_price, round(hi * 1.001, 6))
+
+    return tp_price, sl_price
+
+
+# ==== HTTP-створення BRACKET-ордера (встав поруч з іншими Alpaca-хелперами) ====
+async def place_bracket_notional_order(sym: str, notional: float, tp: float, sl: float) -> Dict[str, Any]:
+    """
+    LONG bracket order для crypto на Alpaca (paper):
+      POST /v2/orders з order_class="bracket", notional, take_profit, stop_loss.
+    """
+    url = f"{ALPACA_BASE_URL}/v2/orders"
+    payload = {
+        "symbol": sym.replace("/", ""),  # "AAVEUSD"
+        "side": "buy",
+        "type": "market",
+        "time_in_force": "gtc",
+        "notional": f"{notional:.2f}",
+        "order_class": "bracket",
+        "take_profit": {"limit_price": f"{tp:.6f}"},
+        "stop_loss": {"stop_price": f"{sl:.6f}"}
+    }
+    headers = {
+        "APCA-API-KEY-ID": ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_API_SECRET,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    async with ClientSession(timeout=ClientTimeout(total=30)) as s:
+        async with s.post(url, headers=headers, json=payload) as r:
+            data = await r.json()
+            if r.status >= 300:
+                raise RuntimeError(f"POST {url} {r.status}: {data}")
+            return data
+
+
+# ==== СКАНЕР/РАНКЕР (залиш свій, якщо вже працює) ====
+
+
+# ==== /signals_crypto — СКАН + АВТОТРЕЙД TOP-N з TP/SL (повністю заміни) ====
+async def signals_crypto(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    st = stedet(u.effective_chat.id)
+    try:
+        # отримуємо ранжований список (твоя функція ранжування)
+        report, ranked = await scan_rank_crypto(st)
+        await u.message.reply_text(report)
+
+        # якщо автотрейд увімкнено — торгуємо TOP-N (LONG only)
+        if st.get("autotrade") and ranked:
+            conf = mode_conf(st)
+            top_n = min(int(conf.get("top_n", 3)), len(ranked))
+            picks = ranked[:top_n]
+
+            for _, sym, raw in picks:
+                # антидубль: не відкриваємо ще раз ту ж саму пару
+                if sym in OPEN_TRADES:
+                    await u.message.reply_text(f"⏩ Пропуск {sym}: вже відкрита позиція")
+                    continue
+
+                h = [float(x["h"]) for x in raw]
+                l = [float(x["l"]) for x in raw]
+                ccls = [float(x["c"]) for x in raw]
+                px = ccls[-1]
+
+                tp, sl = calc_sl_tp(px, max(h), min(l), conf)
+
+                try:
+                    resp = await place_bracket_notional_order(sym, ALPACA_NOTIONAL, tp, sl)
+                    OPEN_TRADES[sym] = {"entry": px, "tp": tp, "sl": sl, "order_id": resp.get("id")}
+                    await u.message.reply_text(
+                        f"🟢 ORDER OK: {sym} BUY ${ALPACA_NOTIONAL:.2f}\nTP: {tp:.6f}  ·  SL: {sl:.6f}"
+                    )
+                except Exception as e:
+                    await u.message.reply_text(f"🔴 ORDER FAIL {sym}: {e}")
+    except Exception as e:
+        await u.message.reply_text(f"🔴 signals_crypto error: {e}")
+
+
+# ==== /trade_crypto — миттєва торгівля TOP-N з TP/SL (повністю заміни) ====
+async def trade_crypto(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    st = stedet(u.effective_chat.id)
+    try:
+        # беремо TOP-N з уже відсортованого списку (без повторного звіту)
+        _, ranked = await scan_rank_crypto(st)
+        if not ranked:
+            await u.message.reply_text("⚠️ Сигналів недостатньо"); return
+
+        conf = mode_conf(st)
+        top_n = min(int(conf.get("top_n", 3)), len(ranked))
+        picks = ranked[:top_n]
+
+        for _, sym, raw in picks:
+            if sym in OPEN_TRADES:
+                await u.message.reply_text(f"⏩ Пропуск {sym}: вже відкрита позиція")
+                continue
+
+            h = [float(x["h"]) for x in raw]
+            l = [float(x["l"]) for x in raw]
+            ccls = [float(x["c"]) for x in raw]
+            px = ccls[-1]
+
+            tp, sl = calc_sl_tp(px, max(h), min(l), conf)
+
+            try:
+                resp = await place_bracket_notional_order(sym, ALPACA_NOTIONAL, tp, sl)
+                OPEN_TRADES[sym] = {"entry": px, "tp": tp, "sl": sl, "order_id": resp.get("id")}
+                await u.message.reply_text(
+                    f"🟢 ORDER OK: {sym} BUY ${ALPACA_NOTIONAL:.2f}\nTP: {tp:.6f}  ·  SL: {sl:.6f}"
+                )
+            except Exception as e:
+                await u.message.reply_text(f"🔴 ORDER FAIL {sym}: {e}")
+
+    except Exception as e:
+        await u.message.reply_text(f"🔴 trade_crypto error: {e}")
 # ========= ENV =========
 TG_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or "").strip()
 
