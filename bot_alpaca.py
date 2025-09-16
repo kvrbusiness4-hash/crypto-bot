@@ -104,6 +104,10 @@ def map_tf(tf: str) -> str:
 def to_order_sym(sym: str) -> str:
     return sym.replace("/", "").upper()
 
+def is_crypto_sym(sym: str) -> bool:
+    """Криптопара має вигляд 'BTC/USD' тощо."""
+    return "/" in (sym or "")
+
 def to_data_sym(sym: str) -> str:
     s = sym.replace(" ", "").upper()
     if "/" in s:
@@ -322,18 +326,31 @@ async def scan_rank_stocks(st: Dict[str, Any]) -> Tuple[str, List[Tuple[float, s
     return rep, ranked
 
 # -------- ORDERS --------
-async def place_bracket_notional_order(sym: str, side: str, notional: float, tp: float | None, sl: float | None) -> Any:
+async def place_bracket_notional_order(sym: str, side: str, notional: float,
+                                       tp: float | None, sl: float | None) -> Any:
+    """
+    Для крипти: GTC + TP/SL (bracket).
+    Для акцій (фракційний нотіонал): тільки DAY без TP/SL (Alpaca цього вимагає).
+    """
     payload = {
         "symbol": to_order_sym(sym),
         "side": side,
         "type": "market",
-        "time_in_force": "gtc",
-        "notional": str(notional),
+        "notional": f"{notional:.2f}",
     }
-    if tp:
-        payload["take_profit"] = {"limit_price": f"{tp:.6f}"}
-    if sl:
-        payload["stop_loss"] = {"stop_price": f"{sl:.6f}"}
+
+    if is_crypto_sym(sym):
+        # crypto дозволяє GTC і bracket з tp/sl
+        payload["time_in_force"] = "gtc"
+        if tp is not None:
+            payload["take_profit"] = {"limit_price": f"{tp:.6f}"}
+        if sl is not None:
+            payload["stop_loss"] = {"stop_price": f"{sl:.6f}"}
+    else:
+        # equities (фракційні/нотіонал): лише DAY і без bracket
+        payload["time_in_force"] = "day"
+        # навмисно НЕ додаємо take_profit/stop_loss — інакше буде 422
+
     return await alp_post_json("/v2/orders", payload)
 
 def calc_sl_tp(side: str, price: float, conf: Dict[str, Any]) -> Tuple[float | None, float | None]:
