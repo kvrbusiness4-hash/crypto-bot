@@ -223,20 +223,43 @@ async def list_assets(asset_class: str) -> List[str]:
         syms.append(s)
     return syms
 
-# -------- DATA: bars --------
-async def get_bars_crypto(pairs: List[str], timeframe: str, limit: int = 200) -> Dict[str, Any]:
+# -------- DATA: crypto & stocks bars --------
+async def get_bars_crypto(pairs: List[str], timeframe: str, limit: int = 120) -> Dict[str, Any]:
+    """
+    v1beta3 /crypto/us/bars — ОБОВʼЯЗКОВО з symbols у форматі 'BTC/USD,ETH/USD,...'
+    timeframe: '1Min','5Min','15Min','30Min','1Hour','1Day' (60Min -> 1Hour через map_tf)
+    """
     tf = map_tf(timeframe)
-    batch = ",".join(pairs)
-    path = f"/v1beta3/crypto/us/bars"
-    params = {"symbols": batch, "timeframe": tf, "limit": str(limit), "sort": "asc"}
-    return await alp_get_json(path, params=params)
+    syms = ",".join([to_data_sym(p) for p in pairs])  # 'BTC/USD,ETH/USD,...'
+    path = "/v1beta3/crypto/us/bars"
+    params = {"symbols": syms, "timeframe": tf, "limit": str(limit), "sort": "asc"}
 
-async def get_bars_stocks(symbols: List[str], timeframe: str, limit: int = 200) -> Dict[str, Any]:
+    async with ClientSession(timeout=ClientTimeout(total=30)) as s:
+        url = f"{ALPACA_DATA_URL}{path}"
+        async with s.get(url, headers=_alp_headers(), params=params) as r:
+            txt = await r.text()
+            if r.status >= 400:
+                raise RuntimeError(f"GET {url} {r.status}: {txt}")
+            return json.loads(txt) if txt else {}
+
+
+async def get_bars_stocks(symbols: List[str], timeframe: str, limit: int = 120) -> Dict[str, Any]:
+    """
+    v2 /stocks/bars — ОБОВʼЯЗКОВО з symbols у форматі 'AAPL,MSFT,...'
+    timeframe: '1Min','5Min','15Min','30Min','1Hour','1Day' (60Min -> 1Hour через map_tf)
+    """
     tf = map_tf(timeframe)
-    batch = ",".join(symbols)
-    path = f"/v2/stocks/bars"
-    params = {"symbols": batch, "timeframe": tf, "limit": str(limit), "sort": "asc", "adjustment": "split"}
-    return await alp_get_json(path, params=params)
+    syms = ",".join([to_order_sym(s) for s in symbols])  # 'AAPL,MSFT,...'
+    path = "/v2/stocks/bars"
+    params = {"symbols": syms, "timeframe": tf, "limit": str(limit), "sort": "asc"}
+
+    async with ClientSession(timeout=ClientTimeout(total=30)) as s:
+        url = f"{ALPACA_DATA_URL}{path}"
+        async with s.get(url, headers=_alp_headers(), params=params) as r:
+            txt = await r.text()
+            if r.status >= 400:
+                raise RuntimeError(f"GET {url} {r.status}: {txt}")
+            return json.loads(txt) if txt else {}
 
 # -------- DATA: quotes (spread/liquidity proxy) --------
 async def latest_quote_crypto(pairs: List[str]) -> Dict[str, Tuple[float, float]]:
