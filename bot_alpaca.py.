@@ -1,462 +1,464 @@
-# bot.py
-# Telegram смарт-автотрейд бот для Alpaca (stocks + crypto 24/7)
-# Без будь-яких перевірок торгових сесій/годин — завжди сканує й торгує.
-# Залежності: python-telegram-bot>=20, aiohttp
-
+# bot_alpaca.py
 import os
-import csv
-import io
-import math
 import asyncio
-import datetime as dt
-from typing import Dict, List, Tuple, Optional
-
 import aiohttp
+import math
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Tuple, Any
+
 from telegram import (
     Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    KeyboardButton,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    CallbackQueryHandler,
+    Application, CommandHandler, MessageHandler,
+    ContextTypes, filters
 )
 
-# ==========================
-# ENV & константи
-# ==========================
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+# =========================
+# ENV
+# =========================
+TG_TOKEN         = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+ALP_BASE_URL     = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").strip().rstrip("/")
+ALP_DATA_URL     = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets").strip().rstrip("/")
+ALP_KEY          = os.getenv("ALPACA_API_KEY", "").strip()
+ALP_SECRET       = os.getenv("ALPACA_API_SECRET", "").strip()
 
-ALP_BASE = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
-ALP_DATA = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
+ALP_ENABLE       = bool(int(os.getenv("ALPACA_ENABLE", "1")))
+ALP_NOTIONAL     = float(os.getenv("ALPACA_NOTIONAL", "50"))
+MAX_STOCKS       = int(os.getenv("ALPACA_MAX_STOCKS", "150"))
+MAX_CRYPTO       = int(os.getenv("ALPACA_MAX_CRYPTO", "80"))
+SCAN_EVERY_SEC   = int(os.getenv("SCAN_EVERY_SEC", "120"))
 
-ALP_KEY = os.getenv("ALPACA_API_KEY", "").strip()
-ALP_SEC = os.getenv("ALPACA_API_SECRET", "").strip()
+# Data API endpoints
+STOCK_BARS_URL   = f"{ALP_DATA_URL}/v2/stocks/bars"
+# crypto бари – у Alpaca це v1beta3
+CRYPTO_BARS_URL  = f"{ALP_DATA_URL}/v1beta3/crypto/us/bars"
 
-# скільки USD на одну угоду
-NOTIONAL = float(os.getenv("ALPACA_NOTIONAL", "50"))
-# чи дозволено виставляти ордери
-AUTOTRADE_ENABLED_BY_ENV = os.getenv("ALPACA_ENABLE", "1") in ("1", "true", "True")
-# межі для скану
-MAX_STOCKS = int(os.getenv("ALPACA_MAX_STOCKS", "300"))
-MAX_CRYPTO = int(os.getenv("ALPACA_MAX_CRYPTO", "100"))
-
-SIGLOG_PATH = os.getenv("SIGLOG_PATH", "").strip()  # напр. "signals_log.csv" (необов’язково)
-
-HEADERS = {
-    "APCA-API-KEY-ID": ALP_KEY,
-    "APCA-API-SECRET-KEY": ALP_SEC,
-}
-
-# Параметри стратегії за профілями
-PROFILES = {
-    "aggressive": dict(tf="15Min", lookback=48, min_score=0.7),
-    "scalp":      dict(tf="5Min",  lookback=72, min_score=0.8),
-    "default":    dict(tf="15Min", lookback=64, min_score=0.8),
-    "swing":      dict(tf="1Hour", lookback=120, min_score=0.65),
-    "safe":       dict(tf="1Hour", lookback=168, min_score=0.85),
-}
-
-# ==========================
-# Стан на користувача
-# ==========================
-def default_state() -> Dict:
+# =========================
+# Глобальний стан на чати
+# =========================
+def default_state():
     return {
-        "profile": "default",
-        "autotrade": AUTOTRADE_ENABLED_BY_ENV,  # можна поміняти командами /alp_on /alp_off
-        "wl_stocks": [],   # пусто => скануємо ВСІ
-        "wl_crypto": [],   # пусто => скануємо ВСІ
+        "autotrade": False,      # вмикається /alp_on
+        "mode": "default",       # профіль
         "last_scan_txt": "",
+        "last_picks": [],
+        "last_picks_c": [],
+        "limits": {
+            "max_open": 20,      # ліміт позицій
+        }
     }
 
-STATE: Dict[int, Dict] = {}  # chat_id -> state
+STATE: Dict[int, Dict[str, Any]] = {}
 
-
-# ==========================
+# =========================
 # Утиліти
-# ==========================
+# =========================
 def now_utc() -> str:
-    return dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 def fmt_usd(x: float) -> str:
     return f"${x:,.2f}"
 
-def csv_bytes(rows: List[List[str]]) -> bytes:
-    buf = io.StringIO()
-    w = csv.writer(buf)
-    for r in rows:
-        w.writerow(r)
-    return buf.getvalue().encode("utf-8")
-
-
-# ==========================
-# HTTP до Alpaca
-# ==========================
-async def alp_get(session: aiohttp.ClientSession, url: str, params=None):
-    async with session.get(url, headers=HEADERS, params=params, timeout=30) as r:
+async def http_json(session: aiohttp.ClientSession, method: str, url: str, **kw) -> Any:
+    headers = kw.pop("headers", {})
+    headers.update({
+        "APCA-API-KEY-ID": ALP_KEY,
+        "APCA-API-SECRET-KEY": ALP_SECRET,
+        "Content-Type": "application/json"
+    })
+    async with session.request(method, url, headers=headers, **kw) as r:
         if r.status >= 400:
             txt = await r.text()
-            raise RuntimeError(f"GET {url} {r.status}: {txt}")
-        return await r.json()
+            raise RuntimeError(f"{method} {url} -> {r.status}: {txt}")
+        if "application/json" in r.headers.get("Content-Type", ""):
+            return await r.json()
+        return await r.text()
 
-async def alp_post(session: aiohttp.ClientSession, url: str, json=None):
-    async with session.post(url, headers=HEADERS, json=json, timeout=30) as r:
-        if r.status >= 400:
-            txt = await r.text()
-            raise RuntimeError(f"POST {url} {r.status}: {txt}")
-        return await r.json()
+async def alp_account(session: aiohttp.ClientSession) -> Dict[str, Any]:
+    return await http_json(session, "GET", f"{ALP_BASE_URL}/v2/account")
 
+async def alp_clock(session: aiohttp.ClientSession) -> Dict[str, Any]:
+    # повертає {'is_open': bool, ...}
+    return await http_json(session, "GET", f"{ALP_BASE_URL}/v2/clock")
 
-# ==========================
-# Alpaca: акаунт/активи/бари
-# ==========================
-async def alp_account(session: aiohttp.ClientSession) -> Dict:
-    return await alp_get(session, f"{ALP_BASE}/v2/account")
+async def alp_positions(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
+    return await http_json(session, "GET", f"{ALP_BASE_URL}/v2/positions")
 
-async def alp_assets(session: aiohttp.ClientSession) -> Tuple[List[str], List[str]]:
-    """Повертає (tickers_equities, symbols_crypto). Без whitelist — усе активне/торговане."""
-    assets = await alp_get(session, f"{ALP_BASE}/v2/assets", params={"status": "active", "tradable": "true"})
-    stocks, crypto = [], []
+async def alp_orders_open(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
+    return await http_json(session, "GET", f"{ALP_BASE_URL}/v2/orders?status=open&nested=true")
+
+async def alp_submit_order(session: aiohttp.ClientSession, symbol: str, side: str, notional: float) -> Dict[str, Any]:
+    payload = {
+        "symbol": symbol,
+        "side": side,               # "buy" / "sell"
+        "type": "market",
+        "time_in_force": "gtc",
+        "notional": round(notional, 2)
+    }
+    return await http_json(session, "POST", f"{ALP_BASE_URL}/v2/orders", json=payload)
+
+async def fetch_assets(session: aiohttp.ClientSession) -> Tuple[List[str], List[str]]:
+    """Повертає (symbols_stocks, symbols_crypto) без вайтліста."""
+    assets = await http_json(session, "GET", f"{ALP_BASE_URL}/v2/assets?status=active")
+    stocks: List[str] = []
+    crypto: List[str] = []
     for a in assets:
-        c = a.get("class")
-        sym = a.get("symbol")
-        if not sym:
+        if not a.get("tradable"): 
             continue
-        if c == "us_equity":
+        klass = a.get("class") or a.get("asset_class")
+        sym = a.get("symbol", "")
+        if klass == "us_equity":
             stocks.append(sym)
-        elif c == "crypto":
-            # у Alpaca crypto вже формату BTC/USD, ETH/USD і т.д.
-            crypto.append(sym)
-    # обмежуємо верхні межі
-    return stocks[:MAX_STOCKS], crypto[:MAX_CRYPTO]
+        elif klass == "crypto":
+            # торгуємо лише USD (у Alpaca: BTC/USD, ETH/USD, SOL/USD ...)
+            if sym.endswith("/USD"):
+                crypto.append(sym)
+    # обмеження за ENV
+    stocks = stocks[:MAX_STOCKS]
+    crypto = crypto[:MAX_CRYPTO]
+    return stocks, crypto
 
-async def bars_stocks(session: aiohttp.ClientSession, symbols: List[str], tf: str, lookback: int) -> Dict[str, List[Dict]]:
-    """/v2/stocks/bars"""
+# =========================
+# Індікатори
+# =========================
+def sma(values: List[float], window: int) -> float:
+    if len(values) < window:
+        return float("nan")
+    return sum(values[-window:]) / window
+
+def rsi(values: List[float], period: int = 14) -> float:
+    if len(values) <= period:
+        return float("nan")
+    gains, losses = 0.0, 0.0
+    for i in range(len(values)-period, len(values)-1):
+        ch = values[i+1] - values[i]
+        if ch > 0: gains += ch
+        else: losses -= ch
+    if losses == 0:
+        return 100.0
+    rs = gains / losses
+    return 100.0 - (100.0 / (1.0 + rs))
+
+# =========================
+# Дані (bars)
+# =========================
+async def get_stock_bars(session: aiohttp.ClientSession, symbols: List[str], tf="15Min", limit=100) -> Dict[str, List[float]]:
+    """returns {symbol: [closes...]}"""
+    out: Dict[str, List[float]] = {}
     if not symbols:
-        return {}
-    # Alpaca обмежує пачки символів; зробимо батчами по 100
-    out = {}
-    end = dt.datetime.utcnow()
-    start = end - dt.timedelta(minutes=lookback*5 if tf.endswith("Min") else lookback*60)
-    params_template = {
-        "timeframe": tf,
-        "start": start.isoformat() + "Z",
-        "end": end.isoformat() + "Z",
-        "limit": lookback + 2,
-        "adjustment": "all",
-    }
-    for i in range(0, len(symbols), 100):
-        syms = symbols[i:i+100]
-        params = params_template | {"symbols": ",".join(syms)}
-        j = await alp_get(session, f"{ALP_DATA}/v2/stocks/bars", params=params)
-        bars = j.get("bars", {})
-        for k, arr in bars.items():
-            out[k] = arr
+        return out
+
+    # chunks до 50 символів
+    step = 50
+    for i in range(0, len(symbols), step):
+        group = symbols[i:i+step]
+        params = {
+            "symbols": ",".join(group),
+            "timeframe": tf,
+            "limit": str(limit),
+            "adjustment": "raw"
+        }
+        data = await http_json(session, "GET", STOCK_BARS_URL, params=params)
+        bars = data.get("bars", {})
+        for sym, arr in bars.items():
+            closes = [b["c"] for b in arr]
+            if closes:
+                out[sym] = closes
     return out
 
-async def bars_crypto(session: aiohttp.ClientSession, symbols: List[str], tf: str, lookback: int) -> Dict[str, List[Dict]]:
-    """/v1beta3/crypto/us/bars — у Alpaca crypto endpoint інший"""
+async def get_crypto_bars(session: aiohttp.ClientSession, symbols: List[str], tf="15Min", limit=100) -> Dict[str, List[float]]:
+    out: Dict[str, List[float]] = {}
     if not symbols:
-        return {}
-    out = {}
-    end = dt.datetime.utcnow()
-    start = end - dt.timedelta(minutes=lookback*5 if tf.endswith("Min") else lookback*60)
-    params_template = {
-        "timeframe": tf,
-        "start": start.isoformat() + "Z",
-        "end": end.isoformat() + "Z",
-        "limit": lookback + 2,
-    }
-    for i in range(0, len(symbols), 50):
-        syms = symbols[i:i+50]
-        params = params_template | {"symbols": ",".join(syms)}
-        j = await alp_get(session, f"{ALP_DATA}/v1beta3/crypto/us/bars", params=params)
-        bars = j.get("bars", {})
-        for k, arr in bars.items():
-            out[k] = arr
+        return out
+    step = 30
+    for i in range(0, len(symbols), step):
+        group = symbols[i:i+step]
+        params = {
+            "symbols": ",".join(group),
+            "timeframe": tf,
+            "limit": str(limit)
+        }
+        data = await http_json(session, "GET", CRYPTO_BARS_URL, params=params)
+        bars = data.get("bars", {})
+        for sym, arr in bars.items():
+            closes = [b["c"] for b in arr]
+            if closes:
+                out[sym] = closes
     return out
 
-
-# ==========================
-# Оцінка сигналу (дуже проста, але швидка)
-# ==========================
-def score_series(bars: List[Dict]) -> Tuple[float, float]:
-    """
-    Повертає (score, last_price).
-    Score = нормалізована сума двох компонент:
-      1) ап-тренд (SMA(close, n1) < SMA(close, n2) < price)
-      2) моментум (pct_change останніх k барів)
-    """
-    if not bars or len(bars) < 10:
-        return (0.0, 0.0)
-    closes = [b["c"] for b in bars]
-    p = closes[-1]
-    n1, n2, k = 5, 20, 5
-    if len(closes) < max(n2, k) + 1:
-        return (0.0, p)
-    sma1 = sum(closes[-n1:]) / n1
-    sma2 = sum(closes[-n2:]) / n2
-    mom = (closes[-1] / closes[-1-k]) - 1.0
+# =========================
+# Скоринг
+# =========================
+def score_series(closes: List[float]) -> float:
+    """Momentum + RSI + SMA alignment."""
+    if len(closes) < 30:
+        return -1e9
+    mom = (closes[-1] / closes[0]) - 1.0   # за вікно даних
+    r = rsi(closes, 14)
+    s_fast = sma(closes, 10)
+    s_slow = sma(closes, 30)
     trend = 0.0
-    if sma1 > sma2 and p > sma1:
-        trend = 1.0
-    # нормалізація моментуму
-    mom_norm = max(0.0, min(1.0, (mom - 0.0) / 0.03))  # ~3% за k барів = добре
-    score = 0.55*trend + 0.45*mom_norm
-    return (score, p)
+    if not math.isnan(s_fast) and not math.isnan(s_slow):
+        trend = (s_fast - s_slow) / s_slow
+    # штраф за перекупленість
+    overbought_penalty = 0.0
+    if not math.isnan(r) and r > 75:
+        overbought_penalty = -0.02
+    # загальний бал
+    return 0.7*mom + 0.3*trend + overbought_penalty
 
+def pick_best(series: Dict[str, List[float]], top_k=5) -> List[Tuple[str, float]]:
+    scored: List[Tuple[str, float]] = []
+    for sym, closes in series.items():
+        s = score_series(closes)
+        if s != s or s < -1e8:
+            continue
+        scored.append((sym, s))
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[:top_k]
 
-# ==========================
-# Скан & підбір
-# ==========================
-async def scan_universe(state: Dict) -> Tuple[List[Tuple[str,float,float,str]], str]:
-    """
-    Повертає picks = [(symbol, score, price, asset_class), ...] та текст звіту.
-    Без перевірок сесії — просто скануємо все доступне.
-    """
-    profile = PROFILES[state["profile"]]
-    tf = profile["tf"]
-    lookback = profile["lookback"]
-    min_score = profile["min_score"]
+# =========================
+# Торгова логіка
+# =========================
+async def place_orders_if_allowed(
+    session: aiohttp.ClientSession,
+    st: Dict[str, Any],
+    picks: List[Tuple[str, float]],
+    picks_c: List[Tuple[str, float]]
+):
+    if not st.get("autotrade"):
+        return
 
-    wl_s = state.get("wl_stocks", []) or []
-    wl_c = state.get("wl_crypto", []) or []
+    # ліміти / захист
+    positions = await alp_positions(session)
+    open_orders = await alp_orders_open(session)
+    have = {p["symbol"] for p in positions}
+    pending = {o["symbol"] for o in open_orders}
+    total_open = len(have) + len(pending)
+    max_open = st["limits"]["max_open"]
 
-    async with aiohttp.ClientSession() as sess:
-        # 1) активи
-        eq_all, cr_all = await alp_assets(sess)
-        eq = wl_s if wl_s else eq_all
-        cr = wl_c if wl_c else cr_all
+    to_trade: List[str] = []
+    # беремо ТОП по акціях + ТОП по крипті
+    for sym, _ in picks[:3]:
+        to_trade.append(sym)
+    for sym, _ in picks_c[:3]:
+        to_trade.append(sym)
 
-        # 2) бари
-        eq_bars = await bars_stocks(sess, eq, tf, lookback)
-        cr_bars = await bars_crypto(sess, cr, tf, lookback)
+    placed = []
+    for sym in to_trade:
+        if total_open >= max_open:
+            break
+        if sym in have or sym in pending:
+            continue
+        try:
+            resp = await alp_submit_order(session, sym, "buy", ALP_NOTIONAL)
+            placed.append(sym)
+            total_open += 1
+        except Exception as e:
+            # ігноруємо окремі фейли, рухаємось далі
+            pass
 
-    # 3) оцінювання
-    picks: List[Tuple[str,float,float,str]] = []
-    for sym, bars in eq_bars.items():
-        sc, p = score_series(bars)
-        if sc >= min_score and p > 0:
-            picks.append((sym, sc, p, "equity"))
-    for sym, bars in cr_bars.items():
-        sc, p = score_series(bars)
-        if sc >= min_score and p > 0:
-            picks.append((sym, sc, p, "crypto"))
+    return placed
 
-    # сортуємо за скором
-    picks.sort(key=lambda x: x[1], reverse=True)
+# =========================
+# Скан
+# =========================
+async def scan_all(st: Dict[str, Any]) -> Tuple[str, List[Tuple[str,float]], List[Tuple[str,float]]]:
+    txt_lines: List[str] = []
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as s:
+        # статус акаунту
+        acc = await alp_account(s)
+        clk = await alp_clock(s)
+        is_open = bool(clk.get("is_open"))
 
-    # 4) репорт
-    lines = [f"🔎 Профіль: *{state['profile']}* · TF=*{tf}* · Мін.скор={min_score}",
-             f"Активів перевірено: акції {len(eq_bars)} · крипто {len(cr_bars)}",
-             f"Знайдено кандидатів: *{len(picks)}*",
-             ""]
-    for i, (sym, sc, p, cls) in enumerate(picks[:30], 1):
-        lines.append(f"{i:>2}. `{sym}` ({cls}) · score={sc:.2f} · price={fmt_usd(p)}")
-    rep = "\n".join(lines)
-    return picks, rep
+        txt_lines.append(f"📊 Account: status={acc.get('status')} · cash={fmt_usd(float(acc.get('cash',0)))} · buying_power={fmt_usd(float(acc.get('buying_power',0)))}")
+        txt_lines.append(f"🕒 Market open: {'YES' if is_open else 'NO'} · {now_utc()}")
 
+        # активи
+        stocks, crypto = await fetch_assets(s)
+        txt_lines.append(f"🔎 Assets: stocks={len(stocks)} · crypto={len(crypto)}")
 
-# ==========================
-# Виставлення ордерів
-# ==========================
-async def place_orders(state: Dict, chat_id: int, picks: List[Tuple[str,float,float,str]]):
-    """Маркет-ордера по top-n кандидатах (по факту — всі, поки вистачає кешу/правил)."""
-    if not state.get("autotrade", False):
-        return "ℹ️ Autotrade вимкнено — ордери не ставимо."
+        # тягнемо бари
+        bars_s = await get_stock_bars(s, stocks, tf="15Min", limit=60) if stocks else {}
+        bars_c = await get_crypto_bars(s, crypto, tf="15Min", limit=60) if crypto else {}
 
-    async with aiohttp.ClientSession() as sess:
-        acc = await alp_account(sess)
-        cash = float(acc.get("cash", 0.0))
+        # ранжуємо
+        picks_s = pick_best(bars_s, top_k=10 if is_open else 0)  # акції лише якщо відкритий ринок
+        picks_c = pick_best(bars_c, top_k=10)                    # крипта завжди
 
-        placed = []
-        for sym, score, price, cls in picks:
-            if cash < NOTIONAL:
-                break
-            # Алпака приймає crypto символи у форматі BTC/USD як є
-            order = {
-                "symbol": sym,
-                "notional": NOTIONAL,
-                "side": "buy",
-                "type": "market",
-                "time_in_force": "day" if cls == "equity" else "gtc",
-            }
-            try:
-                resp = await alp_post(sess, f"{ALP_BASE}/v2/orders", json=order)
-                oid = resp.get("id", "?")
-                placed.append(f"✅ {sym} ({cls}) {fmt_usd(NOTIONAL)} · id={oid}")
-                cash -= NOTIONAL
-            except Exception as e:
-                placed.append(f"❌ {sym} ({cls}) — {e}")
+        # звіт
+        if picks_s:
+            txt_lines.append("🏛 Top stocks:")
+            for sym, sc in picks_s[:5]:
+                txt_lines.append(f" • {sym}: score={sc:.3f}")
+        else:
+            txt_lines.append("🏛 Top stocks: —")
 
-    txt = ["🛒 Ордери:"]
-    txt.extend(placed if placed else ["(нічого не виставлено)"])
-    return "\n".join(txt)
+        if picks_c:
+            txt_lines.append("💠 Top crypto:")
+            for sym, sc in picks_c[:5]:
+                txt_lines.append(f" • {sym}: score={sc:.3f}")
+        else:
+            txt_lines.append("💠 Top crypto: —")
 
+        # автотрейд
+        placed = await place_orders_if_allowed(s, st, picks_s, picks_c)
+        if placed:
+            txt_lines.append("🟢 Orders placed: " + ", ".join(placed))
+        elif st.get("autotrade"):
+            txt_lines.append("ℹ️ Autotrade ON, але підходящих символів для нових ордерів не знайдено (або ліміти).")
 
-# ==========================
+    rep = "\n".join(txt_lines)
+    return rep, picks_s, picks_c
+
+# =========================
 # Telegram UI
-# ==========================
-def kb_main() -> InlineKeyboardMarkup:
-    rows = [
-        [
-            InlineKeyboardButton("Aggressive", callback_data="prof:aggressive"),
-            InlineKeyboardButton("Scalp",      callback_data="prof:scalp"),
-            InlineKeyboardButton("Default",    callback_data="prof:default"),
-        ],
-        [
-            InlineKeyboardButton("Swing",      callback_data="prof:swing"),
-            InlineKeyboardButton("Safe",       callback_data="prof:safe"),
-        ],
-        [
-            InlineKeyboardButton("Signals",    callback_data="act:signals"),
-            InlineKeyboardButton("Autotrade ON", callback_data="act:alp_on"),
-            InlineKeyboardButton("Autotrade OFF", callback_data="act:alp_off"),
-        ],
-        [
-            InlineKeyboardButton("Status",     callback_data="act:status"),
-        ],
-    ]
-    return InlineKeyboardMarkup(rows)
+# =========================
+MAIN_KB = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("/alp_status"), KeyboardButton("/signals")],
+        [KeyboardButton("/alp_on"), KeyboardButton("/alp_off")],
+        [KeyboardButton("/aggressive"), KeyboardButton("/default"), KeyboardButton("/safe")],
+        [KeyboardButton("/help")]
+    ],
+    resize_keyboard=True
+)
 
-
-# ==========================
-# Handlers
-# ==========================
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     st = STATE.setdefault(u.effective_chat.id, default_state())
-    txt = (
-        "👋 Готово. Бот сканує *всі* доступні інструменти на Alpaca — акції та крипту — "
-        "та (за бажанням) ставить ордери.\n\n"
-        "Команди:\n"
-        "• /alp_on /alp_off — увімк/вимк автотрейд\n"
+    await u.message.reply_text(
+        "👋 Готово. Бот сканує всі доступні активи в Alpaca.\n"
+        "• /alp_on — увімкнути автотрейд\n"
+        "• /alp_off — вимкнути автотрейд\n"
         "• /alp_status — стан акаунту\n"
-        "• /signals_alpaca — ручний скан + (за автотрейду) ордери\n\n"
-        "Профіль: */{p}*  · Autotrade: *{a}*\nUTC {t}"
-    ).format(p=st["profile"], a="ON" if st["autotrade"] else "OFF", t=now_utc())
-    await u.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_main())
+        "• /signals — ручний скан + (за потреби) автотрейд\n",
+        reply_markup=MAIN_KB
+    )
 
-async def alp_on_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    await u.message.reply_text(
+        "Команди:\n"
+        "/alp_status — акаунт + стан ринку\n"
+        "/signals — скан і (якщо увімкнено) автотрейд\n"
+        "/alp_on | /alp_off — увімк/вимк автотрейд\n"
+        "/aggressive | /default | /safe — профіль ризику\n",
+        reply_markup=MAIN_KB
+    )
+
+async def profile_aggr(u: Update, c: ContextTypes.DEFAULT_TYPE):
     st = STATE.setdefault(u.effective_chat.id, default_state())
-    st["autotrade"] = True
-    await u.message.reply_text("✅ Alpaca AUTOTRADE: ON")
+    st["mode"] = "aggressive"
+    st["limits"]["max_open"] = 40
+    await u.message.reply_text("✅ Mode: AGGRESSIVE", reply_markup=MAIN_KB)
 
-async def alp_off_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+async def profile_default(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st = STATE.setdefault(u.effective_chat.id, default_state())
+    st["mode"] = "default"
+    st["limits"]["max_open"] = 25
+    await u.message.reply_text("✅ Mode: DEFAULT", reply_markup=MAIN_KB)
+
+async def profile_safe(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st = STATE.setdefault(u.effective_chat.id, default_state())
+    st["mode"] = "safe"
+    st["limits"]["max_open"] = 10
+    await u.message.reply_text("✅ Mode: SAFE", reply_markup=MAIN_KB)
+
+async def autotrade_on_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st = STATE.setdefault(u.effective_chat.id, default_state())
+    st["autotrade"] = True if ALP_ENABLE else False
+    await u.message.reply_text("✅ Alpaca AUTOTRADE: ON", reply_markup=MAIN_KB)
+
+async def autotrade_off_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     st = STATE.setdefault(u.effective_chat.id, default_state())
     st["autotrade"] = False
-    await u.message.reply_text("🟨 Alpaca AUTOTRADE: OFF")
+    await u.message.reply_text("🟨 Alpaca AUTOTRADE: OFF", reply_markup=MAIN_KB)
 
 async def status_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = STATE.setdefault(u.effective_chat.id, default_state())
     try:
-        async with aiohttp.ClientSession() as sess:
-            acc = await alp_account(sess)
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as s:
+            acc = await alp_account(s)
+            clk = await alp_clock(s)
         txt = (
-            "💼 Alpaca: status=*{s}*\n• cash={cash}\n• buying_power={bp}\n• equity={eq}"
-        ).format(
-            s=acc.get("status", "?"),
-            cash=fmt_usd(float(acc.get("cash", 0.0))),
-            bp=fmt_usd(float(acc.get("buying_power", 0.0))),
-            eq=fmt_usd(float(acc.get("equity", 0.0))),
+            f"💼 Alpaca: status={acc.get('status','?')}\n"
+            f"• cash={fmt_usd(float(acc.get('cash',0)))} · buying_power={fmt_usd(float(acc.get('buying_power',0)))} · "
+            f"equity={fmt_usd(float(acc.get('equity',0)))}\n"
+            f"🕒 Market open: {'YES' if clk.get('is_open') else 'NO'}\n"
+            f"{now_utc()}"
         )
     except Exception as e:
         txt = f"❌ Alpaca error: {e}"
-    await u.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
+    await u.message.reply_text(txt, reply_markup=MAIN_KB)
 
 async def signals_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     st = STATE.setdefault(u.effective_chat.id, default_state())
     try:
-        picks, rep = await scan_universe(st)
-        await u.message.reply_text(rep, parse_mode=ParseMode.MARKDOWN)
-
-        # лог CSV (за бажання)
-        if SIGLOG_PATH:
-            rows = [["time","symbol","score","price","class"]]
-            for sym, sc, p, cls in picks:
-                rows.append([now_utc(), sym, f"{sc:.4f}", f"{p:.6f}", cls])
-            with open(SIGLOG_PATH, "a", newline="", encoding="utf-8") as f:
-                w = csv.writer(f); w.writerows(rows)
-
-        if st.get("autotrade") and picks:
-            # візьмемо топ-5 за замовчуванням
-            orders_txt = await place_orders(st, u.effective_chat.id, picks[:5])
-            await u.message.reply_text(orders_txt)
+        rep, picks_s, picks_c = await scan_all(st)
+        st["last_scan_txt"] = rep
+        st["last_picks"] = picks_s
+        st["last_picks_c"] = picks_c
+        # надсилаємо частинами
+        chunks = [rep[i:i+3500] for i in range(0, len(rep), 3500)]
+        for ch in chunks:
+            await u.message.reply_text(ch, parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_KB)
     except Exception as e:
-        await u.message.reply_text(f"❌ scan error: {e}")
+        await u.message.reply_text(f"❌ Scan error: {e}", reply_markup=MAIN_KB)
 
-async def btn_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    q = u.callback_query
-    await q.answer()
-    data = q.data or ""
-    st = STATE.setdefault(u.effective_chat.id, default_state())
+# =========================
+# Періодичний автоскан
+# =========================
+async def periodic_scan(app: Application):
+    while True:
+        try:
+            # робимо копію ключів, щоб не ламати ітерацію під час оновлень
+            for chat_id in list(STATE.keys()):
+                st = STATE.get(chat_id)
+                if not st:
+                    continue
+                try:
+                    rep, picks_s, picks_c = await scan_all(st)
+                    STATE[chat_id]["last_scan_txt"] = rep
+                    STATE[chat_id]["last_picks"] = picks_s
+                    STATE[chat_id]["last_picks_c"] = picks_c
+                    # якщо автотрейд увімкнений – тихо працюємо, звіт не шлемо кожного разу
+                except Exception as e:
+                    # не падаємо на циклі – йдемо далі
+                    pass
+        except Exception:
+            pass
+        await asyncio.sleep(SCAN_EVERY_SEC)
 
-    try:
-        if data.startswith("prof:"):
-            prof = data.split(":",1)[1]
-            if prof in PROFILES:
-                st["profile"] = prof
-                await q.edit_message_text(
-                    f"✅ Профіль встановлено: *{prof}*\nНатисни *Signals* для скану.",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=kb_main(),
-                )
-            else:
-                await q.edit_message_text("Невідомий профіль.", reply_markup=kb_main())
-        elif data == "act:alp_on":
-            st["autotrade"] = True
-            await q.edit_message_text("✅ Autotrade: ON", reply_markup=kb_main())
-        elif data == "act:alp_off":
-            st["autotrade"] = False
-            await q.edit_message_text("🟨 Autotrade: OFF", reply_markup=kb_main())
-        elif data == "act:signals":
-            picks, rep = await scan_universe(st)
-            await c.bot.send_message(chat_id=u.effective_chat.id, text=rep, parse_mode=ParseMode.MARKDOWN)
-            if st.get("autotrade") and picks:
-                orders_txt = await place_orders(st, u.effective_chat.id, picks[:5])
-                await c.bot.send_message(chat_id=u.effective_chat.id, text=orders_txt)
-        elif data == "act:status":
-            async with aiohttp.ClientSession() as sess:
-                acc = await alp_account(sess)
-            txt = (
-                "💼 Alpaca: status=*{s}*\n• cash={cash}\n• buying_power={bp}\n• equity={eq}"
-            ).format(
-                s=acc.get("status","?"),
-                cash=fmt_usd(float(acc.get("cash",0.0))),
-                bp=fmt_usd(float(acc.get("buying_power",0.0))),
-                eq=fmt_usd(float(acc.get("equity",0.0))),
-            )
-            await c.bot.send_message(chat_id=u.effective_chat.id, text=txt, parse_mode=ParseMode.MARKDOWN)
-        else:
-            await q.edit_message_text("?", reply_markup=kb_main())
-    except Exception as e:
-        await c.bot.send_message(chat_id=u.effective_chat.id, text=f"❌ {e}")
-
-# ==========================
+# =========================
 # main
-# ==========================
-def ensure_env():
-    miss = [k for k in ("TELEGRAM_BOT_TOKEN","ALPACA_API_KEY","ALPACA_API_SECRET") if not os.getenv(k)]
-    if miss:
-        raise RuntimeError(f"Missing env: {', '.join(miss)}")
+# =========================
+def build_app() -> Application:
+    app = Application.builder().token(TG_TOKEN).build()
 
-async def run():
-    ensure_env()
-    app: Application = ApplicationBuilder().token(TG_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("alp_on", alp_on_cmd))
-    app.add_handler(CommandHandler("alp_off", alp_off_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("alp_status", status_cmd))
-    app.add_handler(CommandHandler("signals_alpaca", signals_cmd))
-    app.add_handler(CallbackQueryHandler(btn_cb))
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
-    # безкінечно
-    await asyncio.Event().wait()
+    app.add_handler(CommandHandler("signals", signals_cmd))
+    app.add_handler(CommandHandler("alp_on", autotrade_on_cmd))
+    app.add_handler(CommandHandler("alp_off", autotrade_off_cmd))
+
+    app.add_handler(CommandHandler("aggressive", profile_aggr))
+    app.add_handler(CommandHandler("default", profile_default))
+    app.add_handler(CommandHandler("safe", profile_safe))
+
+    # приховуємо текстові повідомлення в никуда
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), help_cmd))
+    return app
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    if not TG_TOKEN or not ALP_KEY or not ALP_SECRET:
+        raise SystemExit("Missing ENV: TELEGRAM_BOT_TOKEN / ALPACA_API_KEY / ALPACA_API_SECRET")
+
+    application = build_app()
+    # запускаємо фонового сканера
+    application.job_queue.run_repeating(lambda ctx: None, interval=1)  # ініціалізація JobQueue
+    application.create_task(periodic_scan(application))
+    application.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
