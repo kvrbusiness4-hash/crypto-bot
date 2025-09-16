@@ -267,7 +267,24 @@ async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         "Крипта 24/7, без перевірки торгової сесії.",
         reply_markup=main_keyboard()
     )
-
+# ----- /alp_status -----
+async def alp_status_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st = STATE.setdefault(u.effective_chat.id, default_state())
+    try:
+        acc = await alp_account()
+        clk = await alp_clock()
+        txt = (
+            "🧳 Alpaca: "
+            f"status={acc.get('status','?')}\n"
+            f"• cash=${float(acc.get('cash',0)):.2f}\n"
+            f"• buying_power=${float(acc.get('buying_power',0)):.2f}\n"
+            f"• equity=${float(acc.get('equity',0)):.2f}\n"
+            f"• market_open={'YES' if bool(clk.get('is_open')) else 'NO'}\n"
+            f"Mode={st.get('mode')} · Autotrade={'ON' if st.get('autotrade') else 'OFF'}"
+        )
+    except Exception as e:
+        txt = f"❌ Alpaca error: {e}"
+    await u.message.reply_text(txt)
 # ===== MAIN =====
 
 def main():
