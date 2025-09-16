@@ -106,6 +106,12 @@ async def alp_account() -> Dict[str, Any]:
     async with ClientSession(timeout=timeout) as s:
         return await alp_get(s, "account")
 
+async def alp_clock() -> Dict[str, Any]:
+    """Стан годинника біржі (в Alpaca це /v2/clock)."""
+    timeout = ClientTimeout(total=30)
+    async with ClientSession(timeout=timeout) as s:
+        return await alp_get(s, "clock")
+
 async def place_notional_order(symbol: str, side: str, notional: float) -> Dict[str, Any]:
     """
     Універсальний ордер у доларовій сумі (USD). Працює і для акцій, і для crypto (24/7).
@@ -134,7 +140,6 @@ async def scan_all(st: Dict[str, Any]) -> Tuple[str, List[str], List[str]]:
     Тут демо-сканер: щоб нічого не ламати — повертає порожні сигнали.
     Можеш вставити свою логіку: відбір за об'ємом, трендом, й т.д.
     """
-    # TODO: додай реальну логіку сканування
     rep_lines = ["🛰 Сканер: наразі немає нових сигналів."]
     report = "\n".join(rep_lines)
     picks_s: List[str] = []  # приклад: ["AAPL", "TSLA"]
@@ -155,6 +160,16 @@ async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         "Крипта торгується 24/7. Без перевірки торгової сесії."
     )
     await u.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=main_keyboard())
+
+async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    await u.message.reply_text(
+        "Команди:\n"
+        "• /alp_on, /alp_off, /alp_status\n"
+        "• /signals_alpaca — ручний скан\n"
+        "• /aggressive /scalp /default /swing /safe — режим профілю\n"
+        "Крипта 24/7, без перевірки торгової сесії.",
+        reply_markup=main_keyboard()
+    )
 
 async def aggressive_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     st = stedef(u.effective_chat.id)
@@ -192,14 +207,18 @@ async def alp_off_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     await u.message.reply_text("⏹ Alpaca AUTOTRADE: OFF", reply_markup=main_keyboard())
 
 async def alp_status_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    st = stedef(u.effective_chat.id)
     try:
         acc = await alp_account()
+        clk = await alp_clock()
         txt = (
             "💼 Alpaca:\n"
             f"• status={acc.get('status','?')}\n"
             f"• cash=${float(acc.get('cash',0)):,.2f}\n"
             f"• buying_power=${float(acc.get('buying_power',0)):,.2f}\n"
-            f"• equity=${float(acc.get('equity',0)):,.2f}"
+            f"• equity=${float(acc.get('equity',0)):,.2f}\n"
+            f"• market_open={'YES' if bool(clk.get('is_open')) else 'NO'}\n"
+            f"Mode={st.get('mode')} · Autotrade={'ON' if st.get('autotrade') else 'OFF'}"
         )
     except Exception as e:
         txt = f"❌ Alpaca error: {e}"
@@ -221,7 +240,7 @@ async def signals_alpaca_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
             # приклад: купити кожен сигнал на ALPACA_NOTIONAL
             for sym in (picks_s[:ALPACA_MAX_STOCKS] + picks_c[:ALPACA_MAX_CRYPTO]):
                 try:
-                    r = await place_notional_order(sym, "buy", ALPACA_NOTIONAL)
+                    await place_notional_order(sym, "buy", ALPACA_NOTIONAL)
                     await u.message.reply_text(f"🟢 ORDER OK: {sym} ${ALPACA_NOTIONAL:.2f}")
                 except Exception as e:
                     await u.message.reply_text(f"🔴 ORDER FAIL {sym}: {e}")
@@ -236,13 +255,11 @@ async def periodic_scan_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     Працює через JobQueue — без проблем з event loop.
     Біжить завжди, крипта не залежить від сесії.
     """
-    # проходимось по всіх чатах, де нас уже стартували
     for chat_id, st in list(STATE.items()):
         try:
             rep, picks_s, picks_c = await scan_all(st)
             st["last_scan_txt"] = rep
             if st.get("autotrade"):
-                # спроба виставити ордери
                 for sym in (picks_s[:ALPACA_MAX_STOCKS] + picks_c[:ALPACA_MAX_CRYPTO]):
                     try:
                         await place_notional_order(sym, "buy", ALPACA_NOTIONAL)
@@ -255,38 +272,7 @@ async def periodic_scan_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 pass
 
-# =========================
-# HELP
-# =========================
-async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    await u.message.reply_text(
-        "Команди:\n"
-        "• /alp_on, /alp_off, /alp_status\n"
-        "• /signals_alpaca — ручний скан\n"
-        "• /aggressive /scalp /default /swing /safe — режим профілю\n"
-        "Крипта 24/7, без перевірки торгової сесії.",
-        reply_markup=main_keyboard()
-    )
-# ----- /alp_status -----
-async def alp_status_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = STATE.setdefault(u.effective_chat.id, default_state())
-    try:
-        acc = await alp_account()
-        clk = await alp_clock()
-        txt = (
-            "🧳 Alpaca: "
-            f"status={acc.get('status','?')}\n"
-            f"• cash=${float(acc.get('cash',0)):.2f}\n"
-            f"• buying_power=${float(acc.get('buying_power',0)):.2f}\n"
-            f"• equity=${float(acc.get('equity',0)):.2f}\n"
-            f"• market_open={'YES' if bool(clk.get('is_open')) else 'NO'}\n"
-            f"Mode={st.get('mode')} · Autotrade={'ON' if st.get('autotrade') else 'OFF'}"
-        )
-    except Exception as e:
-        txt = f"❌ Alpaca error: {e}"
-    await u.message.reply_text(txt)
 # ===== MAIN =====
-
 def main():
     if not TG_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN не задано")
@@ -294,8 +280,9 @@ def main():
     app = Application.builder().token(TG_TOKEN).build()
 
     # handlers
-    app.add_handler(CommandHandler("alp_status", alp_status_cmd))
+    app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
+
     app.add_handler(CommandHandler("aggressive", aggressive_cmd))
     app.add_handler(CommandHandler("scalp", scalp_cmd))
     app.add_handler(CommandHandler("default", default_cmd))
@@ -304,13 +291,15 @@ def main():
 
     app.add_handler(CommandHandler("alp_on", alp_on_cmd))
     app.add_handler(CommandHandler("alp_off", alp_off_cmd))
-    app.add_handler(CommandHandler("signals_alpaca", signals_cmd))
+    app.add_handler(CommandHandler("alp_status", alp_status_cmd))
+    app.add_handler(CommandHandler("signals_alpaca", signals_alpaca_cmd))
 
     # Фоновий сканер запускаємо лише через JobQueue
-    app.job_queue.run_repeating(periodic_scan_job, interval=120, first=5)
+    app.job_queue.run_repeating(periodic_scan_job, interval=SCAN_EVERY_SEC, first=5)
 
     # Блокуючий запуск БЕЗ await і БЕЗ asyncio.run
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
