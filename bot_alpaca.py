@@ -240,7 +240,7 @@ async def _scan_rank_crypto() -> Tuple[str, List[Tuple[float,str,List[Dict[str,A
 
     bars15 = await get_bars_crypto(pairs, "15Min", limit=120)
     bars30 = await get_bars_crypto(pairs, "30Min", limit=120)
-    bars60 = await get_bars_crypto(pairs, "60Min", limit=120)
+    bars60 = await get_bars_crypto(pairs, "1Hour", limit=120)  # 🔥 заміна
 
     ranked = []
     for sym in pairs:
