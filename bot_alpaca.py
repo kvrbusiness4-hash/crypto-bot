@@ -328,17 +328,23 @@ def _rank_by_rsi_ema(
     return bias*100 + e_spread*50 - abs(50.0 - r[0])  # легкий пріоритет на 1-му ТФ
 
 async def _scan_rank_crypto(st: dict) -> Tuple[str, List[Tuple[float, str, List[dict]]]]:
-    conf = _mode_conf(st)
+    """
+    Повертає:
+      report: текст короткого звіту
+      ranked: список кортежів (score, symbol, bars_15m)
+    """
+    conf  = _mode_conf(st)  # бере параметри з MODE_PARAMS згідно режиму ризику
     pairs = await get_active_crypto_usd_pairs()
     if not pairs:
         return "Немає активних USD-пар", []
 
-    tf15, tf30, tf60 = conf["bars"]  # напр., ("15Min","30Min","1Hour")
+    tf15, tf30, tf60 = conf["bars"]          # напр., ("5Min","15Min","1Hour")
     bars15 = await get_bars_crypto(pairs, tf15, limit=120)
     bars30 = await get_bars_crypto(pairs, tf30, limit=120)
     bars60 = await get_bars_crypto(pairs, tf60, limit=120)
 
     ranked: List[Tuple[float, str, List[dict]]] = []
+
     for sym in pairs:
         raw15 = (bars15.get("bars") or {}).get(sym, [])
         raw30 = (bars30.get("bars") or {}).get(sym, [])
@@ -352,12 +358,15 @@ async def _scan_rank_crypto(st: dict) -> Tuple[str, List[Tuple[float, str, List[
 
         score = _rank_by_rsi_ema(
             c15, c30, c60,
-            rsi_buy=conf["rsi_buy"], rsi_sell=conf["rsi_sell"],
-            ema_fast=conf["ema_fast"], ema_slow=conf["ema_slow"],
+            rsi_buy = conf["rsi_buy"],
+            rsi_sell= conf["rsi_sell"],
+            ema_fast= conf["ema_fast"],
+            ema_slow= conf["ema_slow"],
         )
         ranked.append((score, sym, raw15))
 
     ranked.sort(reverse=True)
+
     report = (
         f"🛰 Сканер (крипта):\n"
         f"• Активних USD-пар: {len(pairs)}\n"
@@ -369,71 +378,93 @@ async def _scan_rank_crypto(st: dict) -> Tuple[str, List[Tuple[float, str, List[
 # --- /signals_crypto ---
 async def signals_crypto(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Сканер крипти + (за потреби) автотрейд топ-N з TP/SL.
+    Сканер крипти + (за потреби) автотрейд ТОП-N з TP/SL.
     Працює з режимами входів: long / short / both.
     """
     st = stedef(u.effective_chat.id)
     try:
-        report, ranked = await _scan_rank_crypto(st)  # <— ПЕРЕДАЄМО st
+        report, ranked = await _scan_rank_crypto(st)
         await u.message.reply_text(report)
-
-        if st.get("autotrade") and ranked:
-            conf = _mode_conf(st)
-            picks = ranked[:conf["top_n"]]
-            side_mode = st.get("side_mode", DEFAULT_SIDE_MODE)
-
-            for _, sym, arr in picks:
-                h  = [float(x["h"]) for x in arr]
-                l  = [float(x["l"]) for x in arr]
-                cc = [float(x["c"]) for x in arr]
-                px = cc[-1]
-
-                sides = ["buy"] if side_mode=="long" else ["sell"] if side_mode=="short" else ["buy","sell"]
-                for side in sides:
-                    sl, tp = calc_sl_tp(side, px, h, l, cc)
-                    try:
-                        await place_bracket_notional_order(sym, side, ALPACA_NOTIONAL, tp, sl)
-                        await u.message.reply_text(
-                            f"🟢 ORDER OK: {sym} {('LONG' if side=='buy' else 'SHORT')}\n"
-                            f"TP: {tp:.6f} · SL: {sl:.6f} · ${ALPACA_NOTIONAL:.2f}"
-                        )
-                    except Exception as e:
-                        await u.message.reply_text(f"🔴 ORDER FAIL {sym} {side.upper()}: {e}")
     except Exception as e:
         await u.message.reply_text(f"🔴 crypto scan error: {e}")
+        return
+
+    if not st.get("autotrade") or not ranked:
+        return
+
+    # торгуємо топ-N
+    picks = ranked[:ALPACA_TOP_N]
+    mode  = st.get("side_mode", DEFAULT_SIDE_MODE)              # "long" | "short" | "both"
+    sides_template = ["buy"] if mode == "long" else ["sell"] if mode == "short" else ["buy", "sell"]
+
+    for _, sym, arr in picks:
+        h  = [float(x["h"]) for x in arr]
+        l  = [float(x["l"]) for x in arr]
+        cc = [float(x["c"]) for x in arr]
+        px = cc[-1]
+
+        for side in sides_template:
+            # Short у спот-крипті Alpaca не підтримується — пропускаємо
+            if is_crypto_pair(sym) and side == "sell":
+                await u.message.reply_text(f"🔴 ORDER SKIP {sym} SELL: short для крипти (spot) недоступний в Alpaca.")
+                continue
+
+            sl, tp = calc_sl_tp(side, px, h, l, cc)
+            try:
+                await place_bracket_notional_order(
+                    sym, side, ALPACA_NOTIONAL,
+                    take_profit=tp, stop_loss=sl
+                )
+                await u.message.reply_text(
+                    f"🟢 ORDER OK: {sym} {'LONG' if side=='buy' else 'SHORT'} "
+                    f"@~{px:.6f}\nTP:{tp:.6f} · SL:{sl:.6f} · ${ALPACA_NOTIONAL:.2f}"
+                )
+            except Exception as e:
+                await u.message.reply_text(f"🔴 ORDER FAIL {sym} {side.upper()}: {e}")
 
 # --- /trade_crypto (миттєва торгівля без звіту) ---
 async def trade_crypto(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Миттєва торгівля ТОП-N без окремого звіту (корисно, коли вже знаємо, що є сигнали).
+    Використовує ті самі правила TP/SL і режими входів (long / short / both).
+    """
     st = stedef(u.effective_chat.id)
     try:
-        report, ranked = await _scan_rank_crypto(st)  # <— ПЕРЕДАЄМО st
+        _, ranked = await _scan_rank_crypto(st)
         if not ranked:
             await u.message.reply_text("⚠️ Сигналів недостатньо")
             return
-
-        conf = _mode_conf(st)
-        picks = ranked[:conf["top_n"]]
-        side_mode = st.get("side_mode", DEFAULT_SIDE_MODE)
-
-        for _, sym, arr in picks:
-            h  = [float(x["h"]) for x in arr]
-            l  = [float(x["l"]) for x in arr]
-            cc = [float(x["c"]) for x in arr]
-            px = cc[-1]
-
-            sides = ["buy"] if side_mode=="long" else ["sell"] if side_mode=="short" else ["buy","sell"]
-            for side in sides:
-                sl, tp = calc_sl_tp(side, px, h, l, cc)
-                try:
-                    await place_bracket_notional_order(sym, side, ALPACA_NOTIONAL, tp, sl)
-                    await u.message.reply_text(
-                        f"🟢 ORDER OK: {sym} {('LONG' if side=='buy' else 'SHORT')}\n"
-                        f"TP: {tp:.6f} · SL: {sl:.6f} · ${ALPACA_NOTIONAL:.2f}"
-                    )
-                except Exception as e:
-                    await u.message.reply_text(f"🔴 ORDER FAIL {sym} {side.upper()}: {e}")
     except Exception as e:
         await u.message.reply_text(f"🔴 trade_crypto error: {e}")
+        return
+
+    picks = ranked[:ALPACA_TOP_N]
+    mode  = st.get("side_mode", DEFAULT_SIDE_MODE)
+    sides_template = ["buy"] if mode == "long" else ["sell"] if mode == "short" else ["buy", "sell"]
+
+    for _, sym, arr in picks:
+        h  = [float(x["h"]) for x in arr]
+        l  = [float(x["l"]) for x in arr]
+        cc = [float(x["c"]) for x in arr]
+        px = cc[-1]
+
+        for side in sides_template:
+            if is_crypto_pair(sym) and side == "sell":
+                await u.message.reply_text(f"🔴 ORDER SKIP {sym} SELL: short для крипти (spot) недоступний в Alpaca.")
+                continue
+
+            sl, tp = calc_sl_tp(side, px, h, l, cc)
+            try:
+                await place_bracket_notional_order(
+                    sym, side, ALPACA_NOTIONAL,
+                    take_profit=tp, stop_loss=sl
+                )
+                await u.message.reply_text(
+                    f"🟢 ORDER OK: {sym} {'LONG' if side=='buy' else 'SHORT'} "
+                    f"@~{px:.6f}\nTP:{tp:.6f} · SL:{sl:.6f} · ${ALPACA_NOTIONAL:.2f}"
+                )
+            except Exception as e:
+                await u.message.reply_text(f"🔴 ORDER FAIL {sym} {side.upper()}: {e}")
 
 # =========================
 # ФОНОВИЙ JOB (автотрейд)
