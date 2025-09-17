@@ -323,49 +323,40 @@ async def scan_rank_stocks(st: Dict[str, Any]) -> Tuple[str, List[Tuple[float, s
     return rep, ranked
 
 # -------- ORDERS --------
-async def place_bracket_notional_order_crypto(sym: str, side: str, notional: float, tp: float | None, sl: float | None) -> Any:
-    """Crypto: дозволяє notional + GTC."""
+async def place_bracket_notional_order_crypto(sym: str, side: str, notional: float,
+                                              tp: float | None, sl: float | None) -> Any:
+    # Crypto: дозволяє notional + GTC. ОБОВʼЯЗКОВО order_class="bracket"
     payload = {
         "symbol": to_order_sym(sym),
         "side": side,
         "type": "market",
         "time_in_force": "gtc",
+        "order_class": "bracket",
         "notional": f"{notional}",
     }
-    if tp:
+    if tp is not None:
         payload["take_profit"] = {"limit_price": f"{tp:.6f}"}
-    if sl:
+    if sl is not None:
         payload["stop_loss"] = {"stop_price": f"{sl:.6f}"}
     return await alp_post_json("/v2/orders", payload)
 
-async def place_bracket_notional_order_stock(sym: str, side: str, notional: float, tp: float | None, sl: float | None) -> Any:
-    """
-    Stocks: fractional дозволяється, але тільки time_in_force='day'.
-    Залишаємо notional, щоб не рахувати qty вручну.
-    """
+
+async def place_bracket_notional_order_stock(sym: str, side: str, notional: float,
+                                             tp: float | None, sl: float | None) -> Any:
+    # Stocks: fractional ок → тільки time_in_force="day". ОБОВʼЯЗКОВО order_class="bracket"
     payload = {
         "symbol": to_order_sym(sym),
         "side": side,
         "type": "market",
-        "time_in_force": "day",   # важливо для fractional
+        "time_in_force": "day",
+        "order_class": "bracket",
         "notional": f"{notional}",
     }
-    if tp:
+    if tp is not None:
         payload["take_profit"] = {"limit_price": f"{tp:.6f}"}
-    if sl:
+    if sl is not None:
         payload["stop_loss"] = {"stop_price": f"{sl:.6f}"}
     return await alp_post_json("/v2/orders", payload)
-
-def calc_sl_tp(side: str, price: float, conf: Dict[str, Any]) -> Tuple[float | None, float | None]:
-    tp_pct = float(conf.get("tp_pct", 0.012))
-    sl_pct = float(conf.get("sl_pct", 0.008))
-    if side == "buy":
-        tp = price * (1 + tp_pct)
-        sl = price * (1 - sl_pct)
-    else:
-        # short для крипти не використовуємо
-        tp = sl = None
-    return sl, tp
 
 # -------- COMMANDS --------
 async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
