@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-import o
+import os
 import json
 import math
 import asyncio
