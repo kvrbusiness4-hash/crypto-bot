@@ -1,1 +1,1 @@
-worker: python bot_alpaca.py
+worker: python bot_alpaca.p
