@@ -36,6 +36,9 @@ ALPACA_MAX_STOCKS   = int(os.getenv("ALPACA_MAX_STOCKS") or 50)
 SCAN_INTERVAL_SEC   = int(os.getenv("SCAN_INTERVAL_SEC") or 300)
 DEDUP_COOLDOWN_MIN  = int(os.getenv("DEDUP_COOLDOWN_MIN") or 240)
 
+# ВИМИКАЧ стакану (quotes). 0 — вимкнено (без 404), 1 — увімкнути.
+SCALP_USE_QUOTES    = int(os.getenv("SCALP_USE_QUOTES") or 0)
+
 # ====== GLOBAL STATE (per chat) ======
 STATE: Dict[int, Dict[str, Any]] = {}
 
@@ -54,7 +57,7 @@ MODE_PARAMS = {
         "ema_fast": 9, "ema_slow": 21,
         "top_n": ALPACA_TOP_N,
         "tp_pct": 0.010, "sl_pct": 0.006,
-        # стакан
+        # ваги для мікроструктури (враховуються лише якщо SCALP_USE_QUOTES=1)
         "w_obi": 0.8,
         "w_qm": 0.5,
         "max_spread_bps": 8,
@@ -143,7 +146,7 @@ def kb() -> ReplyKeyboardMarkup:
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
-# ---- rounding
+# ---- ticks / rounding
 def _tick_stock() -> float: return 0.01
 def _tick_crypto() -> float: return 0.0001
 def round_to_tick(price: float, tick: float, direction: str) -> float:
@@ -168,7 +171,6 @@ def _is_trading_path(path: str) -> bool:
     return any(path.startswith(p) for p in TRADING_PATHS)
 
 async def alp_get_json(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-    # FIX: правильно обираємо базу для trading vs data
     base = ALPACA_BASE_URL if _is_trading_path(path) else ALPACA_DATA_URL
     url = f"{base}{path}"
     async with ClientSession(timeout=ClientTimeout(total=30)) as s:
@@ -179,7 +181,6 @@ async def alp_get_json(path: str, params: Optional[Dict[str, Any]] = None) -> An
             return json.loads(txt) if txt else {}
 
 async def alp_post_json(path: str, payload: Dict[str, Any]) -> Any:
-    # POSTи — завжди у trading API (orders, cancel, etc.)
     url = f"{ALPACA_BASE_URL}{path}"
     async with ClientSession(timeout=ClientTimeout(total=30)) as s:
         async with s.post(url, headers=_alp_headers(), data=json.dumps(payload)) as r:
@@ -212,7 +213,7 @@ async def has_open_orders(sym: str) -> bool:
 async def blocked_by_open_state(sym: str) -> bool:
     return (await has_open_position(sym)) or (await has_open_orders(sym))
 
-# -------- DATA: bars & quotes ----------
+# -------- DATA: bars & (optional) quotes ----------
 async def get_bars_crypto(pairs: List[str], timeframe: str, limit: int = 120) -> Dict[str, Any]:
     tf = map_tf(timeframe)
     syms = ",".join([to_data_sym(p) for p in pairs])
@@ -225,6 +226,7 @@ async def get_bars_stocks(symbols: List[str], timeframe: str, limit: int = 120) 
     params = {"symbols": syms, "timeframe": tf, "limit": str(limit), "sort": "asc"}
     return await alp_get_json("/v2/stocks/bars", params=params)
 
+# Ці функції можуть давати 404 на безкоштовних/деяких акаунтах — тому використовується тільки якщо SCALP_USE_QUOTES=1.
 async def get_quotes_stocks(symbols: List[str], limit: int = 20) -> Dict[str, Any]:
     params = {"symbols": ",".join(symbols), "limit": str(limit), "sort": "desc"}
     return await alp_get_json("/v2/stocks/quotes", params=params)
@@ -295,7 +297,7 @@ def crypto_prices_for(side: str, price: float, conf: Dict[str, Any]) -> Tuple[fl
     if sl >= price: sl = round_to_tick(price - tick, tick, "down")
     return sl, tp
 
-# -------- MICROSTRUCTURE (quotes → OBI, spread, momentum) --------
+# -------- MICROSTRUCTURE (optional) --------
 def micro_features_from_quotes(quotes: List[Dict[str, Any]]) -> Tuple[float, float, float]:
     if not quotes:
         return 0.0, 1.0, 0.0
@@ -324,6 +326,17 @@ def micro_features_from_quotes(quotes: List[Dict[str, Any]]) -> Tuple[float, flo
             if d > 0: ups += 1
     qm = ((ups/total) if total else 0.5) * 2 - 1
     return obi_avg, rel_spread, qm
+
+def _score_with_micro(conf: Dict[str, Any], base_score: float,
+                      quotes: List[Dict[str, Any]]) -> Optional[float]:
+    # якщо quotes порожні — повертаємо базовий скор
+    if not quotes:
+        return base_score
+    w_obi = conf.get("w_obi"); w_qm = conf.get("w_qm"); max_bps = conf.get("max_spread_bps")
+    obi, rel_spread, qm = micro_features_from_quotes(quotes)
+    if max_bps is not None and rel_spread > (max_bps / 1e4):
+        return None
+    return base_score + float(w_obi or 0)*obi*100.0 + float(w_qm or 0)*qm*50.0
 
 # -------- ORDERS --------
 async def place_bracket_notional_order_stock(sym: str, side: str, notional: float,
@@ -571,16 +584,12 @@ async def trade_stocks(u: Update, c: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await u.message.reply_text(f"🔴 trade_stocks error: {e}")
 
-# ======= SCANNERS (з урахуванням стакана в SCALP) =======
-def _score_with_micro(conf: Dict[str, Any], base_score: float,
-                      quotes: List[Dict[str, Any]]) -> Optional[float]:
-    w_obi = conf.get("w_obi"); w_qm = conf.get("w_qm"); max_bps = conf.get("max_spread_bps")
-    if w_obi is None or w_qm is None or max_bps is None:
+# ======= SCANNERS =======
+def _score_maybe_with_micro(conf: Dict[str, Any], base_score: float,
+                            quotes: List[Dict[str, Any]]) -> Optional[float]:
+    if not SCALP_USE_QUOTES:
         return base_score
-    obi, rel_spread, qm = micro_features_from_quotes(quotes)
-    if rel_spread > (max_bps / 1e4):
-        return None
-    return base_score + float(w_obi)*obi*100.0 + float(w_qm)*qm*50.0
+    return _score_with_micro(conf, base_score, quotes)
 
 async def scan_rank_crypto(st: Dict[str, Any]) -> Tuple[str, List[Tuple[float, str, List[Dict[str, Any]]]]]:
     conf = _mode_conf(st)
@@ -592,7 +601,13 @@ async def scan_rank_crypto(st: Dict[str, Any]) -> Tuple[str, List[Tuple[float, s
     bars15 = await get_bars_crypto(data_pairs, tf15, limit=120)
     bars30 = await get_bars_crypto(data_pairs, tf30, limit=120)
     bars60 = await get_bars_crypto(data_pairs, tf60, limit=120)
-    quotes_map = await get_quotes_crypto(data_pairs, limit=20)
+
+    quotes_map = {}
+    if SCALP_USE_QUOTES:
+        try:
+            quotes_map = await get_quotes_crypto(data_pairs, limit=20)
+        except Exception:
+            quotes_map = {}
 
     ranked: List[Tuple[float, str, List[Dict[str, Any]]]] = []
     for sym in data_pairs:
@@ -606,11 +621,11 @@ async def scan_rank_crypto(st: Dict[str, Any]) -> Tuple[str, List[Tuple[float, s
         c60 = [float(x["c"]) for x in raw60]
         base = rank_score(c15, c30, c60, conf["rsi_buy"], conf["rsi_sell"], conf["ema_fast"], conf["ema_slow"])
 
-        rawq = (quotes_map.get("quotes") or {}).get(sym, [])
-        scored = _score_with_micro(conf, base, rawq)
+        rawq = (quotes_map.get("quotes") or {}).get(sym, []) if SCALP_USE_QUOTES else []
+        scored = _score_maybe_with_micro(conf, base, rawq)
         if scored is None:
             continue
-        ranked.append((scored, sym, raw15))
+        ranked.append((float(scored), sym, raw15))
 
     ranked.sort(reverse=True)
     rep = (
@@ -629,7 +644,13 @@ async def scan_rank_stocks(st: Dict[str, Any]) -> Tuple[str, List[Tuple[float, s
     bars15 = await get_bars_stocks(symbols, tf15, limit=120)
     bars30 = await get_bars_stocks(symbols, tf30, limit=120)
     bars60 = await get_bars_stocks(symbols, tf60, limit=120)
-    quotes_map = await get_quotes_stocks(symbols, limit=20)
+
+    quotes_map = {}
+    if SCALP_USE_QUOTES:
+        try:
+            quotes_map = await get_quotes_stocks(symbols, limit=20)
+        except Exception:
+            quotes_map = {}
 
     ranked: List[Tuple[float, str, List[Dict[str, Any]]]] = []
     for sym in symbols:
@@ -643,11 +664,11 @@ async def scan_rank_stocks(st: Dict[str, Any]) -> Tuple[str, List[Tuple[float, s
         c60 = [float(x["c"]) for x in raw60]
         base = rank_score(c15, c30, c60, conf["rsi_buy"], conf["rsi_sell"], conf["ema_fast"], conf["ema_slow"])
 
-        rawq = (quotes_map.get("quotes") or {}).get(sym, [])
-        scored = _score_with_micro(conf, base, rawq)
+        rawq = (quotes_map.get("quotes") or {}).get(sym, []) if SCALP_USE_QUOTES else []
+        scored = _score_maybe_with_micro(conf, base, rawq)
         if scored is None:
             continue
-        ranked.append((scored, sym, raw15))
+        ranked.append((float(scored), sym, raw15))
 
     ranked.sort(reverse=True)
     rep = (
