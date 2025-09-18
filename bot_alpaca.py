@@ -56,6 +56,10 @@ MODE_PARAMS = {
         "ema_fast": 9, "ema_slow": 21,
         "top_n": ALPACA_TOP_N,
         "tp_pct": 0.010, "sl_pct": 0.006,
+        # нові ваги для стакана
+        "w_obi": 0.8,          # вага дисбалансу bid/ask
+        "w_qm": 0.5,           # вага micro-momentum котирувань
+        "max_spread_bps": 8,   # ліміт спреду у б.п. (1e-4); якщо більше — ігноруємо сигнал
     },
     "default": {
         "bars": ("15Min", "30Min", "1Hour"),
@@ -96,7 +100,7 @@ STOCKS_UNIVERSE = [
     "SPY","QQQ","IWM","DIA","XLF","XLK","XLV","XLE","XLY","XLP",
 ][:ALPACA_MAX_STOCKS]
 
-# ============ HELPERS ============
+# ============ HELPERS (timeframe, symbols, dedup, rounding) ============
 
 def map_tf(tf: str) -> str:
     t = (tf or "").strip()
@@ -148,14 +152,10 @@ def kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 # ---- price rounding helpers ----
-
-def _tick_stock() -> float: return 0.01   # мінімальний крок ціни для акцій
-def _tick_crypto() -> float: return 0.0001  # базовий крок ціни для крипти (більшість пар)
+def _tick_stock() -> float: return 0.01
+def _tick_crypto() -> float: return 0.0001
 
 def round_to_tick(price: float, tick: float, direction: str) -> float:
-    """
-    direction: 'up' для TP sell (вище), 'down' для SL buy (нижче), 'nearest' інакше.
-    """
     if tick <= 0: return price
     q = price / tick
     if direction == "up":
@@ -221,7 +221,7 @@ async def blocked_by_open_state(sym: str) -> bool:
     if await has_open_orders(sym):  return True
     return False
 
-# -------- DATA: /bars ----------
+# -------- DATA: bars & quotes ----------
 
 async def get_bars_crypto(pairs: List[str], timeframe: str, limit: int = 120) -> Dict[str, Any]:
     tf = map_tf(timeframe)
@@ -248,6 +248,14 @@ async def get_bars_stocks(symbols: List[str], timeframe: str, limit: int = 120) 
             if r.status >= 400:
                 raise RuntimeError(f"GET {url} {r.status}: {txt}")
             return json.loads(txt) if txt else {}
+
+async def get_quotes_stocks(symbols: List[str], limit: int = 20) -> Dict[str, Any]:
+    params = {"symbols": ",".join(symbols), "limit": str(limit), "sort": "desc"}
+    return await alp_get_json("/v2/stocks/quotes", params=params)
+
+async def get_quotes_crypto(pairs: List[str], limit: int = 20) -> Dict[str, Any]:
+    params = {"symbols": ",".join([to_data_sym(p) for p in pairs]), "limit": str(limit), "sort": "desc"}
+    return await alp_get_json("/v1beta3/crypto/us/quotes", params=params)
 
 # -------- INDICATORS --------
 
@@ -287,22 +295,19 @@ def calc_sl_tp(side: str, price: float, conf: Dict[str, Any]) -> Tuple[float, fl
     tp_pct = float(conf.get("tp_pct", 0.012))
     sl_pct = float(conf.get("sl_pct", 0.008))
     side = (side or "buy").lower()
-    # чернеткові ціни без тіка
     if side == "sell":
         tp = price * (1 - tp_pct); sl = price * (1 + sl_pct)
     else:
         tp = price * (1 + tp_pct); sl = price * (1 - sl_pct)
     return sl, tp
 
-# ---- STOCK rounding wrapper ----
+# ---- rounding wrappers ----
 
 def stock_prices_for(side: str, price: float, conf: Dict[str, Any]) -> Tuple[float, float]:
     sl, tp = calc_sl_tp(side, price, conf)
     tick = _tick_stock()
-    # long buy: TP (sell) — вгору, SL (sell stop) — донизу
     tp = round_to_tick(tp, tick, "up")
     sl = round_to_tick(sl, tick, "down")
-    # захист від рівності
     if tp <= price: tp = round_to_tick(price + tick, tick, "up")
     if sl >= price: sl = round_to_tick(price - tick, tick, "down")
     return sl, tp
@@ -315,6 +320,42 @@ def crypto_prices_for(side: str, price: float, conf: Dict[str, Any]) -> Tuple[fl
     if tp <= price: tp = round_to_tick(price + tick, tick, "up")
     if sl >= price: sl = round_to_tick(price - tick, tick, "down")
     return sl, tp
+
+# -------- MICROSTRUCTURE (quotes → OBI, spread, momentum) --------
+
+def micro_features_from_quotes(quotes: List[Dict[str, Any]]) -> Tuple[float, float, float]:
+    """
+    Повертає (obi_avg, rel_spread, qm): obi∈[-1..1], rel_spread (останній), qm∈[-1..1].
+    Працює і для stocks, і для crypto (bp/ap/bs/as).
+    """
+    if not quotes:
+        return 0.0, 1.0, 0.0
+    quotes = list(reversed(quotes))  # старі → нові
+    obis, mids = [], []
+    last_bp, last_ap = None, None
+    for q in quotes:
+        bp = float(q.get("bp") or q.get("bid_price") or 0)
+        ap = float(q.get("ap") or q.get("ask_price") or 0)
+        bs = float(q.get("bs") or q.get("bid_size") or 0)
+        ask_sz = float(q.get("as") or q.get("ask_size") or 0)
+        if (bs + ask_sz) > 0:
+            obis.append((bs - ask_sz) / (bs + ask_sz))
+        if bp > 0 and ap > 0:
+            mids.append((bp + ap) / 2.0)
+            last_bp, last_ap = bp, ap
+    obi_avg = sum(obis) / len(obis) if obis else 0.0
+    if last_bp is None or last_ap is None or not mids:
+        return 0.0, 1.0, 0.0
+    rel_spread = (last_ap - last_bp) / max(1e-9, mids[-1])
+    ups, total = 0, 0
+    for i in range(1, len(mids)):
+        d = mids[i] - mids[i - 1]
+        if d != 0:
+            total += 1
+            if d > 0:
+                ups += 1
+    qm = ((ups / total) if total else 0.5) * 2 - 1
+    return obi_avg, rel_spread, qm
 
 # -------- ORDERS --------
 
@@ -333,7 +374,7 @@ async def place_bracket_notional_order_stock(sym: str, side: str, notional: floa
     if sl is not None: payload["stop_loss"]   = {"stop_price":  f"{sl:.2f}"}
     return await alp_post_json("/v2/orders", payload)
 
-# Crypto: БЕЗ bracket. Вхід ринком, далі окремі TP/SL як sell-ордера на qty.
+# Crypto: вхід ринком, TP/SL — окремі ордери
 async def place_market_notional_crypto(sym: str, side: str, notional: float) -> Any:
     payload = {
         "symbol": to_order_sym(sym),
@@ -360,7 +401,7 @@ async def place_crypto_exits(sym: str, qty: str, tp: float, sl: float) -> None:
             "symbol": symbol, "side": "sell", "type": "limit",
             "time_in_force": "gtc", "limit_price": f"{tp:.4f}", "qty": qty
         })
-    except Exception as e:
+    except Exception:
         pass
     # SL (stop sell)
     try:
@@ -368,7 +409,7 @@ async def place_crypto_exits(sym: str, qty: str, tp: float, sl: float) -> None:
             "symbol": symbol, "side": "sell", "type": "stop",
             "time_in_force": "gtc", "stop_price": f"{sl:.4f}", "qty": qty
         })
-    except Exception as e:
+    except Exception:
         pass
 
 async def cancel_open_orders_for(sym: str) -> None:
@@ -481,7 +522,6 @@ async def signals_crypto(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
             try:
                 await place_market_notional_crypto(sym, side, ALPACA_NOTIONAL)
-                # дочекатися появи позиції та її qty
                 await asyncio.sleep(0.5)
                 qty = await get_position_qty(sym)
                 if qty:
@@ -612,10 +652,106 @@ async def trade_stocks(u: Update, c: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await u.message.reply_text(f"🔴 trade_stocks error: {e}")
 
+# ======= SCANNERS (з урахуванням стакана в SCALP) =======
+
+def _score_with_micro(conf: Dict[str, Any], base_score: float,
+                      quotes: List[Dict[str, Any]]) -> Optional[float]:
+    """Додає до базового score поправки за стаканом лише у SCALP.
+       Повертає None, якщо спред завеликий і символ треба відкинути.
+    """
+    # тільки для SCALP
+    w_obi = conf.get("w_obi"); w_qm = conf.get("w_qm"); max_bps = conf.get("max_spread_bps")
+    if w_obi is None or w_qm is None or max_bps is None:
+        return base_score
+    obi, rel_spread, qm = micro_features_from_quotes(quotes)
+    if rel_spread > (max_bps / 1e4):
+        return None
+    return base_score + float(w_obi)*obi*100.0 + float(w_qm)*qm*50.0
+
+async def scan_rank_crypto(st: Dict[str, Any]) -> Tuple[str, List[Tuple[float, str, List[Dict[str, Any]]]]]:
+    conf = _mode_conf(st)
+    tf15, tf30, tf60 = map_tf(conf["bars"][0]), map_tf(conf["bars"][1]), map_tf(conf["bars"][2])
+
+    pairs = CRYPTO_USD_PAIRS[:]
+    data_pairs = [to_data_sym(p) for p in pairs]
+
+    bars15 = await get_bars_crypto(data_pairs, tf15, limit=120)
+    bars30 = await get_bars_crypto(data_pairs, tf30, limit=120)
+    bars60 = await get_bars_crypto(data_pairs, tf60, limit=120)
+
+    quotes_map = await get_quotes_crypto(data_pairs, limit=20)
+
+    ranked: List[Tuple[float, str, List[Dict[str, Any]]]] = []
+    for sym in data_pairs:
+        raw15 = (bars15.get("bars") or {}).get(sym, [])
+        raw30 = (bars30.get("bars") or {}).get(sym, [])
+        raw60 = (bars60.get("bars") or {}).get(sym, [])
+        if not raw15 or not raw30 or not raw60:
+            continue
+        c15 = [float(x["c"]) for x in raw15]
+        c30 = [float(x["c"]) for x in raw30]
+        c60 = [float(x["c"]) for x in raw60]
+        base = rank_score(c15, c30, c60, conf["rsi_buy"], conf["rsi_sell"], conf["ema_fast"], conf["ema_slow"])
+
+        rawq = (quotes_map.get("quotes") or {}).get(sym, [])
+        scored = _score_with_micro(conf, base, rawq)
+        if scored is None:
+            continue  # спред завеликий
+        ranked.append((scored, sym, raw15))
+
+    ranked.sort(reverse=True)
+    rep = (
+        "🛰️ Сканер (крипта):\n"
+        f"• Активних USD-пар: {len(data_pairs)}\n"
+        f"• Використаємо для торгівлі (лімітом): {min(conf['top_n'], len(ranked))}\n"
+        + (f"• Перші 25: " + ", ".join([s for _, s, _ in ranked[:25]])
+           if ranked else "• Немає сигналів")
+    )
+    return rep, ranked
+
+async def scan_rank_stocks(st: Dict[str, Any]) -> Tuple[str, List[Tuple[float, str, List[Dict[str, Any]]]]]:
+    conf = _mode_conf(st)
+    tf15, tf30, tf60 = map_tf(conf["bars"][0]), map_tf(conf["bars"][1]), map_tf(conf["bars"][2])
+
+    symbols = STOCKS_UNIVERSE[:]
+
+    bars15 = await get_bars_stocks(symbols, tf15, limit=120)
+    bars30 = await get_bars_stocks(symbols, tf30, limit=120)
+    bars60 = await get_bars_stocks(symbols, tf60, limit=120)
+
+    quotes_map = await get_quotes_stocks(symbols, limit=20)
+
+    ranked: List[Tuple[float, str, List[Dict[str, Any]]]] = []
+    for sym in symbols:
+        raw15 = (bars15.get("bars") or {}).get(sym, [])
+        raw30 = (bars30.get("bars") or {}).get(sym, [])
+        raw60 = (bars60.get("bars") or {}).get(sym, [])
+        if not raw15 or not raw30 or not raw60:
+            continue
+        c15 = [float(x["c"]) for x in raw15]
+        c30 = [float(x["c"]) for x in raw30]
+        c60 = [float(x["c"]) for x in raw60]
+        base = rank_score(c15, c30, c60, conf["rsi_buy"], conf["rsi_sell"], conf["ema_fast"], conf["ema_slow"])
+
+        rawq = (quotes_map.get("quotes") or {}).get(sym, [])
+        scored = _score_with_micro(conf, base, rawq)
+        if scored is None:
+            continue
+        ranked.append((scored, sym, raw15))
+
+    ranked.sort(reverse=True)
+    rep = (
+        "📡 Сканер (акції):\n"
+        f"• Символів у списку: {len(symbols)}\n"
+        f"• Використаємо для торгівлі (лімітом): {min(conf['top_n'], len(ranked))}\n"
+        + (f"• Перші 25: " + ", ".join([s for _, s, _ in ranked[:25]])
+           if ranked else "• Немає сигналів")
+    )
+    return rep, ranked
+
 # ======= AUTOSCAN (background) =======
 
 async def _cleanup_crypto_exits_if_closed(sym: str):
-    """Якщо позиції немає — скасувати відкриті sell TP/SL по цьому символу."""
     if not await has_open_position(sym):
         await cancel_open_orders_for(sym)
 
@@ -632,15 +768,10 @@ async def _auto_scan_once_for_chat(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE)
     except Exception:
         market_open = True
 
-    # скани
-    try:
-        _, crypto_ranked = await scan_rank_crypto(st)
-    except Exception:
-        crypto_ranked = []
-    try:
-        _, stocks_ranked = await scan_rank_stocks(st)
-    except Exception:
-        stocks_ranked = []
+    try: _, crypto_ranked = await scan_rank_crypto(st)
+    except Exception: crypto_ranked = []
+    try: _, stocks_ranked = await scan_rank_stocks(st)
+    except Exception: stocks_ranked = []
 
     combined: List[Tuple[float, str, str, List[Dict[str, Any]]]] = []
     for sc, sym, arr in crypto_ranked: combined.append((sc, sym, "crypto", arr))
@@ -652,7 +783,6 @@ async def _auto_scan_once_for_chat(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE)
         if kind == "stock" and not market_open:
             continue
         if await blocked_by_open_state(sym):
-            # для крипти паралельно прибираємо «хвости», якщо позиція вже закрита
             if kind == "crypto":
                 await _cleanup_crypto_exits_if_closed(sym)
             continue
@@ -678,7 +808,6 @@ async def _auto_scan_once_for_chat(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE)
             except Exception as e:
                 await ctx.bot.send_message(chat_id, f"🔴 AUTO ORDER FAIL {sym}: {e}")
 
-    # періодично чистимо хвости по всіх крипто-символах
     for sym in CRYPTO_USD_PAIRS:
         await _cleanup_crypto_exits_if_closed(sym)
 
