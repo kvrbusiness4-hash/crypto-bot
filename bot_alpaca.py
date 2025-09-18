@@ -6,7 +6,8 @@ import math
 import asyncio
 import time
 from typing import Dict, Any, Tuple, List, Optional
-
+import os, datetime
+BUILD = (os.getenv("RAILWAY_GIT_COMMIT_SHA") or "local")[:7]
 from aiohttp import ClientSession, ClientTimeout
 
 from telegram import Update, ReplyKeyboardMarkup
@@ -469,6 +470,18 @@ async def alp_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await u.message.reply_text(f"🔴 alp_status error: {e}")
 
+async def version(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    await u.message.reply_text(f"Build: {BUILD} · {ts}")
+
+async def env_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    use_quotes = int(os.getenv("SCALP_USE_QUOTES") or 0)
+    await u.message.reply_text(
+        "ENV:\n"
+        f"SCALP_USE_QUOTES={use_quotes}\n"
+        f"ALPACA_DATA_URL={ALPACA_DATA_URL}\n"
+        f"ALPACA_BASE_URL={ALPACA_BASE_URL}"
+    )
 # ------- CRYPTO commands -------
 async def signals_crypto(u: Update, c: ContextTypes.DEFAULT_TYPE):
     st = stdef(u.effective_chat.id)
@@ -800,7 +813,8 @@ def main() -> None:
     # Акції
     app.add_handler(CommandHandler("signals_stocks", signals_stocks))
     app.add_handler(CommandHandler("trade_stocks", trade_stocks))
-
+    app.add_handler(CommandHandler("version", version))
+    app.add_handler(CommandHandler("env_status", env_status))
     # Автоскан
     app.add_handler(CommandHandler("auto_on", auto_on))
     app.add_handler(CommandHandler("auto_off", auto_off))
