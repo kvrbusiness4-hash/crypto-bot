@@ -507,38 +507,35 @@ async def scanner_loop(app: Application) -> None:
         await asyncio.sleep( max(5, SCAN_INTERVAL_SEC // 5) )
 
 
-# ================== MAIN ==================
+# ===== запуск =====
 
-def main():
+async def main():
     global HTTP
-    if not TG_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+    async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
+        HTTP = session
 
-    HTTP = aiohttp.ClientSession(timeout=TIMEOUT)
+        app = Application.builder().token(TG_TOKEN).build()
 
-    app = Application.builder().token(TG_TOKEN).build()
+        app.add_handler(CommandHandler("start", start_cmd))
+        app.add_handler(CommandHandler("alp_status", alp_status_cmd))
+        app.add_handler(CommandHandler("alp_on", alp_on_cmd))
+        app.add_handler(CommandHandler("alp_off", alp_off_cmd))
+        app.add_handler(CommandHandler("auto_on", auto_on_cmd))
+        app.add_handler(CommandHandler("auto_off", auto_off_cmd))
+        app.add_handler(CommandHandler("auto_status", auto_status_cmd))
+        app.add_handler(CommandHandler("signals_crypto", signals_crypto_cmd))
+        app.add_handler(CommandHandler("signals_stocks", signals_stocks_cmd))
+        app.add_handler(CommandHandler("scalp", scalp_cmd))
+        app.add_handler(CommandHandler("aggressive", aggressive_cmd))
+        app.add_handler(CommandHandler("safe", safe_cmd))
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("alp_status", alp_status_cmd))
-    app.add_handler(CommandHandler("alp_on", alp_on_cmd))
-    app.add_handler(CommandHandler("alp_off", alp_off_cmd))
-    app.add_handler(CommandHandler("auto_on", auto_on_cmd))
-    app.add_handler(CommandHandler("auto_off", auto_off_cmd))
-    app.add_handler(CommandHandler("auto_status", auto_status_cmd))
-    app.add_handler(CommandHandler("signals_crypto", signals_crypto_cmd))
-    app.add_handler(CommandHandler("signals_stocks", signals_stocks_cmd))
-    app.add_handler(CommandHandler("scalp", scalp_cmd))
-    app.add_handler(CommandHandler("aggressive", aggressive_cmd))
-    app.add_handler(CommandHandler("safe", safe_cmd))
+        # запускаємо фон
+        app.create_task(scanner_loop(app))
 
-    # запустимо фонову корутину
-    app.create_task(scanner_loop(app))
-
-    print("Bot started.")
-    # важливо: один-єдиний event loop, без asyncio.run усередині run_polling
-    app.run_polling(close_loop=False)
+        print("Bot started.")
+        await app.run_polling(close_loop=False)
 
 
 if __name__ == "__main__":
-    import aiohttp  # локальний імпорт після перевірок
-    main()
+    import asyncio
+    asyncio.run(main())
