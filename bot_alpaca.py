@@ -183,16 +183,18 @@ async def alp_post_json(path: str, payload: Dict[str, Any]) -> Any:
 # Додати функцію перевірки балансу
 async def check_balance(symbol: str, notional: float, is_crypto: bool) -> bool:
     """Перевірка балансу перед виставленням ордера"""
+    # Для криптовалют перевірка доступного балансу на конкретну пару
     if is_crypto:
-        # Для криптовалюти перевіряємо доступний баланс на обрану пару
+        # Перевірка для криптовалют: використовуємо правильний символ, без "/USD"
+        symbol = symbol.replace("/USD", "")
         available_balance = await alp_get_json(f"/v1beta3/crypto/us/account")
         balance = float(available_balance.get(symbol, {}).get("available", 0))
     else:
-        # Для акцій перевіряємо доступний баланс на рахунку
+        # Для акцій перевірка доступного балансу
         available_balance = await alp_get_json("/v2/account")
         balance = float(available_balance.get("cash", 0))
 
-    # Перевіряємо, чи вистачає балансу на ордер
+    # Перевірка чи достатньо коштів для ордера
     if balance >= notional:
         return True
     return False
@@ -213,6 +215,7 @@ async def place_order(sym: str, side: str, notional: float, tp: float, sl: float
 
     return f"🟢 Ордер на {sym} {side.upper()} на {notional} USD успішно виконано!"
 
+# Оновлена функція signals_crypto
 # Оновлена функція signals_crypto
 async def signals_crypto(u: Update, c: ContextTypes.DEFAULT_TYPE):
     st = stdef(u.effective_chat.id)
