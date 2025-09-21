@@ -477,25 +477,37 @@ async def place_tp_sl_as_simple_sells(sym: str, filled_qty: float, tp: float | N
         }
         await alp_post_json("/v2/orders", payload_sl)
 
-
-async def place_bracket_notional_order_stock(sym: str, side: str, notional: float,
-                                             tp: float | None, sl: float | None) -> Any:
+async def place_bracket_notional_order_crypto(sym: str, side: str, notional: float,
+                                              tp: float | None = None, sl: float | None = None) -> Any:
     if side.lower() != "buy":
-        raise RuntimeError("stocks: лише long buy підтримано")
+        raise RuntimeError("crypto: лише long buy підтримано")
+
+    # Тільки маркет-ордер без SL/TP
     buy = await place_market_buy_notional(sym, notional)
 
     order_id = buy.get("id", "")
-    filled_qty = 0.0
-    for _ in range(10):
+    for _ in range(12):
         od = await get_order(order_id)
-        status = od.get("status")
-        if status in ("filled", "partially_filled"):
-            filled_qty = float(od.get("filled_qty") or 0)
-            if status == "filled":
-                break
+        if od.get("status") in ("filled", "partially_filled"):
+            break
         await asyncio.sleep(0.7)
 
-    await place_tp_sl_as_simple_sells(sym, filled_qty, tp, sl, is_crypto=False)
+    return buy
+                                                  
+async def place_bracket_notional_order_stock(sym: str, side: str, notional: float,
+                                             tp: float | None = None, sl: float | None = None) -> Any:
+    if side.lower() != "buy":
+        raise RuntimeError("stocks: лише long buy підтримано")
+
+    buy = await place_market_buy_notional(sym, notional)
+
+    order_id = buy.get("id", "")
+    for _ in range(12):
+        od = await get_order(order_id)
+        if od.get("status") in ("filled", "partially_filled"):
+            break
+        await asyncio.sleep(0.7)
+
     return buy
 
 # -------- COMMANDS --------
