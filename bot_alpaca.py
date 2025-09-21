@@ -9,11 +9,7 @@ from typing import Dict, Any, Tuple, List, Optional
 from aiohttp import ClientSession, ClientTimeout
 
 from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ========= ENV =========
 
@@ -30,19 +26,17 @@ ALPACA_TOP_N = int(os.getenv("ALPACA_TOP_N") or 3)
 ALPACA_MAX_CRYPTO = int(os.getenv("ALPACA_MAX_CRYPTO") or 25)
 ALPACA_MAX_STOCKS = int(os.getenv("ALPACA_MAX_STOCKS") or 50)
 
-# інтервал фонового автоскану в секундах
-SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC") or 300)  # 5 хв за замовчуванням
-DEDUP_COOLDOWN_MIN = int(os.getenv("DEDUP_COOLDOWN_MIN") or 240)  # хвилини антидубля
+SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC") or 300)   # 5 хв
+DEDUP_COOLDOWN_MIN = int(os.getenv("DEDUP_COOLDOWN_MIN") or 240) # антидубль (хв)
 
 # ====== GLOBAL STATE (per chat) ======
 STATE: Dict[int, Dict[str, Any]] = {}
 
-# ====== MODE PROFILES (таймфрейми, фільтри, ризики) ======
+# ====== MODE PROFILES ======
 MODE_PARAMS = {
     "aggressive": {
         "bars": ("15Min", "30Min", "1Hour"),
-        "rsi_buy": 55.0,
-        "rsi_sell": 45.0,
+        "rsi_buy": 55.0, "rsi_sell": 45.0,
         "ema_fast": 15, "ema_slow": 30,
         "top_n": ALPACA_TOP_N,
         "tp_pct": 0.015,
@@ -53,7 +47,7 @@ MODE_PARAMS = {
         "rsi_buy": 58.0, "rsi_sell": 42.0,
         "ema_fast": 9, "ema_slow": 21,
         "top_n": ALPACA_TOP_N,
-        "tp_pct": 0.010,   # <- це і буде %sell (1.0%)
+        "tp_pct": 0.010,
         "sl_pct": 0.006,
     },
     "default": {
@@ -82,14 +76,13 @@ MODE_PARAMS = {
     },
 }
 
-# ====== CRYPTO WHITELIST (USD пари) ======
+# ====== SYMBOL LISTS ======
 CRYPTO_USD_PAIRS = [
     "BTC/USD","ETH/USD","SOL/USD","LTC/USD","DOGE/USD","AVAX/USD","AAVE/USD","MKR/USD","DOT/USD",
     "LINK/USD","UNI/USD","PEPE/USD","XRP/USD","TRUMP/USD","CRV/USD","BCH/USD","BAT/USD","GRT/USD",
     "XTZ/USD","USDC/USD","USDT/USD","USDG/USD","YFI/USD","LDO/USD"
 ][:ALPACA_MAX_CRYPTO]
 
-# ====== STOCKS UNIVERSE ======
 STOCKS_UNIVERSE = [
     "AAPL","MSFT","NVDA","AMZN","META","GOOGL","ADBE","CRM","ORCL","AMD","AMAT","INTC","CSCO","QCOM",
     "BAC","JPM","GS","BRK.B","V","MA","KO","PEP","MCD","NKE",
@@ -118,7 +111,7 @@ def is_crypto_sym(sym: str) -> bool:
 def now_s() -> float:
     return time.time()
 
-RECENT_TRADES: Dict[str, float] = {}  # "CRYPTO|AAVEUSD|buy" або "STOCK|AAPL|buy"
+RECENT_TRADES: Dict[str, float] = {}
 def skip_as_duplicate(market: str, sym: str, side: str) -> bool:
     key = f"{market}|{to_order_sym(sym)}|{side.lower()}"
     last = RECENT_TRADES.get(key, 0)
@@ -272,23 +265,74 @@ def calc_sl_tp(side: str, price: float, conf: Dict[str, Any]) -> Tuple[Optional[
         sl = price * (1.0 + sl_pct)
         return (tp, sl)
 
-# ---------- NEW: text formatter ----------
-def format_order_text(sym: str, side: str, notional: float, entry_price: float,
-                      conf: Dict[str, Any], tp: Optional[float], sl: Optional[float],
-                      mode: str, include_tp_sl: bool = False) -> str:
-    """Формує текст для Telegram. У scalp показує %sell та ціну входу."""
-    pct = float(conf.get("tp_pct", 0.0)) * 100.0
-    base = (f"🟢 ORDER OK: {sym} {side.upper()} ${notional:.2f}\n"
-            f"Вхід: {entry_price:.6f}")
-    if mode == "scalp":
-        base += f" · %sell:+{pct:.2f}%"
-        if tp is not None:
-            base += f" → TP:{tp:.6f}"
-    if include_tp_sl and tp is not None:
-        base += f" TP:{tp:.6f}"
-    if include_tp_sl and sl is not None:
-        base += f" SL:{sl:.6f}"
-    return base
+# -------- SCAN (CRYPTO) --------
+async def scan_rank_crypto(st: Dict[str, Any]) -> Tuple[str, List[Tuple[float, str, List[Dict[str, Any]]]]]:
+    conf = _mode_conf(st)
+    tf15, tf30, tf60 = map_tf(conf["bars"][0]), map_tf(conf["bars"][1]), map_tf(conf["bars"][2])
+
+    pairs = CRYPTO_USD_PAIRS[:]
+    data_pairs = [to_data_sym(p) for p in pairs]
+
+    bars15 = await get_bars_crypto(data_pairs, tf15, limit=120)
+    bars30 = await get_bars_crypto(data_pairs, tf30, limit=120)
+    bars60 = await get_bars_crypto(data_pairs, tf60, limit=120)
+
+    ranked: List[Tuple[float, str, List[Dict[str, Any]]]] = []
+    for sym in data_pairs:
+        raw15 = (bars15.get("bars") or {}).get(sym, [])
+        raw30 = (bars30.get("bars") or {}).get(sym, [])
+        raw60 = (bars60.get("bars") or {}).get(sym, [])
+        if not raw15 or not raw30 or not raw60:
+            continue
+        c15 = [float(x["c"]) for x in raw15]
+        c30 = [float(x["c"]) for x in raw30]
+        c60 = [float(x["c"]) for x in raw60]
+        score = rank_score(c15, c30, c60, conf["rsi_buy"], conf["rsi_sell"], conf["ema_fast"], conf["ema_slow"])
+        ranked.append((score, sym, raw15))
+
+    ranked.sort(reverse=True)
+    rep = (
+        "🛰️ Сканер (крипта):\n"
+        f"• Активних USD-пар: {len(data_pairs)}\n"
+        f"• Використаємо для торгівлі (лімітом): {min(conf['top_n'], len(ranked))}\n"
+        + (f"• Перші 25: " + ", ".join([s for _, s, _ in ranked[:25]])
+           if ranked else "• Немає сигналів")
+    )
+    return rep, ranked
+
+# -------- SCAN (STOCKS) --------
+async def scan_rank_stocks(st: Dict[str, Any]) -> Tuple[str, List[Tuple[float, str, List[Dict[str, Any]]]]]:
+    conf = _mode_conf(st)
+    tf15, tf30, tf60 = map_tf(conf["bars"][0]), map_tf(conf["bars"][1]), map_tf(conf["bars"][2])
+
+    symbols = STOCKS_UNIVERSE[:]
+
+    bars15 = await get_bars_stocks(symbols, tf15, limit=120)
+    bars30 = await get_bars_stocks(symbols, tf30, limit=120)
+    bars60 = await get_bars_stocks(symbols, tf60, limit=120)
+
+    ranked: List[Tuple[float, str, List[Dict[str, Any]]]] = []
+    for sym in symbols:
+        raw15 = (bars15.get("bars") or {}).get(sym, [])
+        raw30 = (bars30.get("bars") or {}).get(sym, [])
+        raw60 = (bars60.get("bars") or {}).get(sym, [])
+        if not raw15 or not raw30 or not raw60:
+            continue
+        c15 = [float(x["c"]) for x in raw15]
+        c30 = [float(x["c"]) for x in raw30]
+        c60 = [float(x["c"]) for x in raw60]
+        score = rank_score(c15, c30, c60, conf["rsi_buy"], conf["rsi_sell"], conf["ema_fast"], conf["ema_slow"])
+        ranked.append((score, sym, raw15))
+
+    ranked.sort(reverse=True)
+    rep = (
+        "📡 Сканер (акції):\n"
+        f"• Символів у списку: {len(symbols)}\n"
+        f"• Використаємо для торгівлі (лімітом): {min(conf['top_n'], len(ranked))}\n"
+        + (f"• Перші 25: " + ", ".join([s for _, s, _ in ranked[:25]])
+           if ranked else "• Немає сигналів")
+    )
+    return rep, ranked
 
 # ======== ORDERS ========
 
@@ -395,9 +439,9 @@ async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "/trade_crypto — миттєво торгувати топ-N без додаткового звіту\n"
         "/signals_stocks — показати топ-N для акцій\n"
         "/trade_stocks — миттєво торгувати топ-N акцій\n"
-        "/alp_on /alp_off /alp_status — автотрейд (дозвіл виставляти ордери)\n"
-        "/auto_on /auto_off /auto_status — фоновий автоскан ринку\n"
-        "/long_mode /short_mode /both_mode — напрям (short ігнорується для крипти)\n"
+        "/alp_on /alp_off /alp_status — автотрейд\n"
+        "/auto_on /auto_off /auto_status — фоновий автоскан\n"
+        "/long_mode /short_mode /both_mode — напрям (short для крипти ігнорується)\n"
         "/aggressive /scalp /default /swing /safe — профілі ризику",
         reply_markup=kb()
     )
@@ -477,12 +521,10 @@ async def signals_crypto(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
             try:
                 await place_bracket_notional_order_crypto(sym, side, ALPACA_NOTIONAL, tp, sl)
-                msg = format_order_text(
-                    sym=sym, side=side, notional=ALPACA_NOTIONAL, entry_price=px,
-                    conf=conf, tp=tp, sl=sl, mode=st.get("mode","default"),
-                    include_tp_sl=False  # якщо хочеш писати TP/SL в тексті — постав True
+                await u.message.reply_text(
+                    f"🟢 ORDER OK: {sym} BUY ${ALPACA_NOTIONAL:.2f}\n"
+                    f"TP:{tp:.6f} SL:{sl:.6f} (окремими ордерами)"
                 )
-                await u.message.reply_text(msg)
             except Exception as e:
                 await u.message.reply_text(f"🔴 ORDER FAIL {sym} BUY: {e}")
 
@@ -513,12 +555,10 @@ async def trade_crypto(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
             try:
                 await place_bracket_notional_order_crypto(sym, side, ALPACA_NOTIONAL, tp, sl)
-                msg = format_order_text(
-                    sym=sym, side=side, notional=ALPACA_NOTIONAL, entry_price=px,
-                    conf=conf, tp=tp, sl=sl, mode=st.get("mode","default"),
-                    include_tp_sl=False
+                await u.message.reply_text(
+                    f"🟢 ORDER OK: {sym} BUY ${ALPACA_NOTIONAL:.2f}\n"
+                    f"TP:{tp:.6f} SL:{sl:.6f} (окремими ордерами)"
                 )
-                await u.message.reply_text(msg)
             except Exception as e:
                 await u.message.reply_text(f"🔴 ORDER FAIL {sym} BUY: {e}")
     except Exception as e:
@@ -561,12 +601,10 @@ async def signals_stocks(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
             try:
                 await place_bracket_notional_order_stock(sym, side, ALPACA_NOTIONAL, tp, sl)
-                msg = format_order_text(
-                    sym=sym, side=side, notional=ALPACA_NOTIONAL, entry_price=px,
-                    conf=conf, tp=tp, sl=sl, mode=st.get("mode","default"),
-                    include_tp_sl=False
+                await u.message.reply_text(
+                    f"🟢 ORDER OK: {sym} BUY ${ALPACA_NOTIONAL:.2f}\n"
+                    f"TP:{tp:.6f} SL:{sl:.6f} (окремими ордерами)"
                 )
-                await u.message.reply_text(msg)
             except Exception as e:
                 await u.message.reply_text(f"🔴 ORDER FAIL {sym} BUY: {e}")
 
@@ -608,12 +646,10 @@ async def trade_stocks(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
             try:
                 await place_bracket_notional_order_stock(sym, side, ALPACA_NOTIONAL, tp, sl)
-                msg = format_order_text(
-                    sym=sym, side=side, notional=ALPACA_NOTIONAL, entry_price=px,
-                    conf=conf, tp=tp, sl=sl, mode=st.get("mode","default"),
-                    include_tp_sl=False
+                await u.message.reply_text(
+                    f"🟢 ORDER OK: {sym} BUY ${ALPACA_NOTIONAL:.2f}\n"
+                    f"TP:{tp:.6f} SL:{sl:.6f} (окремими ордерами)"
                 )
-                await u.message.reply_text(msg)
             except Exception as e:
                 await u.message.reply_text(f"🔴 ORDER FAIL {sym} BUY: {e}")
     except Exception as e:
@@ -670,12 +706,10 @@ async def _auto_scan_once_for_chat(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE)
                 await place_bracket_notional_order_stock(sym, side, ALPACA_NOTIONAL, tp, sl)
             else:
                 await place_bracket_notional_order_crypto(sym, side, ALPACA_NOTIONAL, tp, sl)
-            msg = format_order_text(
-                sym=sym, side=side, notional=ALPACA_NOTIONAL, entry_price=px,
-                conf=conf, tp=tp, sl=sl, mode=st.get("mode","default"),
-                include_tp_sl=False
+            await ctx.bot.send_message(
+                chat_id,
+                f"🟢 AUTO ORDER: {to_order_sym(sym)} BUY ${ALPACA_NOTIONAL:.2f} · TP:{(tp or 0):.6f} SL:{(sl or 0):.6f}"
             )
-            await ctx.bot.send_message(chat_id, msg)
         except Exception as e:
             await ctx.bot.send_message(chat_id, f"🔴 AUTO ORDER FAIL {sym}: {e}")
 
@@ -748,11 +782,6 @@ def main() -> None:
     app.add_handler(CommandHandler("trade_stocks", trade_stocks))
 
     # Автоскан
-    app.add_handler(CommandHandler("auto_on", auto_on))
-    app.add_handler(CommandHandler("auto_off", auto_off))
-    app.add_handler(CommandHandler("auto_status", auto_status))
-
-    # фоновий job раз у SCAN_INTERVAL_SEC
     app.job_queue.run_repeating(periodic_auto_scan, interval=SCAN_INTERVAL_SEC, first=10)
 
     print("Bot started.")
