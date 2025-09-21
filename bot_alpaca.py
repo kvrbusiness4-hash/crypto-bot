@@ -180,7 +180,73 @@ async def alp_post_json(path: str, payload: Dict[str, Any]) -> Any:
             if r.status >= 400:
                 raise RuntimeError(f"POST {path} {r.status}: {txt}")
             return json.loads(txt) if txt else {}
+# Додати функцію перевірки балансу
+async def check_balance(symbol: str, notional: float, is_crypto: bool) -> bool:
+    """Перевірка балансу перед виставленням ордера"""
+    if is_crypto:
+        # Для криптовалюти перевіряємо доступний баланс на обрану пару
+        available_balance = await alp_get_json(f"/v1beta3/crypto/us/account")
+        balance = float(available_balance.get(symbol, {}).get("available", 0))
+    else:
+        # Для акцій перевіряємо доступний баланс на рахунку
+        available_balance = await alp_get_json("/v2/account")
+        balance = float(available_balance.get("cash", 0))
 
+    # Перевіряємо, чи вистачає балансу на ордер
+    if balance >= notional:
+        return True
+    return False
+
+# Оновлені функції, що виставляють ордери
+async def place_order(sym: str, side: str, notional: float, tp: float, sl: float, is_crypto: bool):
+    """Виставлення ордера, якщо достатньо балансу"""
+    # Перевірка балансу перед виставленням ордера
+    if not await check_balance(sym, notional, is_crypto):
+        raise RuntimeError(f"🔴 Не вистачає коштів для ордера {sym} {side.upper()}. Баланс: {balance:.2f}.")
+
+    if is_crypto:
+        # Можна додати логіку для ордерів криптовалют
+        await place_bracket_notional_order_crypto(sym, side, notional, tp, sl)
+    else:
+        # Можна додати логіку для ордерів акцій
+        await place_bracket_notional_order_stock(sym, side, notional, tp, sl)
+
+    return f"🟢 Ордер на {sym} {side.upper()} на {notional} USD успішно виконано!"
+
+# Оновлена функція signals_crypto
+async def signals_crypto(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st = stdef(u.effective_chat.id)
+    try:
+        report, ranked = await scan_rank_crypto(st)
+        await u.message.reply_text(report)
+
+        if not st.get("autotrade") or not ranked:
+            return
+
+        picks = ranked[: _mode_conf(st)["top_n"]]
+        for _, sym, arr in picks:
+            side = "buy"  # short ігнорується
+            px = float(arr[-1]["c"])
+            conf = _mode_conf(st)
+            sl, tp = calc_sl_tp(side, px, conf)
+
+            if await has_open_long(sym):
+                await u.message.reply_text(f"⚪ SKIP: вже є позиція по {to_order_sym(sym)}")
+                continue
+
+            if skip_as_duplicate("CRYPTO", sym, side):
+                await u.message.reply_text(f"⚪ SKIP (дубль): {sym} {side.upper()}")
+                continue
+
+            try:
+                # Викликаємо нову функцію для перевірки балансу перед ордером
+                result = await place_order(sym, side, ALPACA_NOTIONAL, tp, sl, is_crypto=True)
+                await u.message.reply_text(result)
+            except Exception as e:
+                await u.message.reply_text(f"🔴 ORDER FAIL {sym} BUY: {e}")
+
+    except Exception as e:
+        await u.message.reply_text(f"🔴 signals_crypto error: {e}")
 # ===== helper: clock & positions =====
 async def alp_clock() -> Dict[str, Any]:
     return await alp_get_json("/v2/clock")
