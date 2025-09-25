@@ -206,22 +206,22 @@ async def get_bars_stocks(symbols: List[str], timeframe: str, limit: int = 120) 
             return json.loads(txt) if txt else {}
 
 async def get_latest_quote_crypto(sym: str) -> Optional[Dict[str, Any]]:
-    # NBBO quote (best bid/ask + sizes)
+    # NBBO quote (best bid/ask + sizes) — беремо останній через /quotes
     dsym = to_data_sym(sym)
-    path = "/v1beta3/crypto/us/quotes/latest"
-    params = {"symbols": dsym}
+    path = "/v1beta3/crypto/us/quotes"
+    params = {"symbols": dsym, "limit": "1", "sort": "desc"}
     data = await alp_get_json(path, params)
-    q = (data.get("quotes") or {}).get(dsym)
-    return q[-1] if isinstance(q, list) and q else q
+    arr = (data.get("quotes") or {}).get(dsym) or []
+    return arr[0] if arr else None
 
 async def get_latest_trade_crypto(sym: str) -> Optional[float]:
+    # останній трейд через /trades
     dsym = to_data_sym(sym)
-    path = "/v1beta3/crypto/us/trades/latest"
-    params = {"symbols": dsym}
+    path = "/v1beta3/crypto/us/trades"
+    params = {"symbols": dsym, "limit": "1", "sort": "desc"}
     data = await alp_get_json(path, params)
-    t = (data.get("trades") or {}).get(dsym)
-    if isinstance(t, list) and t:
-        t = t[-1]
+    arr = (data.get("trades") or {}).get(dsym) or []
+    t = arr[0] if arr else None
     return float(t.get("p")) if t else None
 
 # -------- INDICATORS --------
