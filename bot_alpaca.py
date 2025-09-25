@@ -11,7 +11,6 @@ from typing import Dict, Any, Tuple, List, Optional
 from aiohttp import ClientSession, ClientTimeout
 
 from telegram import Update, ReplyKeyboardMarkup
-from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ========= ENV =========
@@ -303,14 +302,14 @@ def _floor_qty(x: float, dec: int = 6) -> float:
     m = 10 ** dec
     return math.floor(x * m) / m
 
-async def place_market_buy_notional(sym: str, notional: float) -> dict:
-    # невеликий запас, щоб уникнути 403 через “available”
-    safe_notional = max(1.0, float(notional) * 0.995)
+async def place_market_buy_notional(sym: str, notional: float, tif: str = "gtc") -> dict:
+    """Маркет-покупка за нотіоналом. tif: 'gtc' для крипти, 'day' для акцій (фікс fractional orders)."""
+    safe_notional = max(1.0, float(notional) * 0.995)  # трохи нижче, щоб не впертись у available
     payload = {
         "symbol": to_order_sym(sym),
         "side": "buy",
         "type": "market",
-        "time_in_force": "gtc",
+        "time_in_force": tif,
         "notional": f"{safe_notional:.2f}",
     }
     return await alp_post_json("/v2/orders", payload)
@@ -360,24 +359,25 @@ async def place_bracket_notional_order_crypto(sym: str, side: str, notional: flo
     if side.lower() != "buy":
         raise RuntimeError("crypto: лише long buy підтримано")
 
-    # 1) спроба по нотіоналу із запасом
+    # 1) спроба по нотіоналу (крипта дозволяє GTC)
     try:
-        buy = await place_market_buy_notional(sym, notional)
+        buy = await place_market_buy_notional(sym, notional, tif="gtc")
     except RuntimeError as e:
         msg = str(e)
-        # 2) якщо 403 insufficient balance — беремо available і повторюємо qty-ордер
         if "insufficient balance" in msg:
+            # 2) fallback: беремо available й купуємо по qty з запасом вниз
             m = re.search(r'"available"\s*:\s*"([\d\.]+)"', msg)
             if not m:
                 raise
             available_qty = float(m.group(1))
-            safe_qty = _floor_qty(available_qty - 1e-6, 6)
+            safe_qty = _floor_qty(max(0.0, available_qty * 0.99), 6)
             if safe_qty <= 0:
-                raise
+                raise RuntimeError("Недостатньо балансу навіть після зменшення")
             buy = await place_market_buy_qty(sym, safe_qty)
         else:
             raise
 
+    # чекаємо fill
     order_id = buy.get("id", "")
     filled_qty = 0.0
     for _ in range(10):
@@ -396,7 +396,8 @@ async def place_bracket_notional_order_stock(sym: str, side: str, notional: floa
                                              tp: float | None, sl: float | None) -> Any:
     if side.lower() != "buy":
         raise RuntimeError("stocks: лише long buy підтримано")
-    buy = await place_market_buy_notional(sym, notional)
+    # ВАЖЛИВО: для нотіональних (fractional) ордерів по акціях потрібен time_in_force="day"
+    buy = await place_market_buy_notional(sym, notional, tif="day")
 
     order_id = buy.get("id", "")
     filled_qty = 0.0
