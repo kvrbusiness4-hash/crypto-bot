@@ -299,46 +299,67 @@ async def scan_rank_stocks(st: Dict[str, Any]) -> Tuple[str, List[Tuple[float, s
     )
     return rep, ranked
 
-# ======== ORDERS ========
+# ======== ORDERS (CRITICAL PATCH) ========
 
-def _round_stock_qty(qty: float) -> float:
-    return round(qty, 3)
+# мінімальні кроки кількості для крипти на Alpaca (можете доповнювати)
+CRYPTO_QTY_STEP = {
+    "BTCUSD": 0.000001,
+    "ETHUSD": 0.00001,
+    "AAVEUSD": 0.0001,
+    "SOLUSD": 0.001,
+    "LTCUSD": 0.001,
+    "DOGEUSD": 1.0e-4,
+    "AVAXUSD": 0.001,
+    # fallback для решти — 1e-6
+}
+def _qty_step(sym: str) -> float:
+    return CRYPTO_QTY_STEP.get(sym.upper().replace("/", ""), 1e-6)
 
-def _floor_qty(x: float, dec: int = 6) -> float:
-    if x <= 0: return 0.0
-    m = 10 ** dec
-    return math.floor(x * m) / m
+def _floor_step(x: float, step: float) -> float:
+    if x <= 0 or step <= 0: return 0.0
+    return math.floor(x / step) * step
 
-# ---- MARKET BUY HELPERS ----
+async def get_last_crypto_price(sym: str) -> float:
+    data_sym = to_data_sym(sym)
+    bars = await get_bars_crypto([data_sym], "1Min", limit=1)
+    arr = (bars.get("bars") or {}).get(data_sym, [])
+    if not arr:
+        raise RuntimeError(f"Немає ціни для {sym}")
+    return float(arr[-1]["c"])
+
 async def place_market_buy_qty(sym: str, qty: float) -> dict:
+    """Завжди qty для крипти; для акцій не використовуємо."""
+    step = _qty_step(sym)
+    qty = _floor_step(float(qty), step)
     payload = {
         "symbol": to_order_sym(sym),
+        "asset_class": "crypto",
         "side": "buy",
         "type": "market",
-        "time_in_force": "gtc",  # crypto ok
-        "qty": f"{_floor_qty(qty):.6f}",
+        "time_in_force": "gtc",
+        "qty": f"{qty:.10f}",
     }
     return await alp_post_json("/v2/orders", payload)
 
 async def place_market_buy_notional(sym: str, notional: float) -> dict:
     """
-    Акції: notional (fractional) => time_in_force='day'
-    Крипта: переводимо notional у qty і відправляємо як qty (щоб не ловити USD-403).
+    УВАГА: ДЛЯ КРИПТИ НІКОЛИ НЕ ВИКОРИСТОВУЄМО NOTIONAL.
+    Якщо sym — крипта, переводимо notional → qty і викликаємо place_market_buy_qty.
+    Для акцій залишаємо notional + time_in_force='day'.
     """
     if is_crypto_sym(sym):
         price = await get_last_crypto_price(sym)
-        qty = _floor_qty((float(notional) / max(price, 1e-9)) * 0.985, 6)  # 1.5% запас
-        if qty <= 0:
-            raise RuntimeError("Розрахована кількість <= 0")
-        return await place_market_buy_qty(sym, qty)
+        # 2% запас, щоб не впертися в available та рух ціни
+        raw_qty = (float(notional) / max(price, 1e-9)) * 0.98
+        return await place_market_buy_qty(sym, raw_qty)
 
-    # stock
+    # STOCKS (fractional) -> notional + DAY
     safe_notional = max(1.0, float(notional) * 0.995)
     payload = {
         "symbol": to_order_sym(sym),
         "side": "buy",
         "type": "market",
-        "time_in_force": "day",  # <- fractional orders must be DAY
+        "time_in_force": "day",   # fractional orders must be DAY
         "notional": f"{safe_notional:.2f}",
     }
     return await alp_post_json("/v2/orders", payload)
@@ -349,40 +370,41 @@ async def get_order(order_id: str) -> dict:
 async def place_tp_sl_as_simple_sells(sym: str, filled_qty: float, tp: float | None, sl: float | None, is_crypto: bool):
     if filled_qty <= 0:
         return
-    qty = _floor_qty(filled_qty) if is_crypto else _round_stock_qty(filled_qty)
+    qty = _floor_step(filled_qty, _qty_step(sym)) if is_crypto else round(filled_qty, 3)
 
     if tp is not None:
-        payload_tp = {
+        await alp_post_json("/v2/orders", {
             "symbol": to_order_sym(sym),
             "side": "sell",
             "type": "limit",
             "time_in_force": "gtc",
             "limit_price": f"{tp:.6f}",
             "qty": f"{qty}",
-        }
-        await alp_post_json("/v2/orders", payload_tp)
+            "asset_class": "crypto" if is_crypto else "us_equity",
+        })
 
     if sl is not None:
-        payload_sl = {
+        await alp_post_json("/v2/orders", {
             "symbol": to_order_sym(sym),
             "side": "sell",
             "type": "stop",
             "time_in_force": "gtc",
             "stop_price": f"{sl:.6f}",
             "qty": f"{qty}",
-        }
-        await alp_post_json("/v2/orders", payload_sl)
+            "asset_class": "crypto" if is_crypto else "us_equity",
+        })
 
 async def place_bracket_notional_order_crypto(sym: str, side: str, notional: float,
                                               tp: float | None, sl: float | None) -> Any:
     if side.lower() != "buy":
         raise RuntimeError("crypto: лише long buy підтримано")
 
-    buy = await place_market_buy_notional(sym, notional)  # для крипти всередині конвертується у qty
+    # КУПУЄМО КІЛЬКІСТЮ (без notional)
+    buy = await place_market_buy_notional(sym, notional)
 
     order_id = buy.get("id", "")
     filled_qty = 0.0
-    for _ in range(12):
+    for _ in range(14):
         od = await get_order(order_id)
         status = od.get("status")
         if status in ("filled", "partially_filled"):
@@ -402,7 +424,7 @@ async def place_bracket_notional_order_stock(sym: str, side: str, notional: floa
 
     order_id = buy.get("id", "")
     filled_qty = 0.0
-    for _ in range(12):
+    for _ in range(14):
         od = await get_order(order_id)
         status = od.get("status")
         if status in ("filled", "partially_filled"):
