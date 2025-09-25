@@ -396,16 +396,50 @@ async def place_tp_sl_as_simple_sells(sym: str, filled_qty: float, tp: float | N
 
 async def place_bracket_notional_order_crypto(sym: str, side: str, notional: float,
                                               tp: float | None, sl: float | None) -> Any:
+    """Крипта: завжди купуємо КІЛЬКІСТЮ (qty), notional не використовуємо ніколи."""
     if side.lower() != "buy":
         raise RuntimeError("crypto: лише long buy підтримано")
 
-    # КУПУЄМО КІЛЬКІСТЮ (без notional)
-    buy = await place_market_buy_notional(sym, notional)
+    # 1) беремо останню ціну і переводимо $ → qty з запасом
+    data_sym = to_data_sym(sym)
+    bars = await get_bars_crypto([data_sym], "1Min", limit=1)
+    arr = (bars.get("bars") or {}).get(data_sym, [])
+    if not arr:
+        raise RuntimeError(f"Немає ціни для {sym}")
+    last = float(arr[-1]["c"])
 
+    # 2% запасу на проскальзування/збори і округлення до кроку
+    raw_qty = (float(notional) / max(last, 1e-9)) * 0.98
+
+    # мінімальні кроки кількості
+    step = {
+        "BTCUSD": 1e-6, "ETHUSD": 1e-5, "AAVEUSD": 1e-4, "SOLUSD": 1e-3, "LTCUSD": 1e-3,
+        "DOGEUSD": 1e-4, "AVAXUSD": 1e-3
+    }.get(to_order_sym(sym), 1e-6)
+
+    def floor_step(x: float, s: float) -> float:
+        return 0.0 if x <= 0 else math.floor(x / s) * s
+
+    qty = floor_step(raw_qty, step)
+    if qty <= 0:
+        raise RuntimeError(f"qty<=0 для {sym}")
+
+    # 2) маркет-купівля КІЛЬКІСТЮ
+    payload_buy = {
+        "symbol": to_order_sym(sym),
+        "asset_class": "crypto",
+        "side": "buy",
+        "type": "market",
+        "time_in_force": "gtc",
+        "qty": f"{qty:.10f}",
+    }
+    buy = await alp_post_json("/v2/orders", payload_buy)
+
+    # 3) чекаємо заповнення і виставляємо TP/SL окремими sell-ордерами
     order_id = buy.get("id", "")
     filled_qty = 0.0
     for _ in range(14):
-        od = await get_order(order_id)
+        od = await alp_get_json(f"/v2/orders/{order_id}")
         status = od.get("status")
         if status in ("filled", "partially_filled"):
             filled_qty = float(od.get("filled_qty") or 0)
@@ -413,7 +447,31 @@ async def place_bracket_notional_order_crypto(sym: str, side: str, notional: flo
                 break
         await asyncio.sleep(0.7)
 
-    await place_tp_sl_as_simple_sells(sym, filled_qty, tp, sl, is_crypto=True)
+    # округлення до кроку для sell
+    filled_qty = floor_step(filled_qty, step)
+
+    if filled_qty > 0:
+        if tp is not None:
+            await alp_post_json("/v2/orders", {
+                "symbol": to_order_sym(sym),
+                "asset_class": "crypto",
+                "side": "sell",
+                "type": "limit",
+                "time_in_force": "gtc",
+                "limit_price": f"{tp:.6f}",
+                "qty": f"{filled_qty}",
+            })
+        if sl is not None:
+            await alp_post_json("/v2/orders", {
+                "symbol": to_order_sym(sym),
+                "asset_class": "crypto",
+                "side": "sell",
+                "type": "stop",
+                "time_in_force": "gtc",
+                "stop_price": f"{sl:.6f}",
+                "qty": f"{filled_qty}",
+            })
+
     return buy
 
 async def place_bracket_notional_order_stock(sym: str, side: str, notional: float,
