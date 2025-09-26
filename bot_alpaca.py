@@ -670,7 +670,10 @@ def main() -> None:
     app.add_handler(CommandHandler("default", default))
     app.add_handler(CommandHandler("swing", swing))
     app.add_handler(CommandHandler("safe", safe))
-
+    # Фоновий автоскан
+    app.add_handler(CommandHandler("auto_on", auto_on))
+    app.add_handler(CommandHandler("auto_off", auto_off))
+    app.add_handler(CommandHandler("auto_status", auto_status))
     app.add_handler(CommandHandler("long_mode", long_mode))
     app.add_handler(CommandHandler("short_mode", short_mode))
     app.add_handler(CommandHandler("both_mode", both_mode))
