@@ -225,7 +225,66 @@ def calc_sl_tp(side: str, price: float, conf: Dict[str, Any]) -> Tuple[Optional[
         return price*(1+tp_pct), price*(1-sl_pct)
     else:
         return price*(1-tp_pct), price*(1+sl_pct)
+# ======== SCAN + RANK =========
 
+async def scan_rank_crypto(st: Dict[str, Any]) -> Tuple[str, List[Tuple[float, str, List[Dict[str, Any]]]]]:
+    conf = _mode_conf(st)
+    bars15 = await get_bars_crypto(CRYPTO_USD_PAIRS, conf["bars"][0], 120)
+    bars30 = await get_bars_crypto(CRYPTO_USD_PAIRS, conf["bars"][1], 120)
+    bars60 = await get_bars_crypto(CRYPTO_USD_PAIRS, conf["bars"][2], 120)
+
+    ranked: List[Tuple[float, str, List[Dict[str, Any]]]] = []
+    for sym in CRYPTO_USD_PAIRS:
+        arr15 = bars15.get("bars", {}).get(to_data_sym(sym), [])
+        arr30 = bars30.get("bars", {}).get(to_data_sym(sym), [])
+        arr60 = bars60.get("bars", {}).get(to_data_sym(sym), [])
+        if not arr15 or not arr30 or not arr60:
+            continue
+        c15 = [float(x["c"]) for x in arr15]
+        c30 = [float(x["c"]) for x in arr30]
+        c60 = [float(x["c"]) for x in arr60]
+        sc = rank_score(c15, c30, c60,
+                        conf["rsi_buy"], conf["rsi_sell"],
+                        conf["ema_fast"], conf["ema_slow"])
+        ranked.append((sc, sym, arr60))
+    ranked.sort(reverse=True, key=lambda x: x[0])
+
+    rep = "🇺🇦 Сканер (крипта):\n"
+    rep += f"• Активних USD-пар: {len(CRYPTO_USD_PAIRS)}\n"
+    rep += f"• Використаємо для торгівлі (лімітом): {conf['top_n']}\n"
+    top_syms = [r[1] for r in ranked[:25]]
+    rep += f"• Перші 25: {', '.join(top_syms)}"
+    return rep, ranked
+
+
+async def scan_rank_stocks(st: Dict[str, Any]) -> Tuple[str, List[Tuple[float, str, List[Dict[str, Any]]]]]:
+    conf = _mode_conf(st)
+    bars15 = await get_bars_stocks(STOCKS_UNIVERSE, conf["bars"][0], 120)
+    bars30 = await get_bars_stocks(STOCKS_UNIVERSE, conf["bars"][1], 120)
+    bars60 = await get_bars_stocks(STOCKS_UNIVERSE, conf["bars"][2], 120)
+
+    ranked: List[Tuple[float, str, List[Dict[str, Any]]]] = []
+    for sym in STOCKS_UNIVERSE:
+        arr15 = bars15.get("bars", {}).get(sym, [])
+        arr30 = bars30.get("bars", {}).get(sym, [])
+        arr60 = bars60.get("bars", {}).get(sym, [])
+        if not arr15 or not arr30 or not arr60:
+            continue
+        c15 = [float(x["c"]) for x in arr15]
+        c30 = [float(x["c"]) for x in arr30]
+        c60 = [float(x["c"]) for x in arr60]
+        sc = rank_score(c15, c30, c60,
+                        conf["rsi_buy"], conf["rsi_sell"],
+                        conf["ema_fast"], conf["ema_slow"])
+        ranked.append((sc, sym, arr60))
+    ranked.sort(reverse=True, key=lambda x: x[0])
+
+    rep = "📊 Сканер (акції):\n"
+    rep += f"• Активних тикерів: {len(STOCKS_UNIVERSE)}\n"
+    rep += f"• Використаємо для торгівлі (лімітом): {conf['top_n']}\n"
+    top_syms = [r[1] for r in ranked[:25]]
+    rep += f"• Перші 25: {', '.join(top_syms)}"
+    return rep, ranked
 # ======== ORDERS (оновлено) ========
 
 def _round_stock_qty(qty: float) -> float:
