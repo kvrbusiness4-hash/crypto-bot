@@ -46,18 +46,55 @@ STATE: Dict[int, Dict[str, Any]] = {}
 
 # ====== MODE PROFILES ======
 MODE_PARAMS = {
-    # tp/sl — тільки для логіки менеджера позицій (коли продавати)
-    "aggressive": {"bars": ("15Min", "30Min", "1Hour"), "rsi_buy": 55.0, "rsi_sell": 45.0,
-                   "ema_fast": 15, "ema_slow": 30, "top_n": ALPACA_TOP_N, "tp_pct": 0.015, "sl_pct": 0.010},
-    "scalp": {"bars": ("5Min", "15Min", "1Hour"), "rsi_buy": 58.0, "rsi_sell": 42.0,
-              "ema_fast": 9, "ema_slow": 21, "top_n": ALPACA_TOP_N, "tp_pct": 0.010, "sl_pct": 0.006},
-    "default": {"bars": ("15Min", "30Min", "1Hour"), "rsi_buy": 56.0, "rsi_sell": 44.0,
-                "ema_fast": 12, "ema_slow": 26, "top_n": ALPACA_TOP_N, "tp_pct": 0.012, "sl_pct": 0.008},
-    "swing": {"bars": ("30Min", "1Hour", "1Day"), "rsi_buy": 55.0, "rsi_sell": 45.0,
-              "ema_fast": 20, "ema_slow": 40, "top_n": ALPACA_TOP_N, "tp_pct": 0.020, "sl_pct": 0.012},
-    "safe": {"bars": ("15Min", "30Min", "1Hour"), "rsi_buy": 60.0, "rsi_sell": 40.0,
-             "ema_fast": 15, "ema_slow": 35, "top_n": max(1, ALPACA_TOP_N - 1), "tp_pct": 0.009, "sl_pct": 0.006},
-}
+    # SCALP: швидкі таймфрейми, ціль 3%, стоп 2%
+    "scalp": {
+        "bars": ("1Min", "5Min", "15Min"),
+        "rsi_buy": 58.0, "rsi_sell": 42.0,
+        "ema_fast": 9, "ema_slow": 21,
+        "top_n": ALPACA_TOP_N,
+        "tp_pct": 0.03,     # 3%
+        "sl_pct": 0.02      # 2%
+    },
+
+    # AGGRESSIVE: трохи довше тримаємо, ціль 5%, стоп 3%
+    "aggressive": {
+        "bars": ("5Min", "15Min", "1Hour"),
+        "rsi_buy": 56.0, "rsi_sell": 44.0,
+        "ema_fast": 12, "ema_slow": 26,
+        "top_n": ALPACA_TOP_N,
+        "tp_pct": 0.05,     # 5%
+        "sl_pct": 0.03      # 3%
+    },
+
+    # DEFAULT: щось середнє між scalp/aggressive
+    "default": {
+        "bars": ("5Min", "15Min", "1Hour"),
+        "rsi_buy": 57.0, "rsi_sell": 43.0,
+        "ema_fast": 12, "ema_slow": 26,
+        "top_n": ALPACA_TOP_N,
+        "tp_pct": 0.04,     # 4%
+        "sl_pct": 0.025     # 2.5%
+    },
+
+    # SWING: тримаємо довше, ціль 10%, стоп 3%
+    "swing": {
+        "bars": ("30Min", "1Hour", "4Hour"),
+        "rsi_buy": 55.0, "rsi_sell": 45.0,
+        "ema_fast": 20, "ema_slow": 40,
+        "top_n": ALPACA_TOP_N,
+        "tp_pct": 0.10,     # 10%
+        "sl_pct": 0.03      # 3%
+    },
+
+    # SAFE: консервативно, ціль 3%, стоп 2% + жорсткіший RSI
+    "safe": {
+        "bars": ("5Min", "15Min", "1Hour"),
+        "rsi_buy": 60.0, "rsi_sell": 40.0,
+        "ema_fast": 12, "ema_slow": 26,
+        "top_n": max(1, ALPACA_TOP_N - 1),
+        "tp_pct": 0.03,     # 3%
+        "sl_pct": 0.02      # 2%
+    },
 
 # ====== CRYPTO WHITELIST (USD) ======
 # Без фаворитів — звичайний список ліквідних пар:
@@ -125,7 +162,9 @@ def kb() -> ReplyKeyboardMarkup:
         ["/long_mode", "/short_mode", "/both_mode"],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
-
+# ===== Partial TP + Trailing state =====
+# зберігаємо по кожному символу, чи взяли TP1 і який був максимум ціни після нього
+POS_STATE: Dict[str, Dict[str, Any]] = {}   # { "BTCUSD": {"took_tp1": bool, "highest": float} }
 # -------- HTTP ----------
 def _alp_headers() -> Dict[str, str]:
     return {
@@ -377,53 +416,118 @@ def should_exit_by_indicators(conf: Dict[str, Any], closes_short: List[float], c
     return bool(cross_down or weak_rsi)
 
 async def try_manage_crypto_positions(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """Фоновий менеджер: проходить по відкритих крипто-позиціях та закриває за TP/SL/сигналом."""
+    """
+    Фоновий менеджер:
+    - SL завжди активний (sl_pct із MODE_PARAMS)
+    - TP1 = tp_pct: продаємо 50% позиції
+    - Після TP1 вмикаємо трейлінг на решту: фіксуємо максимум і закриваємо при падінні на trail_pct
+    """
     st = stdef(chat_id)
     conf = _mode_conf(st)
-    tp_pct = float(conf.get("tp_pct", 0.01))
-    sl_pct = float(conf.get("sl_pct", 0.008))
+
+    tp_pct = float(conf.get("tp_pct", 0.03))   # 3% дефолт
+    sl_pct = float(conf.get("sl_pct", 0.02))   # 2% дефолт
+    trail_pct = max(0.015, tp_pct / 2.0)       # напр., 1.5% або половина TP
 
     positions = await alp_positions()
-    crypto_positions = [p for p in positions if p.get("asset_class") == "crypto"]
+    crypto_positions = [p for p in positions if (p.get("asset_class") == "crypto")]
 
-    syms = [to_data_sym(p["symbol"]) for p in crypto_positions]
-    if not syms:
+    if not crypto_positions:
         return
 
-    bars_s = await get_bars_crypto(syms, map_tf(conf["bars"][0]), limit=120)
-    bars_l = await get_bars_crypto(syms, map_tf(conf["bars"][1]), limit=120)
+    # Збираємо символи для одного запиту барів
+    syms = [to_data_sym(p["symbol"]) for p in crypto_positions]
+    bars_short = await get_bars_crypto(syms, map_tf(conf["bars"][0]), limit=2)
 
     for p in crypto_positions:
-        sym_ord = p["symbol"]            # BTCUSD
-        sym_data = to_data_sym(sym_ord)  # BTC/USD
+        sym_ord  = p["symbol"]            # BTCUSD
+        sym_data = to_data_sym(sym_ord)   # BTC/USD
 
         try:
-            qty = float(p.get("qty") or 0)
-            if qty <= 0.000001:  # дрібні «пилові» позиції — ігноруємо
+            qty = float(p.get("qty") or 0.0)
+            if qty <= 0:
                 continue
-            avg_entry = float(p.get("avg_entry_price") or 0)
-            c_short = [float(x["c"]) for x in (bars_s.get("bars") or {}).get(sym_data, [])]
-            c_long  = [float(x["c"]) for x in (bars_l.get("bars") or {}).get(sym_data, [])]
-            if not c_short:
+
+            avg_entry = float(p.get("avg_entry_price") or 0.0)
+            arr = (bars_short.get("bars") or {}).get(sym_data, [])
+            if not arr:
                 continue
-            last = c_short[-1]
+            last = float(arr[-1]["c"])
 
-            take_profit = last >= avg_entry * (1.0 + tp_pct)
-            stop_loss   = last <= avg_entry * (1.0 - sl_pct)
-            by_filters  = False
-            if c_long:
-                by_filters = should_exit_by_indicators(conf, c_short, c_long)
+            # --- STOP LOSS завжди активний ---
+            if avg_entry > 0 and (last <= avg_entry * (1.0 - sl_pct)):
+                q = _floor_qty(qty, 6)
+                if q > 0:
+                    await place_market_sell_crypto_qty(sym_ord, q)
+                    pnl_pct = (last / avg_entry - 1.0) * 100.0
+                    await ctx.bot.send_message(
+                        chat_id,
+                        f"✅ EXIT {sym_ord}: reason=SL · avg={avg_entry:.6f} → last={last:.6f} · PnL={pnl_pct:.2f}% · qty={q:.6f}"
+                    )
+                continue  # позицію закрили, йдемо далі
 
-            if take_profit or stop_loss or by_filters:
-                await place_market_sell_crypto_qty(sym_ord, qty)
-                reason = "TP" if take_profit else ("SL" if stop_loss else "SIGNAL")
-                pnl_pct = (last / avg_entry - 1.0) * 100.0 if avg_entry > 0 else 0.0
-                await ctx.bot.send_message(
-                    chat_id,
-                    f"✅ EXIT {sym_ord}: reason={reason} · avg={avg_entry:.6f} → last={last:.6f} "
-                    f"· PnL={pnl_pct:.2f}% · qty={qty:.6f}"
-                )
+            # Дістаємо/створюємо локальний стейт
+            st_pos = POS_STATE.setdefault(sym_ord, {"took_tp1": False, "highest": avg_entry})
+
+            # --- TP1: продаємо 50%, коли досягли tp_pct ---
+            if not st_pos["took_tp1"] and avg_entry > 0 and (last >= avg_entry * (1.0 + tp_pct)):
+                sell_qty = _floor_qty(qty * 0.5, 6)
+                if sell_qty > 0:
+                    await place_market_sell_crypto_qty(sym_ord, sell_qty)
+                    st_pos["took_tp1"] = True
+                    st_pos["highest"] = last   # починаємо трейлити від поточної ціни
+                    pnl_pct = (last / avg_entry - 1.0) * 100.0
+                    await ctx.bot.send_message(
+                        chat_id,
+                        f"✅ PARTIAL TP {sym_ord}: 50% · avg={avg_entry:.6f} → last={last:.6f} · PnL={pnl_pct:.2f}% · sold={sell_qty:.6f}"
+                    )
+                # не робимо continue, бо qty змінився тільки на біржі; наступний цикл підхопить залишок
+                continue
+
+            # --- ТРЕЙЛІНГ для решти після TP1 ---
+            if st_pos["took_tp1"]:
+                # оновлюємо максимум
+                if last > float(st_pos.get("highest") or 0.0):
+                    st_pos["highest"] = last
+
+                peak = float(st_pos.get("highest") or last)
+                # якщо просіли від піку на trail_pct — закриваємо решту
+                if last <= peak * (1.0 - trail_pct):
+                    q = _floor_qty(qty, 6)
+                    if q > 0:
+                        await place_market_sell_crypto_qty(sym_ord, q)
+                        pnl_pct = (last / avg_entry - 1.0) * 100.0
+                        await ctx.bot.send_message(
+                            chat_id,
+                            f"✅ EXIT {sym_ord}: reason=TRAIL · peak={peak:.6f} → last={last:.6f} · PnL={pnl_pct:.2f}% · qty={q:.6f}"
+                        )
+                    # очищаємо стейт на всяк випадок
+                    POS_STATE.pop(sym_ord, None)
+                    continue
+
+            # --- Додатковий фільтр виходу за індикаторами (як і було) ---
+            # (працює як страховка, якщо TP/SL/TRAIL не спрацювали)
+            # Можна залишити або прибрати — на твій вибір:
+            # e_fast<e_slow або RSI<50
+            # — короткі бари вже є, додаємо довші
+            # (щоб не робити зайвих запитів — лише коли нема TP/SL/Trail)
+            # ------ OPTIONAL ------
+            #bars_long = await get_bars_crypto([sym_data], map_tf(conf["bars"][1]), limit=60)
+            #c_short = [float(x["c"]) for x in arr]
+            #c_long  = [float(x["c"]) for x in (bars_long.get("bars") or {}).get(sym_data, [])]
+            #if c_long and should_exit_by_indicators(conf, c_short, c_long):
+            #    q = _floor_qty(qty, 6)
+            #    if q > 0:
+            #        await place_market_sell_crypto_qty(sym_ord, q)
+            #        pnl_pct = (last / avg_entry - 1.0) * 100.0
+            #        await ctx.bot.send_message(
+            #            chat_id,
+            #            f"✅ EXIT {sym_ord}: reason=SIGNAL · avg={avg_entry:.6f} → last={last:.6f} · PnL={pnl_pct:.2f}% · qty={q:.6f}"
+            #        )
+            #    POS_STATE.pop(sym_ord, None)
+
         except Exception as e:
+            # захищаємося від нульових кількостей та інших дрібних багів
             try:
                 await ctx.bot.send_message(chat_id, f"🔴 manage error {sym_ord}: {e}")
             except Exception:
