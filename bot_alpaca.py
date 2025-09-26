@@ -5,7 +5,7 @@ import json
 import math
 import asyncio
 import time
-from typing import Dict, Any, Tuple, List, Optional, Callable, Awaitable
+from typing import Dict, Any, Tuple, List, Optional
 
 from aiohttp import ClientSession, ClientTimeout
 from telegram import Update, ReplyKeyboardMarkup
@@ -21,34 +21,33 @@ ALPACA_API_SECRET = (os.getenv("ALPACA_API_SECRET") or "").strip()
 ALPACA_BASE_URL = (os.getenv("ALPACA_BASE_URL") or "https://paper-api.alpaca.markets").rstrip("/")
 ALPACA_DATA_URL = (os.getenv("ALPACA_DATA_URL") or "https://data.alpaca.markets").rstrip("/")
 
-USD_PER_TRADE = float(os.getenv("USD_PER_TRADE") or 50)   # $ на один вхід
-ALPACA_TOP_N   = int(os.getenv("ALPACA_TOP_N") or 2)
-ALPACA_MAX_CRYPTO  = int(os.getenv("ALPACA_MAX_CRYPTO") or 25)
-ALPACA_MAX_STOCKS  = int(os.getenv("ALPACA_MAX_STOCKS") or 50)
+ALPACA_NOTIONAL = float(os.getenv("ALPACA_NOTIONAL") or 50)  # скільки USD виділяємо на один крипто-вхід
+ALPACA_TOP_N = int(os.getenv("ALPACA_TOP_N") or 2)
+ALPACA_MAX_CRYPTO = int(os.getenv("ALPACA_MAX_CRYPTO") or 25)
+ALPACA_MAX_STOCKS = int(os.getenv("ALPACA_MAX_STOCKS") or 50)
 
-SCAN_INTERVAL_SEC  = int(os.getenv("SCAN_INTERVAL_SEC") or 300)   # 5 хв
+# --- НОВЕ: гнучкий інтервал скану з ENV, із безпечними межами ---
+def _clamp(v, lo, hi):
+    try:
+        v = int(v)
+    except:
+        v = 300
+    return max(lo, min(hi, v))
+
+# інтервал фонового автоскану (і менеджера позицій)
+SCAN_INTERVAL_SEC = _clamp(os.getenv("SCAN_INTERVAL_SEC") or 300, 10, 3600)  # 10s..3600s
 DEDUP_COOLDOWN_MIN = int(os.getenv("DEDUP_COOLDOWN_MIN") or 240)
 
 # ====== GLOBAL STATE (per chat) ======
 STATE: Dict[int, Dict[str, Any]] = {}
 
-# анти-дубль виходу
-LAST_EXIT_AT: Dict[str, float] = {}
-EXIT_COOLDOWN_SEC = int(os.getenv("EXIT_COOLDOWN_SEC") or 10)
-
 # ====== MODE PROFILES ======
 MODE_PARAMS = {
-    # tp/sl — менеджер позицій; для scalp нижче є додаткові умови
+    # tp/sl — тільки для логіки менеджера позицій (коли продавати)
     "aggressive": {"bars": ("15Min", "30Min", "1Hour"), "rsi_buy": 55.0, "rsi_sell": 45.0,
                    "ema_fast": 15, "ema_slow": 30, "top_n": ALPACA_TOP_N, "tp_pct": 0.015, "sl_pct": 0.010},
     "scalp": {"bars": ("5Min", "15Min", "1Hour"), "rsi_buy": 58.0, "rsi_sell": 42.0,
-              "ema_fast": 9, "ema_slow": 21, "top_n": ALPACA_TOP_N, "tp_pct": 0.010, "sl_pct": 0.006,
-              # налаштування стакану:
-              "ob_min_imbalance": 0.56,   # bid_size / (bid+ask) для входу
-              "ob_exit_flip": 0.46,       # при такому дисбалансі в бік продавця — виходимо
-              "trail_start": 0.003,       # стартувати трейл після 0.3% профіту
-              "trail_back": 0.002         # закрити, якщо відкат на 0.2% від локального макс
-    },
+              "ema_fast": 9, "ema_slow": 21, "top_n": ALPACA_TOP_N, "tp_pct": 0.010, "sl_pct": 0.006},
     "default": {"bars": ("15Min", "30Min", "1Hour"), "rsi_buy": 56.0, "rsi_sell": 44.0,
                 "ema_fast": 12, "ema_slow": 26, "top_n": ALPACA_TOP_N, "tp_pct": 0.012, "sl_pct": 0.008},
     "swing": {"bars": ("30Min", "1Hour", "1Day"), "rsi_buy": 55.0, "rsi_sell": 45.0,
@@ -64,10 +63,10 @@ CRYPTO_USD_PAIRS = [
     "XTZ/USD","USDC/USD","USDT/USD","USDG/USD","YFI/USD","LDO/USD"
 ][:ALPACA_MAX_CRYPTO]
 
-# ====== STOCKS UNIVERSE (для звітів) ======
+# ====== STOCKS UNIVERSE ======
 STOCKS_UNIVERSE = [
     "AAPL","MSFT","NVDA","AMZN","META","GOOGL","ADBE","CRM","ORCL","AMD","AMAT","INTC","CSCO","QCOM",
-    "BAC","JPM","GS","BRK.B","V","MA","KO","PEP","MCD","NKE",
+    "BAC","JPM","GS","BRK.B","V","MA","KO","PEP","МCD","NKE",
     "SPY","QQQ","IWM","DIA","XLF","XLK","XLV","XLE","XLY","XLP",
 ][:ALPACA_MAX_STOCKS]
 
@@ -77,9 +76,11 @@ def map_tf(tf: str) -> str:
     return "1Hour" if t.lower() in ("60min","60","1h","60мин","60мін") else t
 
 def to_order_sym(sym: str) -> str:
+    # ордер: без косої риски
     return sym.replace("/", "").upper()
 
 def to_data_sym(sym: str) -> str:
+    # data endpoint: має бути BTC/USD
     s = (sym or "").replace(" ","").upper()
     if "/" in s: return s
     if s.endswith("USD"): return s[:-3]+"/USD"
@@ -129,16 +130,6 @@ def _alp_headers() -> Dict[str, str]:
         "Content-Type": "application/json",
     }
 
-async def _with_retry(fn: Callable[..., Awaitable[Any]], *args, **kwargs) -> Any:
-    last_err = None
-    for _ in range(3):
-        try:
-            return await fn(*args, **kwargs)
-        except Exception as e:
-            last_err = e
-            await asyncio.sleep(0.3)
-    raise last_err
-
 async def alp_get_json(path: str, params: Dict[str, Any] | None = None) -> Any:
     url = f"{ALPACA_BASE_URL}{path}" if path.startswith("/v") else f"{ALPACA_DATA_URL}{path}"
     async with ClientSession(timeout=ClientTimeout(total=30)) as s:
@@ -157,7 +148,10 @@ async def alp_post_json(path: str, payload: Dict[str, Any]) -> Any:
                 raise RuntimeError(f"POST {path} {r.status}: {txt}")
             return json.loads(txt) if txt else {}
 
-# ===== helper: positions =====
+# ===== helper: clock & positions =====
+async def alp_clock() -> Dict[str, Any]:
+    return await alp_get_json("/v2/clock")
+
 async def alp_positions() -> List[Dict[str, Any]]:
     return await alp_get_json("/v2/positions")
 
@@ -170,7 +164,7 @@ async def get_position(sym: str) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
-# -------- DATA: bars & quotes ----------
+# -------- DATA: /bars ----------
 async def get_bars_crypto(pairs: List[str], timeframe: str, limit: int = 120) -> Dict[str, Any]:
     tf = map_tf(timeframe)
     syms = ",".join([to_data_sym(p) for p in pairs])
@@ -190,21 +184,6 @@ async def get_bars_stocks(symbols: List[str], timeframe: str, limit: int = 120) 
     path = "/v2/stocks/bars"
     params = {"symbols": syms, "timeframe": tf, "limit": str(limit), "sort": "asc"}
     async with ClientSession(timeout=ClientTimeout(total=30)) as s:
-        url = f"{ALPACA_DATA_URL}{path}"
-        async with s.get(url, headers=_alp_headers(), params=params) as r:
-            txt = await r.text()
-            if r.status >= 400:
-                raise RuntimeError(f"GET {url} {r.status}: {txt}")
-            return json.loads(txt) if txt else {}
-
-async def get_quotes_latest(symbols: List[str]) -> Dict[str, Any]:
-    """
-    Спроба отримати останні котирування (bid/ask). Якщо ендпойнт недоступний — кину RuntimeError.
-    """
-    syms = ",".join([to_data_sym(s) for s in symbols])
-    path = "/v1beta3/crypto/us/quotes/latest"
-    params = {"symbols": syms}
-    async with ClientSession(timeout=ClientTimeout(total=15)) as s:
         url = f"{ALPACA_DATA_URL}{path}"
         async with s.get(url, headers=_alp_headers(), params=params) as r:
             txt = await r.text()
@@ -252,6 +231,7 @@ def _floor_qty(x: float, dec: int = 6) -> float:
     return math.floor(x * m) / m
 
 async def get_last_price_crypto(sym: str) -> float:
+    """Беру останню ціну із 5Min барів (остання свічка)."""
     data_sym = to_data_sym(sym)
     bars = await get_bars_crypto([data_sym], "5Min", limit=2)
     arr = (bars.get("bars") or {}).get(data_sym, [])
@@ -260,32 +240,26 @@ async def get_last_price_crypto(sym: str) -> float:
     return float(arr[-1]["c"])
 
 async def place_market_buy_crypto_qty(sym: str, qty: float) -> dict:
-    q = _floor_qty(float(qty), 6)
-    if q <= 0:
-        raise RuntimeError("qty must be > 0 after flooring")
     payload = {
         "symbol": to_order_sym(sym),
         "side": "buy",
         "type": "market",
         "time_in_force": "gtc",
         "asset_class": "crypto",
-        "qty": f"{q:.6f}",
+        "qty": f"{_floor_qty(qty):.6f}",
     }
-    return await _with_retry(alp_post_json, "/v2/orders", payload)
+    return await alp_post_json("/v2/orders", payload)
 
 async def place_market_sell_crypto_qty(sym: str, qty: float) -> dict:
-    q = _floor_qty(float(qty), 6)
-    if q <= 0:
-        raise RuntimeError("qty must be > 0 after flooring")
     payload = {
         "symbol": to_order_sym(sym),
         "side": "sell",
         "type": "market",
         "time_in_force": "gtc",
         "asset_class": "crypto",
-        "qty": f"{q:.6f}",
+        "qty": f"{_floor_qty(qty):.6f}",
     }
-    return await _with_retry(alp_post_json, "/v2/orders", payload)
+    return await alp_post_json("/v2/orders", payload)
 
 async def get_order(order_id: str) -> dict:
     return await alp_get_json(f"/v2/orders/{order_id}")
@@ -293,6 +267,10 @@ async def get_order(order_id: str) -> dict:
 # ======== ENTRY & EXIT LOGIC ========
 
 async def crypto_buy_by_usd(sym: str, usd_notional: float) -> Tuple[dict, float, float]:
+    """
+    Купівля крипти через qty = USD / price * 0.995.
+    Повертає (raw_order, filled_qty, fill_price).
+    """
     px = await get_last_price_crypto(sym)
     raw_qty = (float(usd_notional) / max(1e-9, px)) * 0.995
     qty = _floor_qty(raw_qty, 6)
@@ -300,6 +278,7 @@ async def crypto_buy_by_usd(sym: str, usd_notional: float) -> Tuple[dict, float,
         raise RuntimeError("qty<=0 (too small notional)")
     order = await place_market_buy_crypto_qty(sym, qty)
 
+    # дочекаємось заповнення, щоб дістати fill average price
     order_id = order.get("id", "")
     filled_qty, fill_price = 0.0, px
     for _ in range(12):
@@ -318,6 +297,7 @@ async def crypto_buy_by_usd(sym: str, usd_notional: float) -> Tuple[dict, float,
     return order, filled_qty, fill_price
 
 def should_exit_by_indicators(conf: Dict[str, Any], closes_short: List[float], closes_long: List[float]) -> bool:
+    # простий сигнал виходу: швидка EMA нижче повільної або RSI просів нижче середини
     e_fast = ema(closes_long, conf["ema_fast"])
     e_slow = ema(closes_long, conf["ema_slow"])
     r = rsi(closes_short, 14)
@@ -325,67 +305,22 @@ def should_exit_by_indicators(conf: Dict[str, Any], closes_short: List[float], c
     weak_rsi = r < 50.0
     return bool(cross_down or weak_rsi)
 
-# ======== ORDERBOOK UTILS (скальп) ========
-
-def _imbalance_from_quote(q: Dict[str, Any]) -> float:
-    """
-    Повертає bid_size / (bid_size + ask_size) у [0..1]. Якщо даних немає — 0.5.
-    """
-    try:
-        b = float(q.get("bs", 0) or q.get("b", {}).get("s", 0) or 0)
-        a = float(q.get("as", 0) or q.get("a", {}).get("s", 0) or 0)
-        s = b + a
-        return (b / s) if s > 0 else 0.5
-    except Exception:
-        return 0.5
-
-async def orderbook_ok_for_entry(sym: str, conf: Dict[str, Any]) -> bool:
-    try:
-        quotes = await get_quotes_latest([sym])
-        q = (quotes.get("quotes") or {}).get(to_data_sym(sym), {})
-        imb = _imbalance_from_quote(q)
-        return imb >= float(conf.get("ob_min_imbalance", 0.56))
-    except Exception:
-        # фолбек: якщо немає доступу до quotes — не блокуємо вхід
-        return True
-
-async def orderbook_flip_for_exit(sym: str, conf: Dict[str, Any]) -> bool:
-    try:
-        quotes = await get_quotes_latest([sym])
-        q = (quotes.get("quotes") or {}).get(to_data_sym(sym), {})
-        imb = _imbalance_from_quote(q)
-        return imb <= float(conf.get("ob_exit_flip", 0.46))
-    except Exception:
-        return False
-
-def trailing_exit_ok(avg_entry: float, closes_short: List[float], conf: Dict[str, Any]) -> bool:
-    # простий трейл на базі останніх close (короткий ТФ)
-    if not closes_short: 
-        return False
-    last = closes_short[-1]
-    mx = max(closes_short[-10:] or [last])   # локальний максимум за ~10 свічок
-    gain = (mx / max(1e-9, avg_entry) - 1.0)
-    if gain < float(conf.get("trail_start", 0.003)):
-        return False
-    drop = (mx - last) / mx
-    return drop >= float(conf.get("trail_back", 0.002))
-
-# ======== MANAGER ========
-
 async def try_manage_crypto_positions(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Фоновий менеджер: проходить по відкритих крипто-позиціях та закриває за TP/SL/сигналом."""
     st = stdef(chat_id)
     conf = _mode_conf(st)
     tp_pct = float(conf.get("tp_pct", 0.01))
     sl_pct = float(conf.get("sl_pct", 0.008))
-    mode = st.get("mode", "default")
 
     positions = await alp_positions()
     crypto_positions = [p for p in positions if p.get("asset_class") == "crypto"]
 
+    # підготуємо один запит барів на всі symbols для ефективності
     syms = [to_data_sym(p["symbol"]) for p in crypto_positions]
     if not syms:
         return
 
+    # короткі і довгі ряди для індикаторів
     bars_s = await get_bars_crypto(syms, map_tf(conf["bars"][0]), limit=120)
     bars_l = await get_bars_crypto(syms, map_tf(conf["bars"][1]), limit=120)
 
@@ -393,215 +328,39 @@ async def try_manage_crypto_positions(ctx: ContextTypes.DEFAULT_TYPE, chat_id: i
         sym_ord = p["symbol"]            # BTCUSD
         sym_data = to_data_sym(sym_ord)  # BTC/USD
 
-        key = to_order_sym(sym_ord)
-        if now_s() - LAST_EXIT_AT.get(key, 0) < EXIT_COOLDOWN_SEC:
-            continue
-
         try:
             qty = float(p.get("qty") or 0)
             if qty <= 0:
                 continue
             avg_entry = float(p.get("avg_entry_price") or 0)
-
+            # поточна ціна — остання з short барів
             c_short = [float(x["c"]) for x in (bars_s.get("bars") or {}).get(sym_data, [])]
             c_long  = [float(x["c"]) for x in (bars_l.get("bars") or {}).get(sym_data, [])]
             if not c_short:
                 continue
             last = c_short[-1]
 
-            # базові умови
+            # умови виходу
             take_profit = last >= avg_entry * (1.0 + tp_pct)
             stop_loss   = last <= avg_entry * (1.0 - sl_pct)
-            by_filters  = should_exit_by_indicators(conf, c_short, c_long) if c_long else False
+            by_filters  = False
+            if c_long:
+                by_filters = should_exit_by_indicators(conf, c_short, c_long)
 
-            # scalp-спеціальні тригери
-            scalp_exit = False
-            if mode == "scalp":
-                scalp_exit = (
-                    trailing_exit_ok(avg_entry, c_short, conf) or
-                    (await orderbook_flip_for_exit(sym_ord, conf))
-                )
-
-            if take_profit or stop_loss or by_filters or scalp_exit:
-                fresh = await get_position(sym_ord)
-                real_qty = float((fresh or {}).get("qty") or 0)
-                sell_qty = _floor_qty(real_qty, 6)
-                if sell_qty <= 0:
-                    continue
-
-                await place_market_sell_crypto_qty(sym_ord, sell_qty)
-                if take_profit: reason = "TP"
-                elif stop_loss: reason = "SL"
-                elif scalp_exit: reason = "SCALP"
-                else: reason = "SIGNAL"
-
+            if take_profit or stop_loss or by_filters:
+                await place_market_sell_crypto_qty(sym_ord, qty)
+                reason = "TP" if take_profit else ("SL" if stop_loss else "SIGNAL")
                 pnl_pct = (last / avg_entry - 1.0) * 100.0 if avg_entry > 0 else 0.0
                 await ctx.bot.send_message(
                     chat_id,
                     f"✅ EXIT {sym_ord}: reason={reason} · avg={avg_entry:.6f} → last={last:.6f} "
-                    f"· PnL={pnl_pct:.2f}% · qty={sell_qty:.6f}"
+                    f"· PnL={pnl_pct:.2f}% · qty={qty:.6f}"
                 )
-                LAST_EXIT_AT[key] = now_s()
-
         except Exception as e:
             try:
                 await ctx.bot.send_message(chat_id, f"🔴 manage position error {sym_ord}: {e}")
             except Exception:
                 pass
-
-# -------- COMMANDS --------
-async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    stdef(u.effective_chat.id)
-    await u.message.reply_text(
-        "👋 Алпака-бот готовий.\n"
-        "Крипта 24/7; сканер/автотрейд у фоні.\n"
-        "Увімкнути: /alp_on  ·  Вимкнути: /alp_off  ·  Статус: /alp_status\n"
-        "Автоскан: /auto_on  ·  /auto_off  ·  /auto_status",
-        reply_markup=kb()
-    )
-
-async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text(
-        "/signals_crypto — показати топ-N і (якщо Autotrade=ON) купити\n"
-        "/trade_crypto — миттєво торгувати топ-N без звіту\n"
-        "/signals_stocks — топ-N для акцій (без торгівлі)\n"
-        "/alp_on /alp_off /alp_status — автотрейд\n"
-        "/auto_on /auto_off /auto_status — фоновий автоскан + менеджер\n"
-        "/long_mode /short_mode /both_mode — напрям (short для крипти ігнорується)\n"
-        "/aggressive /scalp /default /swing /safe — профілі; у SCALP працює стакан.",
-        reply_markup=kb()
-    )
-
-async def set_mode(u: Update, c: ContextTypes.DEFAULT_TYPE, mode: str):
-    st = stdef(u.effective_chat.id)
-    st["mode"] = mode
-    await u.message.reply_text(f"Режим встановлено: {mode.upper()}")
-
-async def long_mode(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = stdef(u.effective_chat.id); st["side_mode"] = "long"
-    await u.message.reply_text("Режим входів: LONG")
-
-async def short_mode(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = stdef(u.effective_chat.id); st["side_mode"] = "short"
-    await u.message.reply_text("Режим входів: SHORT (для крипти ігнорується)")
-
-async def both_mode(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = stdef(u.effective_chat.id); st["side_mode"] = "both"
-    await u.message.reply_text("Режим входів: BOTH (для крипти все одно LONG)")
-
-async def alp_on(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = stdef(u.effective_chat.id); st["autotrade"] = True
-    await u.message.reply_text("✅ Alpaca AUTOTRADE: ON")
-
-async def alp_off(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = stdef(u.effective_chat.id); st["autotrade"] = False
-    await u.message.reply_text("⛔ Alpaca AUTOTRADE: OFF")
-
-async def alp_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    try:
-        acc = await alp_get_json("/v2/account")
-        st = stdef(u.effective_chat.id)
-        txt = (
-            "📦 Alpaca:\n"
-            f"• status={acc.get('status','UNKNOWN')}\n"
-            f"• cash=${float(acc.get('cash',0)):.2f}\n"
-            f"• buying_power=${float(acc.get('buying_power',0)):.2f}\n"
-            f"• equity=${float(acc.get('equity',0)):.2f}\n"
-            f"Mode={st.get('mode','default')} · Autotrade={'ON' if st.get('autotrade') else 'OFF'} · "
-            f"AutoScan={'ON' if st.get('auto_scan') else 'OFF'} · "
-            f"Side={st.get('side_mode','long')} · USD_per_trade=${USD_PER_TRADE:.2f}"
-        )
-        await u.message.reply_text(txt)
-    except Exception as e:
-        await u.message.reply_text(f"🔴 alp_status error: {e}")
-
-# ------- CRYPTO commands -------
-async def signals_crypto(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = stdef(u.effective_chat.id)
-    try:
-        report, ranked = await scan_rank_crypto(st)
-        await u.message.reply_text(report)
-
-        if not st.get("autotrade") or not ranked:
-            return
-
-        picks = ranked[: _mode_conf(st)["top_n"]]
-        conf = _mode_conf(st)
-
-        for _, sym, _ in picks:
-            # у scalp перевіряємо дисбаланс стакану перед входом
-            ok = True
-            if st.get("mode") == "scalp":
-                ok = await orderbook_ok_for_entry(sym, conf)
-                if not ok:
-                    await u.message.reply_text(f"⚪ SKIP (OB weak): {sym}")
-                    continue
-
-            if await get_position(sym):
-                await u.message.reply_text(f"⚪ SKIP: вже є позиція по {to_order_sym(sym)}")
-                continue
-            if skip_as_duplicate("CRYPTO", sym, "buy"):
-                await u.message.reply_text(f"⚪ SKIP (дубль): {sym} BUY")
-                continue
-
-            try:
-                _, filled_qty, fill_price = await crypto_buy_by_usd(sym, USD_PER_TRADE)
-                await u.message.reply_text(
-                    f"🟢 BUY OK: {sym} · ${USD_PER_TRADE:.2f} · entry={fill_price:.6f} · qty={filled_qty:.6f}"
-                )
-            except Exception as e:
-                await u.message.reply_text(f"🔴 ORDER FAIL {sym} BUY: {e}")
-
-    except Exception as e:
-        await u.message.reply_text(f"🔴 signals_crypto error: {e}")
-
-async def trade_crypto(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = stdef(u.effective_chat.id)
-    try:
-        _, ranked = await scan_rank_crypto(st)
-        if not ranked:
-            await u.message.reply_text("⚠️ Немає сигналів")
-            return
-
-        picks = ranked[: _mode_conf(st)["top_n"]]
-        conf = _mode_conf(st)
-
-        for _, sym, _ in picks:
-            ok = True
-            if st.get("mode") == "scalp":
-                ok = await orderbook_ok_for_entry(sym, conf)
-                if not ok:
-                    await u.message.reply_text(f"⚪ SKIP (OB weak): {sym}")
-                    continue
-
-            if await get_position(sym):
-                await u.message.reply_text(f"⚪ SKIP: вже є позиція по {to_order_sym(sym)}")
-                continue
-            if skip_as_duplicate("CRYPTO", sym, "buy"):
-                await u.message.reply_text(f"⚪ SKIP (дубль): {sym} BUY")
-                continue
-
-            try:
-                _, filled_qty, fill_price = await crypto_buy_by_usd(sym, USD_PER_TRADE)
-                await u.message.reply_text(
-                    f"🟢 BUY OK: {sym} · ${USD_PER_TRADE:.2f} · entry={fill_price:.6f} · qty={filled_qty:.6f}"
-                )
-            except Exception as e:
-                await u.message.reply_text(f"🔴 ORDER FAIL {sym} BUY: {e}")
-    except Exception as e:
-        await u.message.reply_text(f"🔴 trade_crypto error: {e}")
-
-# ------- STOCKS commands (інформативно) -------
-async def signals_stocks(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    st = stdef(u.effective_chat.id)
-    try:
-        report, _ = await scan_rank_stocks(st)
-        await u.message.reply_text(report + "\n(Торгівля акціями вимкнена в цій збірці)")
-    except Exception as e:
-        await u.message.reply_text(f"🔴 signals_stocks error: {e}")
-
-async def trade_stocks(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("ℹ️ У цій збірці автотрейд для акцій відключений. Фокус — крипта.")
 
 # -------- SCAN (CRYPTO) --------
 async def scan_rank_crypto(st: Dict[str, Any]) -> Tuple[str, List[Tuple[float, str, List[Dict[str, Any]]]]]:
@@ -671,10 +430,161 @@ async def scan_rank_stocks(st: Dict[str, Any]) -> Tuple[str, List[Tuple[float, s
     )
     return rep, ranked
 
+# -------- COMMANDS --------
+async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    stdef(u.effective_chat.id)
+    await u.message.reply_text(
+        "👋 Алпака-бот готовий.\n"
+        "Крипта торгується 24/7; акції — коли ринок відкритий. Сканер/автотрейд може працювати у фоні.\n"
+        "Увімкнути автотрейд: /alp_on  ·  Зупинити: /alp_off  ·  Стан: /alp_status\n"
+        "Фоновий автоскан: /auto_on  ·  /auto_off  ·  /auto_status",
+        reply_markup=kb()
+    )
+
+async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    await u.message.reply_text(
+        "/signals_crypto — показати топ-N і (якщо Autotrade=ON) купити\n"
+        "/trade_crypto — миттєво торгувати топ-N без звіту\n"
+        "/signals_stocks — показати топ-N для акцій\n"
+        "/trade_stocks — миттєво торгувати топ-N акцій\n"
+        "/alp_on /alp_off /alp_status — автотрейд\n"
+        "/auto_on /auto_off /auto_status — фоновий автоскан\n"
+        "/long_mode /short_mode /both_mode — напрям (short для крипти ігнорується)\n"
+        "/aggressive /scalp /default /swing /safe — профілі ризику",
+        reply_markup=kb()
+    )
+
+async def set_mode(u: Update, c: ContextTypes.DEFAULT_TYPE, mode: str):
+    st = stdef(u.effective_chat.id)
+    st["mode"] = mode
+    await u.message.reply_text(f"Режим встановлено: {mode.upper()}")
+
+async def long_mode(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st = stdef(u.effective_chat.id); st["side_mode"] = "long"
+    await u.message.reply_text("Режим входів: LONG")
+
+async def short_mode(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st = stdef(u.effective_chat.id); st["side_mode"] = "short"
+    await u.message.reply_text("Режим входів: SHORT (для крипти буде проігноровано)")
+
+async def both_mode(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st = stdef(u.effective_chat.id); st["side_mode"] = "both"
+    await u.message.reply_text("Режим входів: BOTH (для крипти застосуємо лише LONG)")
+
+async def alp_on(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st = stdef(u.effective_chat.id); st["autotrade"] = True
+    await u.message.reply_text("✅ Alpaca AUTOTRADE: ON")
+
+async def alp_off(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st = stdef(u.effective_chat.id); st["autotrade"] = False
+    await u.message.reply_text("⛔ Alpaca AUTOTRADE: OFF")
+
+async def alp_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    try:
+        acc = await alp_get_json("/v2/account")
+        st = stdef(u.effective_chat.id)
+        txt = (
+            "📦 Alpaca:\n"
+            f"• status={acc.get('status','UNKNOWN')}\n"
+            f"• cash=${float(acc.get('cash',0)):.2f}\n"
+            f"• buying_power=${float(acc.get('buying_power',0)):.2f}\n"
+            f"• equity=${float(acc.get('equity',0)):.2f}\n"
+            f"Mode={st.get('mode','default')} · Autotrade={'ON' if st.get('autotrade') else 'OFF'} · "
+            f"AutoScan={'ON' if st.get('auto_scan') else 'OFF'} · "
+            f"Side={st.get('side_mode','long')} · Notional=${ALPACA_NOTIONAL:.2f}"
+        )
+        await u.message.reply_text(txt)
+    except Exception as e:
+        await u.message.reply_text(f"🔴 alp_status error: {e}")
+
+# ------- CRYPTO commands -------
+async def signals_crypto(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st = stdef(u.effective_chat.id)
+    try:
+        report, ranked = await scan_rank_crypto(st)
+        await u.message.reply_text(report)
+
+        if not st.get("autotrade") or not ranked:
+            return
+
+        picks = ranked[: _mode_conf(st)["top_n"]]
+        conf = _mode_conf(st)
+        tp_pct, sl_pct = conf["tp_pct"], conf["sl_pct"]
+
+        for _, sym, arr in picks:
+            side = "buy"
+            if side != "buy":
+                continue
+
+            if await get_position(sym):
+                await u.message.reply_text(f"⚪ SKIP: вже є позиція по {to_order_sym(sym)}")
+                continue
+
+            if skip_as_duplicate("CRYPTO", sym, side):
+                await u.message.reply_text(f"⚪ SKIP (дубль): {sym} {side.upper()}")
+                continue
+
+            try:
+                order, filled_qty, fill_price = await crypto_buy_by_usd(sym, ALPACA_NOTIONAL)
+                await u.message.reply_text(
+                    f"🟢 BUY OK: {sym} · ${ALPACA_NOTIONAL:.2f}\n"
+                    f"Entry={fill_price:.6f} · qty={filled_qty:.6f}\n"
+                    f"План керування: TP={tp_pct*100:.2f}% · SL={sl_pct*100:.2f}% (фоном)"
+                )
+            except Exception as e:
+                await u.message.reply_text(f"🔴 ORDER FAIL {sym} BUY: {e}")
+
+    except Exception as e:
+        await u.message.reply_text(f"🔴 signals_crypto error: {e}")
+
+async def trade_crypto(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st = stdef(u.effective_chat.id)
+    try:
+        _, ranked = await scan_rank_crypto(st)
+        if not ranked:
+            await u.message.reply_text("⚠️ Немає сигналів")
+            return
+
+        picks = ranked[: _mode_conf(st)["top_n"]]
+        conf = _mode_conf(st)
+        tp_pct, sl_pct = conf["tp_pct"], conf["sl_pct"]
+
+        for _, sym, _ in picks:
+            if await get_position(sym):
+                await u.message.reply_text(f"⚪ SKIP: вже є позиція по {to_order_sym(sym)}")
+                continue
+            if skip_as_duplicate("CRYPTO", sym, "buy"):
+                await u.message.reply_text(f"⚪ SKIP (дубль): {sym} BUY")
+                continue
+
+            try:
+                order, filled_qty, fill_price = await crypto_buy_by_usd(sym, ALPACA_NOTIONAL)
+                await u.message.reply_text(
+                    f"🟢 BUY OK: {sym} · ${ALPACA_NOTIONAL:.2f}\n"
+                    f"Entry={fill_price:.6f} · qty={filled_qty:.6f}\n"
+                    f"План керування: TP={tp_pct*100:.2f}% · SL={sl_pct*100:.2f}% (фоном)"
+                )
+            except Exception as e:
+                await u.message.reply_text(f"🔴 ORDER FAIL {sym} BUY: {e}")
+    except Exception as e:
+        await u.message.reply_text(f"🔴 trade_crypto error: {e}")
+
+# ------- STOCKS commands (інформативно) -------
+async def signals_stocks(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st = stdef(u.effective_chat.id)
+    try:
+        report, _ = await scan_rank_stocks(st)
+        await u.message.reply_text(report + "\n(Торгівля акціями демо; модуль входів/виходів для акцій у цьому файлі вимкнено)")
+    except Exception as e:
+        await u.message.reply_text(f"🔴 signals_stocks error: {e}")
+
+async def trade_stocks(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    await u.message.reply_text("ℹ️ У цій збірці автотрейд для акцій відключений. Фокус — крипта.")
+
 # ======= AUTOSCAN (background) =======
 async def _auto_scan_once_for_chat(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
     st = stdef(chat_id)
-    # 1) менеджер позицій спочатку
+    # 1) спочатку керуємо відкритими позиціями (виходи)
     try:
         await try_manage_crypto_positions(ctx, chat_id)
     except Exception as e:
@@ -683,7 +593,7 @@ async def _auto_scan_once_for_chat(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE)
         except Exception:
             pass
 
-    # 2) нові входи
+    # 2) якщо увімкнено автотрейд — можна шукати нові входи
     if not (st.get("auto_scan") and st.get("autotrade")):
         return
 
@@ -701,14 +611,11 @@ async def _auto_scan_once_for_chat(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE)
             continue
         if skip_as_duplicate("CRYPTO", sym, "buy"):
             continue
-        # для scalp — перевірка стакану перед входом
-        if st.get("mode") == "scalp" and not await orderbook_ok_for_entry(sym, conf):
-            continue
         try:
-            _, qty, entry = await crypto_buy_by_usd(sym, USD_PER_TRADE)
+            _, qty, entry = await crypto_buy_by_usd(sym, ALPACA_NOTIONAL)
             await ctx.bot.send_message(
                 chat_id,
-                f"🟢 AUTO BUY: {to_order_sym(sym)} · ${USD_PER_TRADE:.2f} · entry={entry:.6f} · qty={qty:.6f}"
+                f"🟢 AUTO BUY: {to_order_sym(sym)} · ${ALPACA_NOTIONAL:.2f} · entry={entry:.6f} · qty={qty:.6f}"
             )
         except Exception as e:
             await ctx.bot.send_message(chat_id, f"🔴 AUTO ORDER FAIL {sym}: {e}")
@@ -784,6 +691,7 @@ def main() -> None:
     app.add_handler(CommandHandler("auto_off", auto_off))
     app.add_handler(CommandHandler("auto_status", auto_status))
 
+    # фоновий job раз у SCAN_INTERVAL_SEC (і керування позиціями, і нові входи)
     app.job_queue.run_repeating(periodic_auto_scan, interval=SCAN_INTERVAL_SEC, first=10)
 
     print("Bot started.")
