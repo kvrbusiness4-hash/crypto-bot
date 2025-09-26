@@ -1,4 +1,4 @@
-   # -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 
 import os
 import json
@@ -291,7 +291,7 @@ async def scan_rank_stocks(st: Dict[str, Any]) -> Tuple[str, List[Tuple[float, s
     )
     return rep, ranked
 
-# ======== ORDERS (оновлено) ========
+# ======== ORDERS =========
 
 def _round_stock_qty(qty: float) -> float:
     return round(qty, 3)
@@ -352,32 +352,63 @@ async def place_tp_sl_as_simple_sells(sym: str, filled_qty: float, tp: float | N
         }
         await alp_post_json("/v2/orders", payload_sl)
 
+def _parse_insufficient(msg: str) -> Tuple[Optional[float], Optional[str], Optional[float]]:
+    """
+    Повертає (available, symbol, requested) якщо вдалось розпізнати.
+    """
+    try:
+        # спробувати витягнути JSON частину
+        jstart = msg.find("{")
+        if jstart >= 0:
+            js = msg[jstart:]
+            data = json.loads(js)
+            avail = float(data.get("available"))
+            sym = str(data.get("symbol") or "")
+            req = float(str(data.get("message","")).split("requested:")[1].split(",")[0].strip())
+            return avail, sym, req
+    except Exception:
+        pass
+    # універсальний regex
+    m_a = re.search(r'"available"\s*:\s*"?(?P<a>[\d\.]+)"?', msg)
+    m_r = re.search(r'requested:\s*(?P<r>[\d\.]+)', msg)
+    m_s = re.search(r'"symbol"\s*:\s*"(?P<s>[^"]+)"', msg)
+    a = float(m_a.group("a")) if m_a else None
+    r = float(m_r.group("r")) if m_r else None
+    s = m_s.group("s") if m_s else None
+    return a, s, r
+
 async def place_bracket_notional_order_crypto(sym: str, side: str, notional: float,
                                               tp: float | None, sl: float | None) -> Any:
     if side.lower() != "buy":
         raise RuntimeError("crypto: лише long buy підтримано")
 
-    # 1) спроба по нотіоналу із запасом
+    # перша спроба: notional
     try:
         buy = await place_market_buy_notional(sym, notional)
     except RuntimeError as e:
         msg = str(e)
-        # 2) якщо 403 insufficient balance — беремо available і повторюємо qty-ордер
         if "insufficient balance" in msg:
-            m = re.search(r'"available"\s*:\s*"([\d\.]+)"', msg)
-            if not m:
+            available, av_sym, requested = _parse_insufficient(msg)
+            if available is None:
                 raise
-            available_qty = float(m.group(1))
-            safe_qty = _floor_qty(available_qty - 1e-6, 6)
-            if safe_qty <= 0:
-                raise
-            buy = await place_market_buy_qty(sym, safe_qty)
+
+            # якщо помилка в USD — повторюємо notional = available * 0.99
+            if (av_sym or "").upper() == "USD":
+                safe_notional = max(1.0, available * 0.99)
+                buy = await place_market_buy_notional(sym, safe_notional)
+            else:
+                # інакше вважаємо, що available у КІЛЬКОСТІ монет
+                safe_qty = _floor_qty(available * 0.99, 6)
+                if safe_qty <= 0:
+                    raise
+                buy = await place_market_buy_qty(sym, safe_qty)
         else:
             raise
 
+    # дочекатися філу й поставити TP/SL
     order_id = buy.get("id", "")
     filled_qty = 0.0
-    for _ in range(10):
+    for _ in range(12):
         od = await get_order(order_id)
         status = od.get("status")
         if status in ("filled", "partially_filled"):
@@ -385,6 +416,12 @@ async def place_bracket_notional_order_crypto(sym: str, side: str, notional: flo
             if status == "filled":
                 break
         await asyncio.sleep(0.7)
+
+    # резервна спроба, якщо раптом все ще 0
+    if filled_qty == 0:
+        await asyncio.sleep(0.7)
+        od = await get_order(order_id)
+        filled_qty = float(od.get("filled_qty") or 0)
 
     await place_tp_sl_as_simple_sells(sym, filled_qty, tp, sl, is_crypto=True)
     return buy
@@ -397,7 +434,7 @@ async def place_bracket_notional_order_stock(sym: str, side: str, notional: floa
 
     order_id = buy.get("id", "")
     filled_qty = 0.0
-    for _ in range(10):
+    for _ in range(12):
         od = await get_order(order_id)
         status = od.get("status")
         if status in ("filled", "partially_filled"):
@@ -405,6 +442,11 @@ async def place_bracket_notional_order_stock(sym: str, side: str, notional: floa
             if status == "filled":
                 break
         await asyncio.sleep(0.7)
+
+    if filled_qty == 0:
+        await asyncio.sleep(0.7)
+        od = await get_order(order_id)
+        filled_qty = float(od.get("filled_qty") or 0)
 
     await place_tp_sl_as_simple_sells(sym, filled_qty, tp, sl, is_crypto=False)
     return buy
